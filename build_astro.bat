@@ -26,6 +26,20 @@ if not exist "%CMAKE%" (
     exit /b 1
 )
 
+rem Configuracion inicial si no existe (repo recien clonado)
+if not exist "build\CMakeCache.txt" (
+    echo [..] Primera vez: configurando con cmake...
+    call "%CMAKE%" -S . -B build -G "Visual Studio 18 2026" -A x64
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] La configuracion de cmake fallo.
+        echo         Si tu VS no es la 2026, usa:  cmake -S . -B build
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
 echo [..] Compilando Release...
 "%CMAKE%" --build build --config Release
 if errorlevel 1 (
