@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+*.exe
+*.dll
+
+# Logs con session keys / datos sensibles del juego
+*.log
+live_xp_probe*.txt
+astro_crash.txt
+
+# Basura de edicion temporal
+_part*.txt
+_sections*.txt
+_search_results.txt
+_temp_qml.txt
+
+# Scripts de debug/probe temporal (no forman parte de la app)
+# live_xp_probe*.py contienen deviceIds/sk de cuentas REALES: NO subir.
+live_xp_probe*.py
+read_part*.py
+read_qml.py
+search_qml.py
+probe_shop.py
+extract_sections*.py
+apply_changes.py
+fix_dup.ps1
+check_run.sh
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+*.user
