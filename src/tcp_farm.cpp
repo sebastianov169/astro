@@ -4,6 +4,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
+#ifdef Q_OS_WIN
+#include <winsock2.h> // SOCKET/SD_BOTH para shutdown() del fd en stop()
+#endif
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QUrl>
@@ -992,12 +995,26 @@ void FarmWorker::configure(const QString &deviceId, const QString &pemPath, int 
 void FarmWorker::stop()
 {
     m_stop = true;
-    // Abortar el socket TCP del farm para desbloquear recvFrame/waitForReadyRead
-    // sin esperar los 8s del timeout del event loop. Sin esto, stopFarm() timeoutea
-    // y m_farms.clear() destruye el worker viviendo un UAF.
+    // 2026-08-10 (bug reportado por el usuario: "al darle stop se cierra la
+    // app"): abort() se llamaba DESDE EL HILO DE LA UI (stopFarm -> stop)
+    // pero el QTcpSocket vive en el hilo del worker. abort() cross-thread
+    // toca los QSocketNotifiers internos -> "QSocketNotifier: cannot be
+    // enabled or disabled from another thread" + AV 0xC0000005 en
+    // Qt6Network.dll (astro_crash.txt, familia de crashes al parar).
+    // Fix: cerrar el DESCRIPTOR del socket a nivel de OS. shutdown() hace
+    // que el waitForReadyRead pendiente del worker retorne al instante
+    // (EOF/error) y es SEGURO desde otro hilo (no toca el objeto Qt).
     QMutexLocker lk(&m_socketMutex);
-    if (m_activeSock)
-        m_activeSock->abort();
+    if (m_activeSock) {
+        const qintptr fd = m_activeSock->socketDescriptor();
+        if (fd != -1) {
+#ifdef Q_OS_WIN
+            ::shutdown(SOCKET(fd), SD_BOTH);
+#else
+            ::shutdown(int(fd), SHUT_RDWR);
+#endif
+        }
+    }
 }
 
 bool FarmWorker::recvFrame(QTcpSocket *sock, int timeoutMs, int *length, int *flag, Bytes *payload)
@@ -2194,6 +2211,128 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
     // porque t0.elapsed() se reinicia en cada reconexion.
     if (m_nextAutoBuyX2 < 0)
         m_nextAutoBuyX2 = QDateTime::currentMSecsSinceEpoch() + 60000;
+    // 2026-08-10 (pedido del usuario: deteccion x2 paupérrima -> binaria):
+    // chequeo INMEDIATO del x2 en el postSpawn (a los segundos del [20], no
+    // a los 60s): el badge del dashboard dice verde/rojo de inmediato.
+    checkX2(net, sk, magic);
+}
+
+// 2026-08-10 (pedido del usuario: "detecta solo el de las gemas" + "todas
+// las cuentas guardadas"): el estado REAL del x2 sale del INVENTARIO DE
+// CONSUMIBLES (slots 3 y 4 — confirmado por captura Frida del binario
+// 2026-08-10: {"do":"inventory","ingame":true,"slot":3} + slot 4).
+// SOLO se detecta el boost DE LAS GEMAS: "Double Gem XP" id=8590
+// (el "Double XP" id=2016 es XP de cuenta, NO interesa).
+// durability > 0 = ACTIVO (verde); ausente o durability 0 = NO hay (rojo).
+// La compra (si auto-buy ON) rellena el inventario -> el siguiente chequeo
+// lo ve verde. DETECCION por inventario SIEMPRE; compra solo con auto-buy.
+void FarmWorker::checkX2(QNetworkAccessManager *net, const QString &sk, const QString &magic)
+{
+    if (m_stop.load())
+        return;
+    try {
+        const bool autoBuyOn = m_autoBuyX2.load();
+        // ---- 1. LEER EL INVENTARIO REAL de consumibles (slots 3 y 4) ----
+        bool x2Found = false;      // item x2 presente en el inventario
+        bool x2Active = false;     // con durability > 0
+        QString x2Name;
+        QJsonArray invItems;
+        for (int slot : {3, 4}) {
+            QJsonObject invResp = httpApi(net, sk, magic, apiJson({ {"do", "inventory"}, {"slot", slot} }));
+            const QJsonArray items = invResp.value("data").toObject().value("items").toArray();
+            for (const auto &iv : items)
+                invItems.append(iv);
+        }
+        for (const auto &iv : invItems) {
+            const QJsonObject item = iv.toObject();
+            const int iid = item.value("id").toInt();
+            // SOLO el boost de las gemas (8590). El 2016 (Double XP de
+            // cuenta) se ignora por decision del usuario.
+            if (iid != 8590)
+                continue;
+            const QString nm = item.value("name").toString();
+            const int dur = item.value("durability").toInt();
+            const int maxDur = item.value("max_durability").toInt();
+            x2Found = true;
+            x2Name = nm;
+            // durability > 0 = boost vigente (los consumibles agotados
+            // quedan con durability 0, p.ej. "Improved Mass Gainer" 0/20)
+            if (dur > 0) {
+                x2Active = true;
+                emitLog(QString("checkX2: %1 ACTIVO (durability %2/%3)").arg(nm).arg(dur).arg(maxDur));
+            } else {
+                emitLog(QString("checkX2: %1 expirado (durability %2/%3)").arg(nm).arg(dur).arg(maxDur));
+            }
+        }
+        if (x2Active) {
+            // boost REALMENTE vigente en el inventario: verde.
+            setX2State(1, QStringLiteral("x2 gemas activo (%1 en inventario)").arg(x2Name));
+            return;
+        }
+
+        // ---- 2. SIN boost de gemas: comprar el 8590 si auto-buy ON ----
+        // Consultar el store cat=6 para el id/precio del boost.
+        QJsonObject storeResp = httpApi(net, sk, magic, apiJson({ {"do", "store"}, {"category", 6}, {"evo", false} }));
+        QJsonArray storeItems;
+        if (storeResp.value("data").isObject())
+            storeItems = storeResp.value("data").toObject().value("items").toArray();
+        else if (storeResp.value("data").isArray())
+            storeItems = storeResp.value("data").toArray();
+        QJsonObject userResp = httpApi(net, sk, magic, apiJson({ {"do", "userinfo"} }));
+        QJsonObject udata = userResp.value("data").toObject();
+        qlonglong coins = udata.value("coins").toVariant().toLongLong();
+        if (coins <= 0 && udata.contains("userinfo"))
+            coins = udata.value("userinfo").toObject().value("coins").toVariant().toLongLong();
+
+        bool anyCandidate = false;
+        for (const auto &si : storeItems) {
+            const QJsonObject item = si.toObject();
+            // SOLO el boost de gemas: id 8590 ("Double Gem XP").
+            const int itemId = item.value("id").toInt();
+            if (itemId != 8590)
+                continue;
+            const qlonglong price = item.value("price").toVariant().toLongLong();
+            if (price <= 0)
+                continue;
+            anyCandidate = true;
+            if (!autoBuyOn) {
+                // auto-buy OFF: no comprar; rojo con la razon.
+                setX2State(2, QStringLiteral("sin x2 de gemas en inventario (auto-buy desactivado)"));
+                emitLog(QString("checkX2: Double Gem XP NO en inventario y auto-buy OFF (no se compra)"));
+                break;
+            }
+            if (coins < price) {
+                setX2State(3, QStringLiteral("sin coins para Double Gem XP (necesita %1, tiene %2)")
+                                .arg(price).arg(coins));
+                emitLog(QString("checkX2: coins insuficientes para Double Gem XP (%1 < %2)")
+                            .arg(coins).arg(price));
+                continue;
+            }
+            emitLog(QString("checkX2: Double Gem XP no activo - buying"));
+            QJsonObject buyResp = httpApi(net, sk, magic, apiJson({ {"do", "buy"}, {"item", itemId} }));
+            const QString buyMsg = buyResp.value("message").toString();
+            const bool buyOk = buyResp.value("result").toString() == QLatin1String("ok");
+            if (buyOk) {
+                setX2State(1, QStringLiteral("x2 de gemas comprado: %1").arg(item.value("name").toString()));
+                emitLog(QString("checkX2: bought '%1' successfully").arg(item.value("name").toString()));
+            } else if (buyMsg.contains(QLatin1String("already_owned"))) {
+                // el server dice que ya lo tiene: el inventario no lo listo
+                // (puede tardar en aparecer) -> verde conservador.
+                setX2State(1, QStringLiteral("x2 de gemas ya activo (%1)").arg(item.value("name").toString()));
+                emitLog(QString("checkX2: Double Gem XP ya activo (already_owned)"));
+            } else {
+                setX2State(2, buyMsg.left(60));
+                emitLog(QString("checkX2: buy failed: %1").arg(buyMsg.left(60)));
+            }
+            break; // un intento por chequeo
+        }
+        if (!anyCandidate && !x2Found)
+            setX2State(2, QStringLiteral("Double Gem XP no disponible en tienda ni inventario"));
+    } catch (const std::exception &e) {
+        emitLog(QString("checkX2: ERROR %1").arg(QString::fromUtf8(e.what()).left(80)));
+    } catch (...) {
+        emitLog("checkX2: ERROR desconocido");
+    }
 }
 
 void FarmWorker::refreshXp()
@@ -3573,146 +3712,14 @@ void FarmWorker::run()
         // sesion sin mover.)
         // Auto-buy x2: cada 5 minutos, consultar la tienda y comprar gemas x2
         // (multiplicador de XP x2 por 24h) si hay coins suficientes.
-        // 2026-08-10 (bug reportado por el usuario + probe del server real):
-        // el store category=10 son SOLO gemas del catalogo ("Gema Azul"...),
-        // NUNCA items x2 — el auto-buy nunca encontraba nada. Los boosts x2
-        // reales estan en category=6: "Double Gem XP" (id=8590, 1200) y
-        // "Double XP" (id=2016, 600).
-        // 2026-08-10 (bug #2): nextAutoBuyX2 usaba t0.elapsed() que se reinicia
-        // en cada reconexion (el CTF mata la partida ~40s -> el chequeo de 60s
-        // nunca alcanzaba). Ahora RELOJ REAL + miembro persistente del worker:
-        // -1 = programar al primer SPAWNED (linea 3350), luego cada 5 min.
-        if (m_autoBuyX2.load() && m_nextAutoBuyX2 >= 0
+        // 2026-08-10 (pedido del usuario: deteccion paupérrima -> binaria):
+        // toda la logica vive en checkX2() — se llama INMEDIATO en postSpawn
+        // (el badge dice verde/rojo a los segundos del [20], no a los 60s) y
+        // aqui cada 5 min con reloj real (miembro persistente del worker).
+        if (m_nextAutoBuyX2 >= 0
             && QDateTime::currentMSecsSinceEpoch() >= m_nextAutoBuyX2) {
             m_nextAutoBuyX2 = QDateTime::currentMSecsSinceEpoch() + 300000; // 5 minutos
-            try {
-                QJsonObject storeResp = apiCall(&net, sk, magic, apiJson({ {"do", "store"}, {"category", 6}, {"evo", false} }));
-                QJsonArray storeItems;
-                if (storeResp.value("data").isObject())
-                    storeItems = storeResp.value("data").toObject().value("items").toArray();
-                else if (storeResp.value("data").isArray())
-                    storeItems = storeResp.value("data").toArray();
-                emitLog(QString("Auto-buy x2: store cat=6 items=%1").arg(storeItems.size()));
-                // Obtener coins del usuario (2026-08-10: do=userinfo devuelve
-                // data.userinfo.coins, no data.coins — el probe del server real
-                // lo confirmo; leer ambos para robustez)
-                QJsonObject userResp = apiCall(&net, sk, magic, apiJson({ {"do", "userinfo"} }));
-                QJsonObject udata = userResp.value("data").toObject();
-                qlonglong coins = udata.value("coins").toVariant().toLongLong();
-                if (coins <= 0 && udata.contains("userinfo"))
-                    coins = udata.value("userinfo").toObject().value("coins").toVariant().toLongLong();
-                emitLog(QString("Auto-buy x2: coins=%1").arg(coins));
-                // 2026-08-10 (bug reportado por el usuario: cuentas sin coins
-                // aparecian con x2 activo): el estado REAL del boost NO es el
-                // campo "owned" del store (el item comprado queda owned=true
-                // para SIEMPRE, aunque el boost de 24h ya expiro). El server
-                // expone el estado real en userinfo.battlepass: coin_multiplier
-                // (2 = x2 activo) y expires (unix ts del vencimiento).
-                QJsonObject bp;
-                {
-                    const QJsonObject ui = udata.contains("userinfo")
-                                               ? udata.value("userinfo").toObject()
-                                               : QJsonObject();
-                    bp = ui.value("battlepass").toObject();
-                    if (bp.isEmpty())
-                        bp = udata.value("battlepass").toObject();
-                }
-                const int coinMult = bp.value("coin_multiplier").toInt();
-                const qlonglong bpExpires = bp.value("expires").toVariant().toLongLong();
-                const bool x2Active = (coinMult >= 2)
-                                      || (bpExpires > QDateTime::currentSecsSinceEpoch());
-                emitLog(QString("Auto-buy x2: battlepass coin_multiplier=%1 expires=%2 -> %3")
-                            .arg(coinMult).arg(bpExpires)
-                            .arg(x2Active ? QStringLiteral("x2 ACTIVO") : QStringLiteral("x2 NO activo")));
-                if (x2Active) {
-                    // boost REALMENTE activo: no comprar, badge verde con la
-                    // razon verificada (antes el owned=true del store mentia
-                    // "ya activo" aunque estuviera expirado).
-                    setX2State(1, QStringLiteral("x2 activo (battlepass x%1, expires %2)")
-                                    .arg(coinMult)
-                                    .arg(QDateTime::fromSecsSinceEpoch(bpExpires)
-                                             .toString(QStringLiteral("dd/MM HH:mm"))));
-                }
-                bool anyCandidate = false;
-                for (const auto &si : storeItems) {
-                    if (x2Active)
-                        break;
-                    const QJsonObject item = si.toObject();
-                    const QString itemName = item.value("name").toString().toLower();
-                    // Buscar gemas que contengan "x2" en el nombre (multiplicador de XP)
-                    if (!itemName.contains("x2") && !itemName.contains("double") && !itemName.contains("x 2"))
-                        continue;
-                    const int itemId = item.value("id").toInt();
-                    const qlonglong price = item.value("price").toVariant().toLongLong();
-                    if (itemId <= 0 || price <= 0)
-                        continue;
-                    anyCandidate = true;
-                    // 2026-08-10: el "owned" del store NO bloquea la recompra:
-                    // si el boost expiro, hay que comprarlo de nuevo (el item
-                    // viejo queda owned=true para siempre).
-                    if (coins < price) {
-                        setX2State(3, QStringLiteral("sin coins (necesita %1, tiene %2)").arg(price).arg(coins));
-                        emitLog(QString("Auto-buy x2: coins insuficientes para '%1' (%2 < %3)")
-                                    .arg(item.value("name").toString()).arg(coins).arg(price));
-                        continue;
-                    }
-                    emitLog(QString("Auto-buy x2: found '%1' (id=%2, price=%3, coins=%4) - buying")
-                                .arg(item.value("name").toString()).arg(itemId).arg(price).arg(coins));
-                    QJsonObject buyResp = apiCall(&net, sk, magic, apiJson({ {"do", "buy"}, {"item", itemId} }));
-                    bool buyOk = buyResp.value("result").toString() == QLatin1String("ok");
-                    // 2026-08-10 (bug reportado por el usuario: cuentas sin
-                    // coins "aparecian con x2"): la señal REAL del server es la
-                    // respuesta del buy. "already_owned" = el boost YA esta
-                    // activo (el server no deja recomprar un boost vigente de
-                    // 24h) — NO es un fallo. "ok" = comprado ahora. Cualquier
-                    // otro error = fallo real. El campo "owned" del store NO
-                    // sirve (queda true para siempre aunque el boost expire).
-                    const QString buyMsg = buyResp.value("message").toString();
-                    if (buyOk) {
-                        coins -= price;
-                        // verificar el estado REAL tras comprar: releer
-                        // userinfo y confirmar (no confiar solo en el "ok").
-                        QThread::msleep(800);
-                        bool verified = false;
-                        try {
-                            QJsonObject vResp = apiCall(&net, sk, magic, apiJson({ {"do", "userinfo"} }));
-                            QJsonObject vd = vResp.value("data").toObject();
-                            QJsonObject vbp = vd.value("userinfo").toObject().value("battlepass").toObject();
-                            if (vbp.isEmpty())
-                                vbp = vd.value("battlepass").toObject();
-                            const int vMult = vbp.value("coin_multiplier").toInt();
-                            const qlonglong vExp = vbp.value("expires").toVariant().toLongLong();
-                            verified = (vMult >= 2)
-                                       || (vExp > QDateTime::currentSecsSinceEpoch());
-                            if (verified)
-                                setX2State(1, QStringLiteral("comprado y verificado (battlepass x%1, expires %2)")
-                                                .arg(vMult)
-                                                .arg(QDateTime::fromSecsSinceEpoch(vExp)
-                                                         .toString(QStringLiteral("dd/MM HH:mm"))));
-                            else
-                                setX2State(1, QStringLiteral("comprado: %1 (ok del server)").arg(item.value("name").toString()));
-                        } catch (...) {
-                            setX2State(1, QStringLiteral("comprado: %1 (verificacion no disponible)").arg(item.value("name").toString()));
-                        }
-                        emitLog(QString("Auto-buy x2: bought '%1' successfully").arg(item.value("name").toString()));
-                    } else if (buyMsg.contains(QLatin1String("already_owned"))) {
-                        // boost YA activo: verde con la razon real del server
-                        // (antes este caso caia en "buy failed" -> parecia
-                        // fallo, o en el owned del store -> mentia).
-                        setX2State(1, QStringLiteral("x2 ya activo (el server rechazo la recompra: %1)").arg(buyMsg.left(40)));
-                        emitLog(QString("Auto-buy x2: '%1' ya activo (already_owned)").arg(item.value("name").toString()));
-                    } else {
-                        setX2State(2, buyMsg.left(60));
-                        emitLog(QString("Auto-buy x2: buy failed: %1").arg(buyMsg.left(60)));
-                    }
-                }
-                if (!anyCandidate && !x2Active)
-                    setX2State(0, QStringLiteral("sin items x2 en la tienda"));
-            } catch (const std::exception &e) {
-                emitLog(QString("Auto-buy x2: ERROR %1").arg(QString::fromUtf8(e.what()).left(80)));
-            } catch (...) {
-                emitLog("Auto-buy x2: ERROR desconocido");
-            }
+            checkX2(&net, sk, magic);
         }
 
         // deteccion de perdida de conexion TCP: si el socket se desconecto,

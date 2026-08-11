@@ -155,6 +155,14 @@ public slots:
     void loadFarmSelection();
     Q_INVOKABLE void refreshAllAccounts();                    // login x10 en paralelo: nombre/status/coins
     Q_INVOKABLE void configureAutoRefresh(bool enabled, int intervalSeconds); // timer auto-refresh (intervalo >= 10s)
+    // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
+    // las cuentas guardadas"): login secuencial de cada cuenta (aunque no
+    // farmee) + lectura del inventario de consumibles (slots 3 y 4) +
+    // deteccion del "Double Gem XP" (id=8590) con durability>0. El resultado
+    // (x2State/x2Reason) se persiste en accounts.json para el badge.
+    Q_INVOKABLE void scanAllX2();
+    // persiste x2State/x2Reason en la cuenta index de m_accounts (scanAllX2)
+    void updateAccountX2(int index, int state, const QString &reason);
     Q_INVOKABLE QString theme() const;                       // tema persistido (QSettings) o "midnight"
     Q_INVOKABLE void saveTheme(const QString &theme);
     Q_INVOKABLE QString loadTheme();        // persiste el tema elegido en QSettings

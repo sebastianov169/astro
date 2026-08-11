@@ -635,6 +635,119 @@ void FarmController::loadFarmSelection()
         emit farmSelectionChanged();
 }
 
+// 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
+// las cuentas guardadas"): login secuencial de CADA cuenta de accounts.json
+// (aunque no farmee) + lectura del inventario de consumibles (slots 3 y 4,
+// los mismos que consulta el binario al abrir el inventario de pociones —
+// captura Frida 2026-08-10) + deteccion del boost DE LAS GEMAS:
+// "Double Gem XP" id=8590 con durability>0 = ACTIVO. El resultado se
+// persiste en accounts.json (x2State/x2Reason) para que el badge lo
+// muestre aunque la cuenta no tenga sesion de farm. NO compra nada: solo
+// detecta, para saber a que cuentas comprarles.
+// Secuencial 1 login a la vez: el server corta el handshake cuando llegan
+// varios AUTHs de la misma IP a la vez (leccion de la fase conexion).
+void FarmController::scanAllX2()
+{
+    if (m_accounts.isEmpty())
+        return;
+    appendLog(QStringLiteral("X2 scan: %1 cuentas guardadas...").arg(m_accounts.size()));
+    // Snapshot de los devices (m_accounts puede cambiar mientras tanto)
+    struct ScanEntry {
+        QString device;
+        QString pemPath;
+        int index = -1;
+    };
+    QVector<ScanEntry> entries;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        const QString dev = m_accounts.at(i).toMap().value(QStringLiteral("device")).toString();
+        if (dev.isEmpty())
+            continue;
+        ScanEntry e;
+        e.device = dev;
+        e.pemPath = fakeTpmPathForDevice(dev);
+        e.index = i;
+        entries.append(e);
+    }
+    appendLog(QStringLiteral("X2 scan: %1 con device valido").arg(entries.size()));
+    for (const ScanEntry &e : entries) {
+        LoginManager local;
+        if (!e.pemPath.isEmpty()) {
+            QFile pf(e.pemPath);
+            if (pf.open(QIODevice::ReadOnly)) {
+                local.setAttestPem(QString::fromUtf8(pf.readAll()));
+                pf.close();
+            }
+        }
+        LoginResult r;
+        for (int intento = 1; intento <= 2; ++intento) {
+            r = local.login(e.device);
+            if (r.ok)
+                break;
+            writeLogFile(QStringLiteral("[DBG] X2 scan login %1 intento=%2 fallo: %3")
+                             .arg(logName(e.device, QString())).arg(intento).arg(r.error));
+            if (intento < 2)
+                QThread::msleep(1200);
+        }
+        if (!r.ok) {
+            writeLogFile(QStringLiteral("[DBG] X2 scan %1: login fallo (%2)")
+                             .arg(logName(e.device, QString())).arg(r.error.left(80)));
+            updateAccountX2(e.index, 2, QStringLiteral("scan: login fallo (%1)").arg(r.error.left(50)));
+            continue;
+        }
+        // Leer el inventario de consumibles (slots 3 y 4) y buscar el 8590.
+        bool found = false;
+        bool active = false;
+        QString name;
+        int dur = 0, maxDur = 0;
+        for (int slot : {3, 4}) {
+            const QJsonObject inv = local.apiCall(QStringLiteral("{\"do\":\"inventory\",\"slot\":%1}").arg(slot));
+            const QJsonArray items = inv.value(QStringLiteral("data")).toObject().value(QStringLiteral("items")).toArray();
+            for (const auto &iv : items) {
+                const QJsonObject item = iv.toObject();
+                if (item.value(QStringLiteral("id")).toInt() != 8590)
+                    continue;
+                found = true;
+                name = item.value(QStringLiteral("name")).toString();
+                dur = item.value(QStringLiteral("durability")).toInt();
+                maxDur = item.value(QStringLiteral("max_durability")).toInt();
+                if (dur > 0)
+                    active = true;
+            }
+        }
+        if (active) {
+            // boost de gemas VIGENTE en el inventario: verde.
+            updateAccountX2(e.index, 1, QStringLiteral("x2 gemas activo (%1 %2/%3)").arg(name).arg(dur).arg(maxDur));
+            writeLogFile(QStringLiteral("[DBG] X2 scan %1: %2 ACTIVO (%3/%4)")
+                             .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur));
+        } else if (found) {
+            updateAccountX2(e.index, 2, QStringLiteral("x2 gemas expirado (%1 %2/%3)").arg(name).arg(dur).arg(maxDur));
+            writeLogFile(QStringLiteral("[DBG] X2 scan %1: %2 expirado (%3/%4)")
+                             .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur));
+        } else {
+            updateAccountX2(e.index, 2, QStringLiteral("sin Double Gem XP en inventario"));
+            writeLogFile(QStringLiteral("[DBG] X2 scan %1: sin Double Gem XP (8590) en inventario")
+                             .arg(logName(e.device, QString())));
+        }
+        // pausa anti-bot entre cuentas (el server corta AUTHs simultaneos)
+        QThread::msleep(800);
+    }
+    saveAccounts();
+    emit accountsChanged();
+    appendLog(QStringLiteral("X2 scan: completo (%1 cuentas)").arg(entries.size()));
+}
+
+// 2026-08-10: persiste el estado del x2 (detectado por scanAllX2) en la
+// cuenta de accounts.json y notifica a la UI (badge del dashboard).
+void FarmController::updateAccountX2(int index, int state, const QString &reason)
+{
+    if (index < 0 || index >= m_accounts.size())
+        return;
+    QVariantMap am = m_accounts.at(index).toMap();
+    am.insert(QStringLiteral("x2State"), state);
+    am.insert(QStringLiteral("x2Reason"), reason);
+    m_accounts.replace(index, am);
+}
+
 bool FarmController::farmRunning() const
 {
     for (int i = 0; i < m_farms.size(); ++i)
@@ -3053,12 +3166,15 @@ QVariantList FarmController::workflowAccounts() const
                 if (fh.worker) {
                     am.insert(QStringLiteral("x2State"), fh.worker->x2State());
                     am.insert(QStringLiteral("x2Reason"), fh.worker->x2Reason());
+                } else if (am.contains(QStringLiteral("x2State"))) {
+                    // 2026-08-10 (pedido del usuario: "todas las cuentas"):
+                    // estado PERSISTIDO por scanAllX2 (login propio aunque la
+                    // cuenta no farmee) — el badge refleja el inventario real
+                    // sin necesidad de sesion de farm.
                 } else {
-                    // cuenta seleccionada SIN farm activo: el badge refleja el
-                    // flag CONFIGURADO (activado -> pendiente de sesion;
-                    // desactivado -> razon clara). Antes decia "sin sesion de
-                    // farm" siempre -> parecia que el auto-buy estaba apagado
-                    // aunque estuviera activado (bug reportado por el usuario).
+                    // cuenta seleccionada SIN farm activo ni scan: el badge
+                    // refleja el flag CONFIGURADO (activado -> pendiente de
+                    // sesion; desactivado -> razon clara).
                     am.insert(QStringLiteral("x2State"), 0);
                     am.insert(QStringLiteral("x2Reason"),
                               m_autoBuyX2 ? QStringLiteral("activado, esperando sesion de farm")

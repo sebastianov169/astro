@@ -1231,44 +1231,31 @@ ApplicationWindow {
                                                     font.pixelSize: 9
                                                     font.family: "Cascadia Mono, Consolas, monospace"
                                                 }
-                                                // 2026-08-10 (pedido workflow): indicador del estado
-                                                // REAL del boost x2 de la cuenta (lo que el auto-buy
-                                                // logro, no lo configurado): verde "x2 ✓" comprado/
-                                                // activo, rojo "x2 ✗" fallo, gris "x2 ✗" sin coins o
-                                                // desactivado. Estado 0 pendiente (activado pero sin
-                                                // sesion o antes del primer chequeo) se muestra como
-                                                // "x2 ·" gris — NO es un fallo (bug reportado: parecia
-                                                // que el auto-buy estaba apagado).
+                                                // 2026-08-10 (pedido del usuario: "cuando este el x2
+                                                // salga verde, y cuando no haya rojo"): BINARIO —
+                                                // verde SOLO si x2State==1 (comprado/ya activo
+                                                // verificado), rojo en TODO lo demas (pendiente,
+                                                // sin coins, fallo, auto-buy off). Tooltip con la
+                                                // razon exacta.
                                                 Rectangle {
                                                     visible: modelData.x2State !== undefined
                                                     Layout.preferredWidth: 42
                                                     Layout.preferredHeight: 18
                                                     radius: 4
                                                     color: modelData.x2State === 1 ? Qt.rgba(colors.mint.r, colors.mint.g, colors.mint.b, 0.18)
-                                                         : (modelData.x2State === 2 ? Qt.rgba(colors.red.r, colors.red.g, colors.red.b, 0.20)
-                                                         : Qt.rgba(colors.muted.r, colors.muted.g, colors.muted.b, 0.18))
-                                                    border.color: modelData.x2State === 1 ? colors.mint
-                                                         : (modelData.x2State === 2 ? colors.red
-                                                         : colors.muted)
+                                                         : Qt.rgba(colors.red.r, colors.red.g, colors.red.b, 0.20)
+                                                    border.color: modelData.x2State === 1 ? colors.mint : colors.red
                                                     border.width: 1
                                                     LabelText {
                                                         anchors.centerIn: parent
-                                                        text: modelData.x2State === 1 ? "x2 \u2713"
-                                                            : (modelData.x2State === 2 ? "x2 \u2717"
-                                                            : (modelData.x2State === 3 ? "x2 \u2717"
-                                                            : "x2 \u00b7"))
-                                                        color: modelData.x2State === 1 ? colors.mint
-                                                            : (modelData.x2State === 2 ? colors.red
-                                                            : (modelData.x2State === 3 ? colors.muted
-                                                            : colors.muted))
+                                                        text: modelData.x2State === 1 ? "x2 \u2713" : "x2 \u2717"
+                                                        color: modelData.x2State === 1 ? colors.mint : colors.red
                                                         font.pixelSize: 8
                                                         font.weight: Font.Bold
                                                     }
                                                     ToolTip.visible: x2Hover.hovered
                                                     ToolTip.text: modelData.x2State === 1 ? ("x2 activo: " + (modelData.x2Reason || "comprado"))
-                                                         : (modelData.x2State === 2 ? ("x2 fallo: " + (modelData.x2Reason || ""))
-                                                         : (modelData.x2State === 3 ? ("x2 sin coins: " + (modelData.x2Reason || ""))
-                                                         : ("x2: " + (modelData.x2Reason || "pendiente"))))
+                                                         : ("x2 NO activo: " + (modelData.x2Reason || "sin x2"))
                                                     ToolTip.delay: 300
                                                     HoverHandler { id: x2Hover }
                                                 }

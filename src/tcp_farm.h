@@ -132,6 +132,12 @@ public:
     int x2State() const { return m_x2State.load(); }
     QString x2Reason() const { return m_x2Reason; }
     void setX2State(int s, const QString &r) { m_x2State.store(s); m_x2Reason = r; }
+    // 2026-08-10 (pedido del usuario: deteccion binaria verde/rojo): consulta
+    // el store cat=6 + userinfo y actualiza el estado REAL del x2. Se llama
+    // INMEDIATO en postSpawn (no esperar 60s) y cada 5 min en el loop.
+    // La senal real del server es la respuesta del buy: ok=comprado,
+    // already_owned=ya activo (verde); sin coins/fallo=no hay x2 (rojo).
+    void checkX2(QNetworkAccessManager *net, const QString &sk, const QString &magic);
     // Aborto cooperativo EXTERNO (verificado 2026-08-08, familia 0x1CE857):
     // el refreshXp del worker local del refreshAll pollea el settle hasta
     // 60s; si el shutdown empieza mientras, el poll seguira y los QJsonObject/

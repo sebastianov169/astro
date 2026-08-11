@@ -222,6 +222,12 @@ int main(int argc, char *argv[])
         // las casillas guardadas. Recargar la seleccion DESPUES de cargar las
         // cuentas para que las casillas marcadas sobrevivan al reinicio.
         farm.loadFarmSelection();
+        // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para
+        // TODAS las cuentas guardadas"): scan de arranque (login secuencial
+        // + inventario consumibles) para pintar el badge verde/rojo real de
+        // cada cuenta aunque no farmee. 2s despues para no competir con el
+        // arranque de la UI.
+        QTimer::singleShot(2000, &farm, [&farm]() { farm.scanAllX2(); });
     });
 
     const auto roots = engine.rootObjects();
