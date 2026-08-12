@@ -96,7 +96,7 @@ ApplicationWindow {
             var g = list[i]
             priorityQmlModel.append({
                 id: g.id, name: g.name, sprite: g.sprite,
-                level: g.level, account: g.account
+                level: g.level, account: g.account !== undefined ? g.account : ""
             })
         }
     }
@@ -1331,6 +1331,39 @@ ApplicationWindow {
                                                     animated: false
                                                     value: root.gemProgress(modelData.cexp, modelData.exp)
                                                     barColor: colors.amber
+                                                }
+                                                // v39 (pedido del usuario): bajo la barra de XP de cada
+                                                // gema — XP ganado en el ultimo refresh, nombre de la
+                                                // gema y coins de la cuenta.
+                                                RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: 6
+                                                    LabelText {
+                                                        visible: modelData.xpGainRefresh !== undefined && modelData.xpGainRefresh > 0
+                                                        text: modelData.xpGainRefresh !== undefined ? "+" + modelData.xpGainRefresh.toLocaleString() + " XP" : ""
+                                                        color: "#50d39f"
+                                                        font.pixelSize: 9
+                                                        font.weight: Font.DemiBold
+                                                        font.family: "Cascadia Mono, Consolas, monospace"
+                                                        Layout.preferredWidth: 92
+                                                    }
+                                                    LabelText {
+                                                        visible: modelData.gemSummary !== undefined && modelData.gemSummary.length > 0
+                                                        text: modelData.gemSummary || ""
+                                                        color: colors.muted
+                                                        font.pixelSize: 9
+                                                        Layout.fillWidth: true
+                                                        elide: Text.ElideRight
+                                                    }
+                                                    LabelText {
+                                                        visible: modelData.coins !== undefined && modelData.coins > 0
+                                                        text: modelData.coins !== undefined ? "\u00a4 " + modelData.coins.toLocaleString() : ""
+                                                        color: colors.amber
+                                                        font.pixelSize: 9
+                                                        font.family: "Cascadia Mono, Consolas, monospace"
+                                                        Layout.preferredWidth: 90
+                                                        horizontalAlignment: Text.AlignRight
+                                                    }
                                                 }
                                                 // Badge PRIORIDAD (2026-08-10): la gema se compro del
                                                 // shop por prioridad porque el inventario estaba vacio.

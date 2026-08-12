@@ -6,6 +6,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QThread>
+#include <QPointer>
 #include <QStringList>
 #include <QMutex>
 #include <QSet>
@@ -157,6 +158,10 @@ public slots:
     void saveFarmSelection();
     void loadFarmSelection();
     Q_INVOKABLE void refreshAllAccounts();                    // login x10 en paralelo: nombre/status/coins
+    // v38: refresh SIMPLE = STOP de los farms + login nuevo de todas + respawn
+    // de las cuentas que estaban farmeando (pedido: "volver a hacer todo").
+    void maybeStartRefreshAllLogin();                         // poll hasta que los farms terminen
+    void respawnDevices(const QStringList &devices);          // re-spawn tras el refresh
     Q_INVOKABLE void configureAutoRefresh(bool enabled, int intervalSeconds); // timer auto-refresh (intervalo >= 10s)
     // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
     // las cuentas guardadas"): login secuencial de cada cuenta (aunque no
@@ -315,9 +320,14 @@ private:
     QThread *m_qwsThread = nullptr;
 
     // Multi-farm: un handle por cuenta spawneada. Cada uno tiene su thread+worker.
+    // QPointer (2026-08-12, crash STOP): el worker se destruye via deleteLater
+    // cuando su thread termina (en el propio worker thread), y el GUI lo quita
+    // de m_farms DESPUES (queued). Cualquier uso de un puntero crudo en esa
+    // ventana es UB -> vtable NULL (SEH 0xC0000005 rip=0). QPointer se anula
+    // solo al morir el objeto: todos los `if (fh.worker)` se vuelven seguros.
     struct FarmHandle {
-        QThread *thread = nullptr;
-        FarmWorker *worker = nullptr;
+        QPointer<QThread> thread;
+        QPointer<FarmWorker> worker;
         QString deviceId;
         QString pemPath;
         QString accountName;
@@ -339,6 +349,9 @@ private:
     int m_refreshAllProgress = 0;
     QString m_refreshAllStatus;
     QThread *m_refreshAllThread = nullptr;
+    bool m_refreshWaitingFarms = false;      // v38: esperando el STOP de los farms
+    qint64 m_refreshWaitDeadline = 0;        // v40: timeout de 15s de la espera
+    QStringList m_refreshRespawnDevices;     // v38: devices a re-spawnear al terminar
     QString m_accountSearch;
     QVariantList m_farmSelection; // devices seleccionados para farmear (max 10)
     QTimer *m_autoRefreshTimer = nullptr; // auto-refresh de cuentas (intervalo en ms)

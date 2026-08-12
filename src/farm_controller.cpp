@@ -583,6 +583,10 @@ FarmController::FarmController(QObject *parent) : QObject(parent)
         // cuentas farmeando (no rompe sus sesiones), asi que aqui SOLO se
         // fuerza el flush de la UI con los datos frescos del worker.
         flushUi();
+        // v39 (pedido del usuario: "el autorefresh deberia volver a hacer todo
+        // desde 0 como si presionara RUN"): ciclo COMPLETO cada intervalo —
+        // STOP de las sesiones + login nuevo (XP real tras materializar) +
+        // respawn. refreshAllAccounts() ya hace exactamente eso (v38).
         if (!m_refreshingAll && !m_qwsLoading && !m_accounts.isEmpty())
             refreshAllAccounts();
     });
@@ -3314,7 +3318,13 @@ QVariantList FarmController::workflowAccounts() const
                     fh.spawned ? QStringLiteral("Farming") :
                     (fh.thread->isRunning() ? QStringLiteral("Connecting") : QStringLiteral("Idle")));
                 // 2026-08-10: estado REAL del auto-buy x2 (indicador por cuenta)
-                if (fh.worker) {
+                // 2026-08-12 (crash STOP): el worker se destruye en el thread
+                // cuando run() sale, ANTES de que el GUI procese el lambda de
+                // finished que lo quita de m_farms. En esa ventana fh.worker
+                // es un puntero colgante -> x2State() = vtable NULL (SEH
+                // 0xC0000005, rip=0). Nunca tocar el worker si el thread ya
+                // no corre: el badge cae al estado persistido del inventario.
+                if (fh.worker && fh.thread && fh.thread->isRunning()) {
                     am.insert(QStringLiteral("x2State"), fh.worker->x2State());
                     am.insert(QStringLiteral("x2Reason"), fh.worker->x2Reason());
                 } else if (am.contains(QStringLiteral("x2State"))) {
@@ -3445,57 +3455,107 @@ void FarmController::refreshAllAccounts()
     }
     m_refreshingAll = true;
     m_refreshAllProgress = 0;
-    m_refreshAllStatus = QStringLiteral("Refreshing all accounts...");
+    m_refreshAllStatus = QStringLiteral("Stopping farms...");
     emit refreshAllProgressChanged();
     m_abortingRefreshAll.store(false);
 
-    // Snapshot de devices (GUI thread)
-    QVector<QPair<QString, QString>> targets;
-    QVector<FarmWorker *> farmingWorkers;
+    // v38 (pedido del usuario: "volver a hacer todo el proceso"): el refresh
+    // SIMPLE = STOP de todas las sesiones de farm + login nuevo de TODAS las
+    // cuentas + re-spawn de las que estaban farmeando. Al terminar la sesion
+    // el server materializa el cexp real (el cexp en partida se congela), asi
+    // el login nuevo lee el XP correcto. Sin kick FFA ni settle de worker.
+    QStringList respawnDevices;
+    for (const auto &fh : m_farms) {
+        if (!fh.worker || !fh.thread || !fh.thread->isRunning())
+            continue;
+        respawnDevices.append(fh.deviceId);
+        fh.worker->stop();
+    }
+    // si no habia farms, el respawn no aplica: solo se refresca la data
+    m_refreshRespawnDevices = respawnDevices;
+
+    appendLog(QStringLiteral("Auto-refresh: stopping %1 farm(s), then fresh login of %2 account(s)")
+                  .arg(respawnDevices.size()).arg(m_accounts.size()));
+    writeLogFile(QStringLiteral("[Refresh] stopping %1 farm(s)").arg(respawnDevices.size()));
+
+    // poll: espera asincrona a que todos los threads de farm terminen (el
+    // connect(thread, finished) los quita de m_farms), luego login de todas.
+    // v40 (bug 2026-08-12: el login nunca arrancaba y la app crasheo): si un
+    // worker queda colgado en backoff/reconnect (msleep de hasta ~16s que NO
+    // chequea m_stop), m_farms nunca se vacia y el poll esperaba para siempre.
+    // Timeout de 30s (cubre el backoff maximo): pasado el plazo se procede
+    // igual, pero filtrando del respawn los devices aun vivos. El login del
+    // refresh NUNCA debe solaparse con un worker vivo de la MISMA cuenta
+    // (doble login simultaneo = race de Qt 6.10.3, AV; los TPM eh warnings
+    // del crash apuntaban a un worker viejo reintentando login mientras el
+    // refresh logueaba esa misma cuenta).
+    m_refreshWaitDeadline = QDateTime::currentMSecsSinceEpoch() + 30000;
+    m_refreshWaitingFarms = true;
+    QTimer::singleShot(0, this, [this]() { maybeStartRefreshAllLogin(); });
+}
+
+void FarmController::maybeStartRefreshAllLogin()
+{
+    if (!m_refreshingAll)
+        return;
+    if (m_refreshWaitingFarms && !m_farms.isEmpty()) {
+        // v40: timeout — si un worker no termina, no bloquear el refresh para
+        // siempre. Los devices cuyo thread sigue vivo se quitan del respawn.
+        if (QDateTime::currentMSecsSinceEpoch() < m_refreshWaitDeadline) {
+            QTimer::singleShot(250, this, [this]() { maybeStartRefreshAllLogin(); });
+            return;
+        }
+        appendLog(QStringLiteral("Refresh: %1 farm(s) no terminaron en 30s, continuando sin ellos")
+                      .arg(m_farms.size()));
+        writeLogFile(QStringLiteral("[Refresh] %1 farms colgados tras el timeout, login sigue")
+                         .arg(m_farms.size()));
+    }
+    m_refreshWaitingFarms = false;
+
+    appendLog(QStringLiteral("Refresh: login nuevo de %1 cuentas...").arg(m_accounts.size()));
+    writeLogFile(QStringLiteral("[Refresh] login nuevo de %1 cuentas, respawn %2")
+                     .arg(m_accounts.size()).arg(m_refreshRespawnDevices.size()));
+
+    // Snapshot de devices (GUI thread): TODAS las cuentas, sin saltarse las
+    // que farmeaban (ya estan paradas). Se capturan tambien el orden de
+    // colores priorizados (para re-equipar segun prioridad si la gema
+    // desaparecio) y el cache de gemas de cada cuenta.
+    QStringList priorityColors;
+    for (int ci : m_gemPriority) {
+        if (ci < 0 || ci >= 20) continue;
+        const QString colorLower = QString::fromLatin1(kGemColorNames[ci]).left(
+            QString::fromLatin1(kGemColorNames[ci]).indexOf(QLatin1Char(' '))).toLower();
+        priorityColors.append(QStringLiteral("%1-%2").arg(ci + 1, 2, 10, QLatin1Char('0')).arg(colorLower));
+    }
+    struct RefreshTarget {
+        QString deviceId;
+        QString name;
+        QVariantList cachedGems;
+    };
+    QVector<RefreshTarget> targets;
     for (const auto &v : m_accounts) {
         const QVariantMap m = v.toMap();
-        const QString dev = m.value(QStringLiteral("device")).toString();
-        // v37 (pedido del usuario: "el refresh deberia terminar las sesiones
-        // de todas las cuentas y volver a repetir todo otra vez"): ANTES se
-        // saltaban las cuentas farmeando (el login las mataba) y su XP real
-        // quedaba congelado en el dashboard (el cexp solo se materializa al
-        // terminar la sesion). AHORA se KICKEAN via refreshXp() del worker:
-        // kick por cambio de modo FFA -> poll del settle (XP real) -> vuelta
-        // a CTF + re-spawn. El worker lo hace en su propio thread sin romper
-        // el estado (m_skipFinalCtfSpawn marca que no haga spawn TCP).
-        bool farming = false;
-        for (auto &fh : m_farms) {
-            if (fh.deviceId == dev && fh.worker && fh.thread && fh.thread->isRunning()) {
-                farming = true;
-                farmingWorkers.append(fh.worker);
-                break;
-            }
-        }
-        if (farming)
-            continue;
-        targets.append({dev, m.value(QStringLiteral("name")).toString()});
-    }
-    // v37: kickear las cuentas farmeando para que materialicen su XP (settle)
-    // y vuelvan a CTF. Cada worker hace el kick + poll en su propio thread.
-    for (FarmWorker *w : farmingWorkers) {
-        w->setSkipFinalCtfSpawn(true); // el refresh no debe spawnear TCP (el farm sigue)
-        QMetaObject::invokeMethod(w, [w]() { w->refreshXp(); }, Qt::QueuedConnection);
+        RefreshTarget t;
+        t.deviceId = m.value(QStringLiteral("device")).toString();
+        t.name = m.value(QStringLiteral("name")).toString();
+        t.cachedGems = m.value(QStringLiteral("gems")).toList();
+        targets.append(t);
     }
     const int total = targets.size();
     if (total == 0) {
         m_refreshingAll = false;
         emit refreshAllProgressChanged();
-        emit toastMessage(QStringLiteral("Todas las cuentas estan farmeando (XP en vivo)"));
+        emit toastMessage(QStringLiteral("No accounts to refresh"));
         return;
     }
 
     QThread *thread = new QThread(this);
     m_refreshAllThread = thread;
-    connect(thread, &QThread::started, thread, [this, thread, targets, total]() {
+    connect(thread, &QThread::started, thread, [this, thread, targets, total, priorityColors]() {
         for (int k = 0; k < total; ++k) {
             if (m_abortingRefreshAll.load())
                 break;
-            const QString deviceId = targets.at(k).first;
+            const QString deviceId = targets.at(k).deviceId;
             const QString pemPath = fakeTpmPathForDevice(deviceId);
             struct RefreshOut {
                 bool ok = false;
@@ -3503,6 +3563,8 @@ void FarmController::refreshAllAccounts()
                 QString name;
                 qlonglong coins = 0;
                 QVector<GemInfo> gems;
+                QString repairLog;   // v39: resultado del auto-repair
+                QString reequipLog;  // v39: resultado del re-equip por prioridad
             } out;
             if (!pemPath.isEmpty()) {
                 LoginManager local;
@@ -3520,6 +3582,62 @@ void FarmController::refreshAllAccounts()
                     if (out.gems.isEmpty()) {
                         QThread::msleep(1000);
                         out.gems = local.fetchInventory(5);
+                    }
+                    // v39 (pedido del usuario): el refresh mantiene las gemas
+                    // operativas. 1) REPAIR: la gema equipada danada por
+                    // durabilidad se repara. 2) RE-EQUIP: si el inventario
+                    // quedo vacio (la gema desaparecio/rotura total), se
+                    // equipa otra segun el gem priority de la cuenta.
+                    if (!out.gems.isEmpty()) {
+                        const GemInfo &eg = out.gems.first();
+                        if (eg.maxDurability > 0 && eg.durability < eg.maxDurability) {
+                            const QJsonObject resp = local.apiCall(
+                                QStringLiteral("{\"do\":\"repair\",\"item\":%1,\"slot\":5}").arg(eg.id));
+                            const bool okRepair = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                            out.repairLog = okRepair
+                                ? QStringLiteral("repaired gem %1 (%2/%3)")
+                                      .arg(eg.id).arg(eg.durability).arg(eg.maxDurability)
+                                : QStringLiteral("repair gem %1 failed: %2")
+                                      .arg(eg.id).arg(resp.value(QStringLiteral("message")).toString().left(40));
+                            if (okRepair) {
+                                QThread::msleep(600);
+                                out.gems = local.fetchInventory(5);
+                            }
+                        }
+                    } else if (out.gems.isEmpty() && !priorityColors.isEmpty()) {
+                        // buscar en el cache de la cuenta la primera gema cuyo
+                        // color este mas arriba en la prioridad
+                        const QVariantList cached = targets.at(k).cachedGems;
+                        int bestId = -1;
+                        QString bestCk;
+                        for (const QString &ck : priorityColors) {
+                            for (const auto &gv : cached) {
+                                const QVariantMap gm = gv.toMap();
+                                if (gemColorKey(gm.value(QStringLiteral("sprite")).toString()) != ck)
+                                    continue;
+                                const int dur = gm.value(QStringLiteral("durability")).toInt();
+                                if (dur <= 0)
+                                    continue;
+                                bestId = gm.value(QStringLiteral("id")).toInt();
+                                bestCk = ck;
+                                break;
+                            }
+                            if (bestId > 0)
+                                break;
+                        }
+                        if (bestId > 0) {
+                            const QJsonObject resp = local.apiCall(
+                                QStringLiteral("{\"do\":\"equip\",\"item\":%1,\"slot\":5}").arg(bestId));
+                            const bool okEquip = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                            out.reequipLog = okEquip
+                                ? QStringLiteral("re-equipped gem %1 (%2) por prioridad").arg(bestId).arg(bestCk)
+                                : QStringLiteral("re-equip gem %1 failed: %2")
+                                      .arg(bestId).arg(resp.value(QStringLiteral("message")).toString().left(40));
+                            if (okEquip) {
+                                QThread::msleep(600);
+                                out.gems = local.fetchInventory(5);
+                            }
+                        }
                     }
                     out.gemsEmptyConfirmed = out.gems.isEmpty();
                 }
@@ -3541,6 +3659,13 @@ void FarmController::refreshAllAccounts()
                             am.insert(QStringLiteral("coins"), o.coins);
                         if (!o.gems.isEmpty()) {
                             const GemInfo &eg = o.gems.first();
+                            // v39: XP ganado desde el ultimo refresh (delta del
+                            // cexp persistido) para mostrarlo bajo la barra de
+                            // la gema en el dashboard.
+                            const qlonglong prevCexp = am.value(QStringLiteral("cexp")).toLongLong();
+                            const qlonglong newCexp = qlonglong(eg.cexp);
+                            if (newCexp >= prevCexp && prevCexp > 0)
+                                am.insert(QStringLiteral("xpGainRefresh"), newCexp - prevCexp);
                             am.insert(QStringLiteral("sprite"), gemSpritePath(eg.name, eg.itemLevel));
                             am.insert(QStringLiteral("gemSummary"),
                                       QStringLiteral("%1 Lv%2").arg(translateGemName(eg.name)).arg(eg.itemLevel));
@@ -3559,6 +3684,18 @@ void FarmController::refreshAllAccounts()
                             am.remove(QStringLiteral("gems"));
                         }
                         am.insert(QStringLiteral("lastRefresh"), qint64(QDateTime::currentSecsSinceEpoch()));
+                        if (!o.repairLog.isEmpty())
+                            appendLog(QStringLiteral("[Refresh] %1: %2")
+                                          .arg(am.value(QStringLiteral("name")).toString().isEmpty()
+                                                   ? shortDevice(deviceId)
+                                                   : am.value(QStringLiteral("name")).toString(),
+                                               o.repairLog));
+                        if (!o.reequipLog.isEmpty())
+                            appendLog(QStringLiteral("[Refresh] %1: %2")
+                                          .arg(am.value(QStringLiteral("name")).toString().isEmpty()
+                                                   ? shortDevice(deviceId)
+                                                   : am.value(QStringLiteral("name")).toString(),
+                                               o.reequipLog));
                     }
                     m_accounts[i] = am;
                     break;
@@ -3572,6 +3709,27 @@ void FarmController::refreshAllAccounts()
                     m_refreshAllStatus = QStringLiteral("All %1 accounts refreshed").arg(total);
                     emit refreshAllProgressChanged();
                     emit toastMessage(m_refreshAllStatus);
+                    appendLog(QStringLiteral("Refresh completo: %1 cuentas, re-spawning %2 farm(s)")
+                                  .arg(total).arg(m_refreshRespawnDevices.size()));
+                    writeLogFile(QStringLiteral("[Refresh] done %1 cuentas, respawn %2")
+                                     .arg(total).arg(m_refreshRespawnDevices.size()));
+                    // v38: las cuentas que estaban farmeando se re-spawnean
+                    // (el STOP anterior las saco; el refresh de data termino).
+                    // v40: filtrar AHORA los devices cuyo thread sigue vivo
+                    // (colgados tras el timeout) para no duplicar sesiones.
+                    if (!m_refreshRespawnDevices.isEmpty()) {
+                        for (const auto &fh : m_farms) {
+                            if (fh.thread && fh.thread->isRunning())
+                                m_refreshRespawnDevices.removeAll(fh.deviceId);
+                        }
+                        if (m_refreshRespawnDevices.isEmpty()) {
+                            appendLog(QStringLiteral("Refresh: sin respawn (farms aun corriendo)"));
+                            writeLogFile(QStringLiteral("[Refresh] sin respawn (farms aun vivos)"));
+                        }
+                        const QStringList toRespawn = m_refreshRespawnDevices;
+                        m_refreshRespawnDevices.clear();
+                        respawnDevices(toRespawn);
+                    }
                 }
             }, Qt::QueuedConnection);
             // Pausa entre cuentas para no saturar el server
@@ -3586,6 +3744,21 @@ void FarmController::refreshAllAccounts()
     }, Qt::DirectConnection);
     connect(thread, &QThread::finished, thread, &QObject::deleteLater);
     thread->start();
+}
+
+// v38: re-spawnea las cuentas indicadas tras el refresh. spawn() toma su
+// lista de m_farmSelection: se rellena temporalmente con los devices que
+// estaban farmeando (spawn() hace el snapshot al entrar), se lanza y se
+// restaura la seleccion original del usuario.
+void FarmController::respawnDevices(const QStringList &devices)
+{
+    const QVariantList savedSelection = m_farmSelection;
+    m_farmSelection.clear();
+    for (const QString &d : devices)
+        m_farmSelection.append(d);
+    spawn();
+    m_farmSelection = savedSelection;
+    emit farmSelectionChanged();
 }
 
 // ===================== REFRESH XP =====================
