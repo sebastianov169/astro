@@ -76,7 +76,11 @@ QString extractHaxeStringAfter(const QByteArray &data, const char *key)
     const int len = QString::fromLatin1(data.mid(p + 1, q - p - 1)).toInt(&ok);
     if (!ok || len <= 0 || q + 1 + len > data.size())
         return QString();
-    return QString::fromUtf8(data.mid(q + 1, len));
+    // El qw.sol guarda deviceIds URL-encoded (%2C, %3B...): decodificar siempre
+    QString val = QString::fromUtf8(data.mid(q + 1, len));
+    if (val.contains(QStringLiteral("%")))
+        val = QUrl::fromPercentEncoding(data.mid(q + 1, len));
+    return val;
 }
 
 // Todos los device id de un qw.sol (deviceId, deviceIdSecondary, deviceId4..N,
@@ -104,7 +108,10 @@ QStringList extractAllDeviceIds(const QByteArray &data)
                         if (q < data.size() && data.at(q) == ':') {
                             const int len = data.mid(v + 1, q - v - 1).toInt(&ok);
                             if (ok && len > 0 && q + 1 + len <= data.size()) {
-                                const QString dev = QString::fromUtf8(data.mid(q + 1, len));
+                                const QByteArray rawDev = data.mid(q + 1, len);
+                                QString dev = QString::fromUtf8(rawDev);
+                                if (dev.contains(QStringLiteral("%")))
+                                    dev = QUrl::fromPercentEncoding(rawDev);
                                 if (!dev.isEmpty() && !out.contains(dev))
                                     out.append(dev);
                                 pos = q + 1 + len;
@@ -398,11 +405,25 @@ QVariantList storeItemsCacheFrom(const QVector<StoreItem> &items)
 }
 
 // AppData/Astro/accounts.json (independiente del organizationName de la app)
-QString accountsFilePath()
+// FIX 2026-08-11: Qt MinGW aplica organizationName ("Astro Labs") a
+// GenericDataLocation -> la ruta real terminaba en %APPDATA%\Astro Labs\Astro
+// y no coincidia con la que usa el resto del ecosistema. Usar APPDATA fijo.
+QString astroDataBase()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    QString base;
+    const QByteArray env = qgetenv("APPDATA");
+    if (!env.isEmpty())
+        base = QString::fromLocal8Bit(env);
+    if (base.isEmpty())
+        base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
     if (base.isEmpty())
         base = QCoreApplication::applicationDirPath();
+    return base;
+}
+
+QString accountsFilePath()
+{
+    QString base = astroDataBase();
     QDir d(base + QStringLiteral("/Astro"));
     if (!d.exists())
         d.mkpath(d.absolutePath());
@@ -427,7 +448,7 @@ QString fakeTpmPathForGroup(int groupIdx)
 {
     if (groupIdx < 0)
         return QString();
-    QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    QString base = astroDataBase();
     if (base.isEmpty())
         base = QCoreApplication::applicationDirPath();
     QDir d(base + QStringLiteral("/Astro/fake_tpm"));
@@ -484,7 +505,7 @@ QString fakeTpmPathForDevice(const QString &device)
 {
     if (device.isEmpty())
         return QString();
-    QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    QString base = astroDataBase();
     if (base.isEmpty())
         base = QCoreApplication::applicationDirPath();
     QDir d(base + QStringLiteral("/Astro/fake_tpm"));
@@ -556,6 +577,12 @@ FarmController::FarmController(QObject *parent) : QObject(parent)
     m_autoRefreshTimer = new QTimer(this);
     m_autoRefreshTimer->setInterval(600000);
     connect(m_autoRefreshTimer, &QTimer::timeout, this, [this]() {
+        // 2026-08-11 (queja del usuario: "el refresh no actualiza el XP en el
+        // dashboard"): el XP en vivo ya lo reportan los workers (op 24 ->
+        // onFarmXp -> lastXp) y el flushUi lo pinta. El refreshAll salta las
+        // cuentas farmeando (no rompe sus sesiones), asi que aqui SOLO se
+        // fuerza el flush de la UI con los datos frescos del worker.
+        flushUi();
         if (!m_refreshingAll && !m_qwsLoading && !m_accounts.isEmpty())
             refreshAllAccounts();
     });
@@ -662,6 +689,19 @@ void FarmController::scanAllX2()
         const QString dev = m_accounts.at(i).toMap().value(QStringLiteral("device")).toString();
         if (dev.isEmpty())
             continue;
+        // 2026-08-11 (bug de interfaz: badges x2 rojos falsos): las cuentas con
+        // farm ACTIVO ya tienen el x2State calculado en vivo por el checkX2 del
+        // worker (con la sesion del farm). Hacer login simultaneo aqui rompe la
+        // sesion del farm o devuelve inventario vacio -> "sin x2" falso. Saltar.
+        bool farming = false;
+        for (const auto &fh : std::as_const(m_farms)) {
+            if (fh.deviceId == dev && fh.worker && fh.thread && fh.thread->isRunning()) {
+                farming = true;
+                break;
+            }
+        }
+        if (farming)
+            continue;
         ScanEntry e;
         e.device = dev;
         e.pemPath = fakeTpmPathForDevice(dev);
@@ -678,15 +718,36 @@ void FarmController::scanAllX2()
                 pf.close();
             }
         }
-        LoginResult r;
-        for (int intento = 1; intento <= 2; ++intento) {
-            r = local.login(e.device);
-            if (r.ok)
+        // FIX 2026-08-11 (crash: el scan rompia la sesion del farm): si la
+        // cuenta tiene farm activo, su worker ya tiene sk/magic validos. Usar
+        // la sesion del worker (loginifneeded sin KNOCK/LIM/EH) en vez de
+        // login completo - el login duplicado desconecta/crashea la sesion.
+        QString farmSk, farmMagic;
+        for (const auto &fh : std::as_const(m_farms)) {
+            if (fh.deviceId == e.device && fh.worker) {
+                farmSk = fh.worker->sessionSk();
+                farmMagic = fh.worker->sessionMagic();
                 break;
-            writeLogFile(QStringLiteral("[DBG] X2 scan login %1 intento=%2 fallo: %3")
-                             .arg(logName(e.device, QString())).arg(intento).arg(r.error));
-            if (intento < 2)
-                QThread::msleep(1200);
+            }
+        }
+        LoginResult r;
+        if (!farmSk.isEmpty()) {
+            // reutilizar sesion del worker: loginifneeded barato, no rompe nada
+            r.ok = local.loginWithSession(farmSk, farmMagic);
+            r.deviceId = e.device;
+            if (!r.ok)
+                writeLogFile(QStringLiteral("[DBG] X2 scan %1: sesion del farm invalida, fallback login").arg(logName(e.device, QString())));
+        }
+        if (!r.ok) {
+            for (int intento = 1; intento <= 2; ++intento) {
+                r = local.login(e.device);
+                if (r.ok)
+                    break;
+                writeLogFile(QStringLiteral("[DBG] X2 scan login %1 intento=%2 fallo: %3")
+                                 .arg(logName(e.device, QString())).arg(intento).arg(r.error));
+                if (intento < 2)
+                    QThread::msleep(1200);
+            }
         }
         if (!r.ok) {
             writeLogFile(QStringLiteral("[DBG] X2 scan %1: login fallo (%2)")
@@ -2116,6 +2177,32 @@ void FarmController::moveGemPriority(int from, int to)
     saveGemPriority();
 }
 
+// El modelo QML (priorityQmlModel) se reordena en vivo durante el drag; el
+// backend m_gemPriority NO se toco. Al soltar, la UI manda el orden final
+// (lista de ids) y aqui se reconstruye m_gemPriority en ese orden exacto.
+void FarmController::applyPriorityOrder(const QVariantList &orderedIds)
+{
+    QVector<int> newOrder;
+    newOrder.reserve(orderedIds.size());
+    for (const auto &v : orderedIds) {
+        const int id = v.toMap().value(QStringLiteral("id")).toInt();
+        if (id > 0 && m_gemPriority.contains(id) && !newOrder.contains(id))
+            newOrder.append(id);
+    }
+    // cuentas gemas que el modelo no incluyo: mantenerlas al final (por si
+    // priorityGems() filtro alguna sin cuenta)
+    for (int i = 0; i < m_gemPriority.size(); ++i) {
+        const int id = m_gemPriority.at(i);
+        if (!newOrder.contains(id))
+            newOrder.append(id);
+    }
+    if (newOrder == m_gemPriority)
+        return;
+    m_gemPriority = newOrder;
+    saveGemPriority();
+    emit gemPriorityChanged();
+}
+
 // 20 tipos de gema del juego (mismo orden que colorNames en gemSpritePath).
 static const char *kGemColorNames[] = {
     "Black Gem", "Blue Gem", "Brown Gem", "Cyan Gem", "Green Gem",
@@ -2342,10 +2429,15 @@ void FarmController::spawn()
                             // La sesion del pre-spawn se pasa al farm: sin re-login
                             // en el arranque (9 doLogin simultaneos de los farms =
                             // race de Qt 6.10.3, AV 0x1CE857/0x1C8A4E con rdi=9).
-                            // STAGGER anti-bot: 1.5s entre farms (el server corta
-                            // AUTHs simultaneos de la misma IP).
+                            // STAGGER anti-bot: el server corta AUTHs simultaneos
+                            // de la misma IP (acepta ~1 conexion cada 2-3s).
+                            // 2026-08-11 (9 cuentas en WAIT: el stagger de 1.5s
+                            // hacia conectar todas en ~13s -> el server cortaba
+                            // el handshake de las que se solapaban). Subido a
+                            // 5s: imita a un usuario abriendo las ventanas del
+                            // juego una por una (~40s para las 9).
                             {
-                                const int delayMs = spawnIdx * 1500;
+                                const int delayMs = spawnIdx * 5000;
                                 const QString dev = p.deviceId;
                                 const int gId = gemId;
                                 const QString nm = name;
@@ -2717,6 +2809,8 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
     worker->setAutoRepair(m_autoRepair);
     worker->setAutoBuyX2(m_autoBuyX2);
     worker->configure(deviceId, pemPath, gemId);
+    // prioridad de gemas (ids de color) para el cambio automatico de gema rota
+    worker->setGemPriorityList(m_gemPriority);
     worker->setAbortFlag(&m_abortingRefreshAll);
     // Si la sesion del pre-spawn es valida, pasarsela al worker para que
     // haga un "warm start" sin re-login (9 doLogin simultaneos = race).
@@ -2845,10 +2939,19 @@ void FarmController::onGemXpRead(FarmWorker *w, qlonglong cexp, qlonglong exp)
     const qlonglong delta = cexp - fh->lastGemCexp;
     fh->lastGemCexp = cexp;
 
+    // 2026-08-11 (queja del usuario: "el refresh no muestra el avance del XP"):
+    // el cexp de la gema (inventory slot=5) SE CONGELA mientras la cuenta esta
+    // en partida (el server lo materializa al terminar la sesion). El avance
+    // real en vivo esta en el XP del op 24 (fh->lastXp). Combinar ambos para
+    // que el dashboard SIEMPRE muestre progreso.
+    const qlonglong liveXp = qlonglong(fh->lastXp);
+    const qlonglong shownXp = qMax(cexp, liveXp);
+    const qlonglong shownDelta = qMax(qlonglong(0), qMax(delta, liveXp > 0 ? liveXp : 0));
+
     // Actualiza el texto de XP de la gema (solo si es la cuenta activa)
     if (fh->deviceId == resolveDeviceId()) {
         m_gemXpText = QStringLiteral("Gem XP %1/%2 | Gained (delta): %3 | Level: %4")
-                          .arg(cexp).arg(exp).arg(qMax(qlonglong(0), delta)).arg((exp > 0) ? QString::number(int((cexp * 25) / qMax(exp, qlonglong(1)))) : QStringLiteral("--"));
+                          .arg(shownXp).arg(exp).arg(shownDelta).arg((exp > 0) ? QString::number(int((cexp * 25) / qMax(exp, qlonglong(1)))) : QStringLiteral("--"));
         emit gemXpTextChanged();
     }
     scheduleUiFlush();
@@ -3075,6 +3178,21 @@ void FarmController::useAccount(int index)
     applyAccount(index);
 }
 
+// Busca por deviceId real (el modelo filtrado/ordenado de la UI puede no
+// coincidir con el orden de m_accounts: usar device evita seleccionar otra cuenta)
+void FarmController::useAccountByDevice(const QString &device)
+{
+    if (device.isEmpty())
+        return;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        if (m_accounts.at(i).toMap().value(QStringLiteral("device")).toString() == device) {
+            setDeviceId(device);
+            applyAccount(i);
+            return;
+        }
+    }
+}
+
 void FarmController::removeAccount(int index)
 {
     if (index < 0 || index >= m_accounts.size())
@@ -3112,6 +3230,32 @@ bool FarmController::toggleFarmSelection(int index, bool checked)
         m_farmSelection.removeAll(device);
     }
     // Persistencia de la seleccion: las casillas marcadas sobreviven al cierre
+    saveFarmSelection();
+    emit farmSelectionChanged();
+    return true;
+}
+
+bool FarmController::toggleFarmSelectionByDevice(const QString &device, bool checked)
+{
+    if (device.isEmpty())
+        return false;
+    int index = -1;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        if (m_accounts.at(i).toMap().value(QStringLiteral("device")).toString() == device) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0)
+        return false;
+    if (checked) {
+        if (m_farmSelection.size() >= kMaxFarmSelection)
+            return false;
+        if (!m_farmSelection.contains(device))
+            m_farmSelection.append(device);
+    } else {
+        m_farmSelection.removeAll(device);
+    }
     saveFarmSelection();
     emit farmSelectionChanged();
     return true;
@@ -3156,6 +3300,13 @@ QVariantList FarmController::workflowAccounts() const
                 am.insert(QStringLiteral("lastXp"), fh.lastXp);
                 // El delegate del dashboard lee xpGained (alias de lastXp)
                 am.insert(QStringLiteral("xpGained"), fh.lastXp);
+                // 2026-08-11: el cexp de la gema se congela en partida; el
+                // avance real va en fh.lastXp (op 24). Combinar para que el
+                // "cexp / exp" del dashboard avance en vivo.
+                const qlonglong baseCexp = am.value(QStringLiteral("cexp")).toLongLong();
+                const qlonglong liveXp = qlonglong(fh.lastXp);
+                if (liveXp > 0)
+                    am.insert(QStringLiteral("cexp"), QVariant::fromValue(baseCexp + liveXp));
                 am.insert(QStringLiteral("deaths"), fh.deaths);
                 am.insert(QStringLiteral("spawned"), fh.spawned);
                 am.insert(QStringLiteral("startedAt"), fh.startedAt);
@@ -3302,10 +3453,29 @@ void FarmController::refreshAllAccounts()
     QVector<QPair<QString, QString>> targets;
     for (const auto &v : m_accounts) {
         const QVariantMap m = v.toMap();
-        targets.append({m.value(QStringLiteral("device")).toString(),
-                        m.value(QStringLiteral("name")).toString()});
+        const QString dev = m.value(QStringLiteral("device")).toString();
+        // 2026-08-11 (refresh mataba el farm: 372 XP en 10 min): el login
+        // completo por PEM de una cuenta con sesion TCP ACTIVA la desconecta
+        // (mismo mecanismo que el potchanger). Saltar cuentas farmeando: su
+        // XP real lo reporta el worker en vivo (gemXpRead/xpUpdate).
+        bool farming = false;
+        for (const auto &fh : std::as_const(m_farms)) {
+            if (fh.deviceId == dev && fh.worker && fh.thread && fh.thread->isRunning()) {
+                farming = true;
+                break;
+            }
+        }
+        if (farming)
+            continue;
+        targets.append({dev, m.value(QStringLiteral("name")).toString()});
     }
     const int total = targets.size();
+    if (total == 0) {
+        m_refreshingAll = false;
+        emit refreshAllProgressChanged();
+        emit toastMessage(QStringLiteral("Todas las cuentas estan farmeando (XP en vivo)"));
+        return;
+    }
 
     QThread *thread = new QThread(this);
     m_refreshAllThread = thread;

@@ -10,6 +10,9 @@
 #include <QFile>
 #include <QStandardPaths>
 #include <QCryptographicHash>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
 
 #ifdef Q_OS_WIN
 #include <windows.h>

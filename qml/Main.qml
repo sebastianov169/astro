@@ -16,10 +16,9 @@ ApplicationWindow {
 
     property int page: 0
     property bool priorityOpen: false
-    // estado del drag & drop sticky del priority (indices del ListModel)
+    // estado del click-to-swap del priority (gema seleccionada)
     property bool priorityDragActive: false
     property int priorityDragStart: -1
-    property int priorityDragIndex: -1
     property bool prioritySortOpen: false
     property bool shopOpen: false
     property bool qwsOpen: false
@@ -1356,7 +1355,7 @@ ApplicationWindow {
                                         MouseArea {
                                             anchors.fill: parent
                                             z: -1
-                                            onClicked: farm.useAccount(index)
+                                            onClicked: farm.useAccountByDevice(modelData.device)
                                             cursorShape: Qt.PointingHandCursor
                                         }
                                     }
@@ -1440,7 +1439,7 @@ ApplicationWindow {
                                                     Layout.preferredWidth: 18
                                                     Layout.preferredHeight: 18
                                                     checked: farm.farmSelection.indexOf(modelData.device) >= 0
-                                                    onToggled: farm.toggleFarmSelection(index, checked)
+                                                    onToggled: farm.toggleFarmSelectionByDevice(modelData.device, checked)
                                                     indicator: Rectangle {
                                                         width: 16
                                                         height: 16
@@ -1496,7 +1495,7 @@ ApplicationWindow {
                                     MouseArea {
                                         anchors.fill: parent
                                         z: -1
-                                        onClicked: farm.useAccount(index)
+                                        onClicked: farm.useAccountByDevice(modelData.device)
                                         cursorShape: Qt.PointingHandCursor
                                     }
                                 }
@@ -1891,7 +1890,7 @@ ApplicationWindow {
                     LabelText { text: "Gem farming priority"; font.pixelSize: 18; font.weight: Font.DemiBold; Layout.fillWidth: true }
                     StatusPill { value: "ORDER"; accent: colors.amber }
                 }
-                LabelText { text: "Drag gems to set the farming priority. Top = farmed first."; color: colors.muted; font.pixelSize: 10 }
+                LabelText { text: "Click a gem to select it, then click another to swap. Top = farmed first."; color: colors.muted; font.pixelSize: 10 }
                 // cabecera
                 RowLayout { Layout.fillWidth: true; Layout.preferredHeight: 22; Layout.leftMargin: 8; Layout.rightMargin: 8
                     SmallCaption { text: "#"; Layout.preferredWidth: 34 }
@@ -1922,13 +1921,11 @@ ApplicationWindow {
                         width: ListView.view.width
                         height: 48
                         radius: 5
-                        // sticky: la fila arrastrada se eleva y resalta
-                        color: root.priorityDragIndex === prioRow.index ? Qt.lighter(colors.amber, 2.3) : (prioHover.containsMouse ? Qt.lighter(colors.surface2, 1.15) : colors.surface2)
+                        // sticky: la fila seleccionada (primer click) se resalta
+                        color: root.priorityDragStart === prioRow.index ? Qt.lighter(colors.amber, 2.3) : (prioHover.containsMouse ? Qt.lighter(colors.surface2, 1.15) : colors.surface2)
                         Behavior on color { ColorAnimation { duration: 100 } }
-                        border.color: root.priorityDragIndex === prioRow.index ? colors.amber : "transparent"
+                        border.color: root.priorityDragStart === prioRow.index ? colors.amber : "transparent"
                         border.width: 1
-                        opacity: dragArea.drag.active ? 0.5 : 1.0
-                        z: dragArea.drag.active ? 100 : 0
                         RowLayout { anchors.fill: parent; anchors.leftMargin: 8; anchors.rightMargin: 8; spacing: 8
                             LabelText { text: (prioRow.index + 1).toString().padStart(2, "0"); color: colors.faint; font.pixelSize: 11; Layout.preferredWidth: 34 }
                             GemSprite { sprite: modelData.sprite; iconSize: 32 }
@@ -1960,8 +1957,10 @@ ApplicationWindow {
                                     verticalAlignment: Text.AlignVCenter
                                 }
                                 onClicked: {
-                                    farm.toggleAutoBuyColor(modelData.id, !autoBuyBtn.checked)
-                                    autoBuyBtn.checked = !autoBuyBtn.checked
+                                    // checkable:true ya invierte checked al
+                                    // click; pasar el estado NUEVO directo (el
+                                    // viejo invertia 2 veces -> estado al reves)
+                                    farm.toggleAutoBuyColor(modelData.id, autoBuyBtn.checked)
                                 }
                             }
                             RowLayout { Layout.preferredWidth: 64; spacing: 4; z: 2
@@ -1981,40 +1980,34 @@ ApplicationWindow {
                             id: dragArea
                             anchors.fill: parent
                             anchors.rightMargin: 172
-                            cursorShape: Qt.OpenHandCursor
-                            // PATRON OFICIAL de Qt para reordenar ListView:
-                            // drag.target mueve la fila con el cursor y el
-                            // onPositionChanged reordena el MODELO en vivo.
-                            // El centro de la fila arrastrada decide el destino;
-                            // al soltar el modelo ya esta en el orden correcto.
-                            preventStealing: true
-                            drag.target: parent
-                            drag.axis: Drag.YAxis
-                            drag.threshold: 8
-                            onPressed: {
-                                root.priorityDragStart = prioRow.index
-                                root.priorityDragIndex = prioRow.index
-                                root.priorityDragActive = true
-                            }
-                            onPositionChanged: {
-                                if (!root.priorityDragActive || !dragArea.drag.active)
-                                    return
-                                // centro de la fila arrastrada en coordenadas del content
-                                var cy = dragArea.mapToItem(priorityList.contentItem, 0, prioRow.height / 2).y
-                                var over = priorityList.indexAt(0, cy)
-                                if (over >= 0 && over !== root.priorityDragIndex) {
-                                    priorityQmlModel.move(root.priorityDragIndex, over, 1)
-                                    root.priorityDragIndex = over
+                            cursorShape: Qt.PointingHandCursor
+                            // CLICK-TO-SWAP 2026-08-11 (pedido del usuario):
+                            // click en una gema la selecciona; click en otra
+                            // las intercambia. El drag fisico se pelea con el
+                            // ListView (sobreposicion) y el drag sin target no
+                            // activa drag.active en Qt 6.8 -> el swap por clicks
+                            // es robusto y simple.
+                            onClicked: {
+                                if (root.priorityDragStart < 0) {
+                                    // primera seleccion
+                                    root.priorityDragStart = prioRow.index
+                                    root.priorityDragActive = true
+                                } else if (root.priorityDragStart === prioRow.index) {
+                                    // click en la misma -> deseleccionar
+                                    root.priorityDragStart = -1
+                                    root.priorityDragActive = false
+                                } else {
+                                    // click en otra -> intercambiar posiciones
+                                    var from = root.priorityDragStart
+                                    var to = prioRow.index
+                                    // mueve el item de 'from' a 'to' (desplaza el resto)
+                                    priorityQmlModel.move(from, to, 1)
+                                    // sincroniza el backend con el orden final
+                                    farm.applyPriorityOrder(priorityQmlModel)
+                                    root.priorityDragStart = -1
+                                    root.priorityDragActive = false
+                                    root.toast("Priority updated")
                                 }
-                            }
-                            onReleased: {
-                                root.priorityDragActive = false
-                                if (root.priorityDragStart >= 0
-                                    && root.priorityDragIndex !== root.priorityDragStart) {
-                                    farm.moveGemPriority(root.priorityDragStart, root.priorityDragIndex)
-                                }
-                                root.priorityDragStart = -1
-                                root.priorityDragIndex = -1
                             }
                         }
                         HoverHandler { id: prioHover }

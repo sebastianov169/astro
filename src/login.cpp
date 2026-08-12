@@ -47,7 +47,7 @@ QString urlEncode(const QString &s, bool plusForSpace)
     QByteArray in = s.toUtf8();
     QString out;
     for (char c : in) {
-        unsigned char ch = unsigned char(c);
+        unsigned char ch = static_cast<unsigned char>(c);
         if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~')
             out += QChar(ch);
         else if (ch == ' ' && plusForSpace)
@@ -345,6 +345,39 @@ LoginResult LoginManager::login(const QString &deviceId)
     }
 }
 
+// Reutiliza una sesion ya establecida (sk/magic del worker del farm) SIN
+// KNOCK/LIM/EH. El login completo duplicado desconecta/crashea la sesion del
+// farm (mecanismo del potchanger). Verifica con loginifneeded (1 request).
+bool LoginManager::loginWithSession(const QString &sessionKey, const QString &magic)
+{
+    if (sessionKey.isEmpty() || magic.isEmpty())
+        return false;
+    m_sessionKey = sessionKey;
+    m_magic = magic;
+    m_lastCoins = 0;
+    m_accountName.clear();
+    try {
+        QJsonObject body;
+        body.insert("do", QStringLiteral("loginifneeded"));
+        body.insert("at", QString());
+        body.insert("wt", QString());
+        body.insert("usertoken", QJsonValue());
+        QJsonObject resp = apiCall(QString::fromUtf8(
+            QJsonDocument(body).toJson(QJsonDocument::Compact)));
+        // sesion valida si la respuesta tiene data.uid real (no vacio/0)
+        const int uid = resp.value("data").toObject().value("uid").toInt();
+        if (uid > 0)
+            return true;
+        m_sessionKey.clear();
+        m_magic.clear();
+        return false;
+    } catch (...) {
+        m_sessionKey.clear();
+        m_magic.clear();
+        return false;
+    }
+}
+
 QVector<GemInfo> LoginManager::fetchInventory(int slot)
 {
     QMutexLocker loginLocker(&g_loginMutex); // serializado (ver login(): construcciones QJsonObject)
@@ -449,9 +482,13 @@ QVector<StoreItem> LoginManager::fetchStore(int category)
         s.id = it.value("id").toInt();
         s.name = it.value("name").toString();
         s.sprite = it.value("sprite").toString();
-        s.level = it.value("level").toInt();
+        // FIX 2026-08-11 (bug: gemas mostraban lvl 1 en la shop): el server
+        // manda "level":1 (nivel base del item, SIEMPRE 1) + "item_level" (el
+        // nivel REAL de la gema). El orden viejo leia level primero y nunca
+        // llegaba a item_level. Invertido.
+        s.level = it.value("item_level").toInt();
         if (s.level <= 0)
-            s.level = it.value("item_level").toInt();
+            s.level = it.value("level").toInt();
         s.price = it.value("price").toInt();
         s.exp = it.value("exp").toVariant().toLongLong();
         s.owned = it.value("owned").toBool();
@@ -730,4 +767,81 @@ QJsonObject LoginManager::doFullRefresh()
     out.insert("lvl", result.lvl);
     out.insert("error", result.error);
     return out;
+}
+
+// Desequipa los slots de armor (0,1,2) antes del farm CTF. El server gasta
+// durabilidad del armor en partida y el farm de gemas no lo usa; desequipar
+// evita el desgaste. Request verificado contra el server real 2026-08-11:
+// {"do":"equip","item":<id>,"slot":<N>,"cmd":"unequip"} -> result ok.
+bool LoginManager::unequipArmorSlots()
+{
+    if (m_sessionKey.isEmpty())
+        return false;
+    auto apiCall = [&](const QString &bodyJson) -> QJsonObject {
+        QString url = kEngine + "?_sid=" + urlEncode(m_sessionKey, false) + "&rndx=" + rndx();
+        Bytes enc = m2xcEncryptFull(bytesOf(bodyJson), bytesOf(m_magic), 0, 0);
+        QByteArray resp = httpPost(QUrl(url), m2xcFmt(enc).toUtf8(), &m_net);
+        QString t = QString::fromUtf8(resp);
+        QByteArray payload = resp;
+        if (t.startsWith(QStringLiteral("tBB,"))) {
+            Bytes blob = b64Decode(t.mid(12));
+            if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2'
+                && blob[2] == 'X' && blob[3] == 'C') {
+                Bytes dec = m2xcDecryptFull(blob, bytesOf(m_magic));
+                payload = QByteArray(reinterpret_cast<const char *>(dec.data()), int(dec.size()));
+            } else {
+                Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(m_magic, 100), false);
+                while (!dec.empty() && dec.back() == 0)
+                    dec.pop_back();
+                QJsonObject firstTry = parseJsonObject(
+                    QByteArray(reinterpret_cast<const char *>(dec.data()), int(dec.size())));
+                if (firstTry.contains(QStringLiteral("result"))) {
+                    payload = QByteArray(reinterpret_cast<const char *>(dec.data()), int(dec.size()));
+                } else if (!firstTry.contains(QStringLiteral("data"))) {
+                    dec = aesCbcCrypt(blob, deriveAesKey(m_magic), false);
+                    while (!dec.empty() && dec.back() == 0)
+                        dec.pop_back();
+                    payload = QByteArray(reinterpret_cast<const char *>(dec.data()), int(dec.size()));
+                }
+            }
+        }
+        return parseJsonObject(payload);
+    };
+
+    // 1. leer el equip actual via loginifneeded (data.userinfo.equip)
+    try {
+        QJsonObject lin = apiCall(QStringLiteral("{\"do\":\"loginifneeded\",\"at\":\"\",\"wt\":\"\",\"usertoken\":null}"));
+        QJsonObject userinfo = lin.value("data").toObject().value("userinfo").toObject();
+        QJsonObject equip = userinfo.value("equip").toObject();
+        // slots de armor: 0 = arma, 1 = casco, 2 = botas (type = equipment)
+        int unequipped = 0;
+        for (const QString &slotKey : {QStringLiteral("0"), QStringLiteral("1"), QStringLiteral("2")}) {
+            if (!equip.contains(slotKey))
+                continue;
+            const QJsonObject item = equip.value(slotKey).toObject();
+            const int itemId = item.value("id").toInt();
+            if (itemId <= 0)
+                continue;
+            const QString type = item.value("type").toString().toLower();
+            if (type != QLatin1String("equipment"))
+                continue;
+            QJsonObject body;
+            body.insert("do", QStringLiteral("equip"));
+            body.insert("item", itemId);
+            body.insert("slot", slotKey.toInt());
+            body.insert("cmd", QStringLiteral("unequip"));
+            QJsonObject r = apiCall(QString::fromUtf8(
+                QJsonDocument(body).toJson(QJsonDocument::Compact)));
+            if (r.value("result").toString() == QLatin1String("ok")) {
+                ++unequipped;
+                std::printf("[UNEQUIP] slot %s: item %d desequipado\n",
+                            slotKey.toUtf8().constData(), itemId);
+                fflush(stdout);
+            }
+            QThread::msleep(400);
+        }
+        return unequipped >= 0;
+    } catch (...) {
+        return false;
+    }
 }

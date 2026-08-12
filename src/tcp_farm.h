@@ -8,6 +8,8 @@
 #include <QTcpSocket>
 #include <QUdpSocket>
 #include <QScopedPointer>
+#include <QRandomGenerator>
+#include <QList>
 #include <atomic>
 #include <vector>
 #include <cstdint>
@@ -65,6 +67,8 @@ class MersenneTwister {
 public:
     explicit MersenneTwister(std::uint32_t seed);
     std::uint32_t nextVal();
+    void saveState(std::uint32_t out[624], int &outIndex) const;
+    void restoreState(const std::uint32_t in[624], int index);
 private:
     std::uint32_t m_mt[624];
     int m_index = 624;
@@ -123,6 +127,16 @@ public:
     ~FarmWorker() override;
 
     void configure(const QString &deviceId, const QString &pemPath, int gemItem);
+    // Lista de prioridad de gemas (ids de color 0-19, orden de farmeo): si la
+    // gema actual esta rota (durability 0 y sin repair), el worker cambia a la
+    // siguiente disponible de esta lista (tarea del amigo 2026-08-11).
+    void setGemPriorityList(const QVector<int> &priority) { m_gemPriorityList = priority; }
+    // Cambia a la siguiente gema de la prioridad cuando la actual esta rota.
+    void switchToNextGem(QNetworkAccessManager *net, const QString &sk, const QString &magic,
+                         const QJsonArray &items);
+    // Jitter de reconexion ampliado + sesgo por deviceId: des-sincroniza los
+    // reintentos cuando varias cuentas caen a la vez (farm inestable 2026-08-11).
+    int reconnectJitterMs() const { return QRandomGenerator::global()->bounded(4000); }
     void setUseRoom(bool useRoom) { m_useRoom = useRoom; }
     void setAutoRespawn(bool on) { m_autoRespawn.store(on); }
     void setAutoRepair(bool on) { m_autoRepair.store(on); }
@@ -234,6 +248,10 @@ signals:
     void accountState(const QString &mode, const QString &region); // modo actual (CTF/FFA) + region
 
 private:
+    // XP total acumulada por el worker a traves de reconexiones: el FarmState
+    // se recrea en cada intento TCP y perderia el contador (bug reportado:
+    // "como funciona el contador de xp?").
+    double m_sessionXpTotal = 0.0;
     struct FarmState {
         QString suffix;
         std::unique_ptr<tcp::MersenneTwister> mt;
@@ -324,9 +342,11 @@ private:
     // cada 1s + UDP MOVE (puerto 3724, opcode 0x002726) cada 1s, con valores
     // AFK (34.0, -3.084, 0.9309: no mueven, no disparan). Socket UDP creado
     // en run() tras el connect; NULL si falla (el TCP MOVE sigue solo).
-    QScopedPointer<QUdpSocket> m_udpSock{nullptr};
-    QByteArray m_udpPrefix;   // 9 bytes: 0x80|rand + 8 chars del charset del binario
-    quint32 m_udpSeq = 0;     // secuencia del UDP MOVE (incrementa por envio)
+QScopedPointer<QUdpSocket> m_udpSock{nullptr};
+QByteArray m_udpPrefix;   // 9 bytes: 0x80|rand + 8 chars del charset del binario
+quint32 m_udpSeq = 0;     // secuencia del UDP MOVE (incrementa por envio)
+// coordenadas pseudo-aleatorias del UDP MOVE (simulan movimiento de jugador)
+double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     QString m_udpIp;          // IP resuelta del server (QHostAddress NO resuelve nombres)
     // Aborto cooperativo EXTERNO (verificado 2026-08-08, familia 0x1CE857):
     // el refreshXp del worker local del refreshAll pollea el settle hasta
@@ -350,6 +370,7 @@ private:
     qlonglong m_gemCexpInicial = -1; // cexp (XP del nivel) al iniciar la sesion (idem; el server mueve cexp, no exp)
     qint64 nextGemXpRead = 0; // proxima lectura HTTP de la XP de la gema (cadencia 60s, la misma del updateexp)
     int m_gemItem = 0;
+    QVector<int> m_gemPriorityList; // prioridad de gemas (ids de color), vacia = solo la actual
     QString m_sk;             // session key del login (para el refresh de XP sin re-login)
     QString m_magic;          // magic del login (idem)
     // Mutex de sesion (THR-2): m_sk/m_magic/m_connectIndex/m_gemExpInicial/
@@ -371,6 +392,20 @@ private:
     // comparten proceso y el static era una data race. Se resetea al iniciar
     // cada run().
     int m_undecCount = 0;
+    // 2026-08-11 (deteccion de muerte): timestamps (reloj real ms) de los
+    // frames 0x64 recientes (formato interno de entidades del server). >=3
+    // en 5s = muerte del jugador -> respawn minimo como el binario.
+    QList<qint64> m_undecBurstAt;
+    // 2026-08-11 v3: ultimo respawn por muerte 0x641b (cooldown 8s).
+    qint64 m_lastRespawnAt = 0;
+    // 2026-08-11 v5: ultima reply CLIENT_EQUIPMENT_DATA a los frames 0x64
+    // (el server pide el equip en el spawn/respawn; cooldown 3s).
+    qint64 m_lastEquipReplyAt = 0;
+    // 2026-08-11 v3: tag GLOBAL del mmm (el binario lo lleva creciente 34->65+
+    // sin reset entre sesiones; el server corta si el tag vuelve a 2). El
+    // binario ARRANCA en 2 (v6: tag=20 inicial empeoro, prom 39s vs 87s de
+    // tag=2; los tags altos de la captura flush eran de un proceso longevo).
+    int m_mmmTag = 2;
     // 2026-08-10 (bug auto-buy): los timers largos (updateexp/autoBuyX2) usaban
     // t0.elapsed() que se REINICIA en cada reconexion (continue del run()); el
     // CTF mata la partida cada ~40s asi que el chequeo de 60s nunca alcanzaba.

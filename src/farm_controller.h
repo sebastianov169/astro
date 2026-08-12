@@ -150,6 +150,9 @@ public slots:
     Q_INVOKABLE void loadAccounts();                          // lee accounts.json al arrancar
     Q_INVOKABLE void toggleFavorite(int index);               // estrella favorito (sube la cuenta arriba)
     Q_INVOKABLE bool toggleFarmSelection(int index, bool checked); // casilla "a farmear" (max 10)
+    // variantes por deviceId (robustas al modelo filtrado/ordenado de la UI)
+    Q_INVOKABLE void useAccountByDevice(const QString &device);
+    Q_INVOKABLE bool toggleFarmSelectionByDevice(const QString &device, bool checked);
     Q_INVOKABLE void clearFarmSelection();
     void saveFarmSelection();
     void loadFarmSelection();
@@ -177,6 +180,9 @@ public slots:
     Q_INVOKABLE void repairGem(int gemId);                    // repara gema rota {"do":"repair","item":id,"slot":5}
     // ---- prioridad de gemas ----
     Q_INVOKABLE void moveGemPriority(int from, int to);       // reordena la lista de prioridad (drag & drop)
+    // Aplica el orden FINAL del modelo QML al backend (robusto al drag): el
+    // modelo visual se reordena en vivo y este metodo sincroniza m_gemPriority.
+    Q_INVOKABLE void applyPriorityOrder(const QVariantList &orderedIds);
     Q_INVOKABLE void loadGemPriority();                       // lee QSettings al arrancar
     Q_INVOKABLE void saveGemPriority();                       // persiste en QSettings
     Q_INVOKABLE QVariantList priorityGems() const;            // todas las gemas unicas de las cuentas, ordenadas por prioridad

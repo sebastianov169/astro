@@ -59,6 +59,12 @@ public:
     // Bloqueante. deviceId vacio -> lee MitosisOG/qw.sol.
     LoginResult login(const QString &deviceId);
 
+    // FIX 2026-08-11 (crash del X2 scan con farm activo): reutiliza una
+    // sesion ya establecida (sk/magic del worker) SIN hacer KNOCK/LIM/EH -
+    // el login completo duplicado desconecta/crashea la sesion del farm.
+    // Devuelve ok=true si la sesion es valida (loginifneeded responde).
+    bool loginWithSession(const QString &sessionKey, const QString &magic);
+
     // PEM de atestacion (fake TPM) para el EH de ESTA cuenta/device. Cada
     // account/device usa SIEMPRE su propia clave (setAttestPem); si esta vacia,
     // login() falla con error en vez de caer a la clave embebida compartida.
@@ -66,6 +72,12 @@ public:
 
     // Consulta el inventory de un slot. Devuelve las gemas.
     QVector<GemInfo> fetchInventory(int slot = 5);
+
+    // Desequipa los slots de armor (0=arma, 1=casco, 2=botas) antes del farm:
+    // el server gasta durabilidad del armor en partida y el farm CTF no lo usa.
+    // Request verificado: {"do":"equip","item":<id>,"slot":<N>,"cmd":"unequip"}.
+    // Devuelve true si todos los slots quedaron sin armor (o ya estaban vacios).
+    bool unequipArmorSlots();
 
     // Consulta la tienda (do:"store"). category=10 -> gemas del catalogo con
     // precio de compra. Devuelve los items de la tienda (StoreItem).
