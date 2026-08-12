@@ -1581,6 +1581,13 @@ bool FarmWorker::readGemXp(const QJsonObject &invResp, qlonglong *cexpOut, qlong
     for (const auto &iv : items) {
         QJsonObject it = iv.toObject();
         int id = it.value("id").toInt(-1);
+        // DEBUG v29: loguear el JSON completo del item para encontrar el
+        // campo del XP acumulado (el cexp/exp son del nivel, estaticos).
+        if (id == m_gemItem || id == activeId) {
+            emitLog(QString("GEM ITEM RAW (id=%1): %2")
+                        .arg(id)
+                        .arg(QString::fromUtf8(QJsonDocument(it).toJson(QJsonDocument::Compact)).left(300)));
+        }
         if (id == m_gemItem) {
             if (cexpOut) *cexpOut = jsonGemXp(it.value("cexp"));
             if (expOut) *expOut = jsonGemXp(it.value("exp"));
@@ -2368,17 +2375,15 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
             drainMs(150);
         } catch (...) {}
     }
-    // AUTO-REPAIR en cada spawn/respawn (2026-08-10, bug reportado por el
-    // usuario): antes vivia dentro del bloque nextGemXpRead (60s con
-    // t0.elapsed() que se reinicia en cada reconexion — el CTF mata la
-    // partida ~40s, el chequeo nunca corria). Aqui corre en CADA [20]
-    // (spawn inicial y respawn), con 1 solo inventory. Repara si
-    // durability <= max/2 (incluye 0 = rota).
-    // 2026-08-11 (sesiones cortas: el postSpawn de 5-7 HTTPs serializados
-    // tardaba ~12s y el server cortaba): el auto-repair SOLO si la gema NO
-    // esta equipada (recien equipada -> puede estar dañada). Si ya esta
-    // equipada desde el pre-connect, se salta (ahorra 2 HTTPs en el postSpawn).
-    if (m_autoRepair.load() && m_gemItem > 0 && !m_gemEquipped) {
+    // AUTO-REPAIR en cada spawn/respawn (2026-08-11, BUG REAL: las gemas se
+    // rompen al llegar al limite de XP y quedan rotas para siempre). Antes
+    // el auto-repair solo corria si !m_gemEquipped, pero el pre-connect
+    // equipa la gema ANTES del postSpawn -> m_gemEquipped=true -> el repair
+    // NUNCA corria -> las gemas rotas (durability:0) bloqueaban el XP de las
+    // cuentas (el cexp quedo congelado en todas: 3768/7200, 12997/14400...).
+    // v30: reparar SIEMPRE si la gema esta danada (durability <= max/2),
+    // este o no equipada.
+    if (m_autoRepair.load() && m_gemItem > 0) {
         try {
             QJsonObject invR = httpApiDrain(apiJson({ {"do", "inventory"}, {"slot", 5} }));
             const QJsonArray items = invR.value("data").toObject().value("items").toArray();
@@ -2394,9 +2399,13 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
                             QString repairMsg = repairResp.value("message").toString();
                             bool repairOk = repairResp.value("result").toString() == QLatin1String("ok");
                             emitLog(QString("Auto-repair result: %1 (%2)").arg(repairOk ? "ok" : "failed").arg(repairMsg.left(60)));
+                            // v32 (aclaracion del usuario): las gemas rotas por
+                            // DESGASTE se reparan y se sigue con ellas (repair ok).
+                            // Las que desaparecen por LIMITE de XP se van solas y
+                            // vuelven a la tienda (aparte del macro). Aqui solo se
+                            // cambia de gema si el repair FALLA con la gema rota.
                             if (!repairOk && dur <= 0 && !m_gemPriorityList.isEmpty()) {
-                                // Gema ROTA y repair fallo: cambiar a la siguiente
-                                // gema disponible de la prioridad (tarea 2026-08-11).
+                                emitLog("Gem ROTA y repair fallo - cambiando a la siguiente");
                                 switchToNextGem(net, sk, magic, items);
                             }
                         } catch (...) {}
