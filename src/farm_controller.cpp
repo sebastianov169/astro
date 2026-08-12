@@ -3451,23 +3451,35 @@ void FarmController::refreshAllAccounts()
 
     // Snapshot de devices (GUI thread)
     QVector<QPair<QString, QString>> targets;
+    QVector<FarmWorker *> farmingWorkers;
     for (const auto &v : m_accounts) {
         const QVariantMap m = v.toMap();
         const QString dev = m.value(QStringLiteral("device")).toString();
-        // 2026-08-11 (refresh mataba el farm: 372 XP en 10 min): el login
-        // completo por PEM de una cuenta con sesion TCP ACTIVA la desconecta
-        // (mismo mecanismo que el potchanger). Saltar cuentas farmeando: su
-        // XP real lo reporta el worker en vivo (gemXpRead/xpUpdate).
+        // v37 (pedido del usuario: "el refresh deberia terminar las sesiones
+        // de todas las cuentas y volver a repetir todo otra vez"): ANTES se
+        // saltaban las cuentas farmeando (el login las mataba) y su XP real
+        // quedaba congelado en el dashboard (el cexp solo se materializa al
+        // terminar la sesion). AHORA se KICKEAN via refreshXp() del worker:
+        // kick por cambio de modo FFA -> poll del settle (XP real) -> vuelta
+        // a CTF + re-spawn. El worker lo hace en su propio thread sin romper
+        // el estado (m_skipFinalCtfSpawn marca que no haga spawn TCP).
         bool farming = false;
-        for (const auto &fh : std::as_const(m_farms)) {
+        for (auto &fh : m_farms) {
             if (fh.deviceId == dev && fh.worker && fh.thread && fh.thread->isRunning()) {
                 farming = true;
+                farmingWorkers.append(fh.worker);
                 break;
             }
         }
         if (farming)
             continue;
         targets.append({dev, m.value(QStringLiteral("name")).toString()});
+    }
+    // v37: kickear las cuentas farmeando para que materialicen su XP (settle)
+    // y vuelvan a CTF. Cada worker hace el kick + poll en su propio thread.
+    for (FarmWorker *w : farmingWorkers) {
+        w->setSkipFinalCtfSpawn(true); // el refresh no debe spawnear TCP (el farm sigue)
+        QMetaObject::invokeMethod(w, [w]() { w->refreshXp(); }, Qt::QueuedConnection);
     }
     const int total = targets.size();
     if (total == 0) {
