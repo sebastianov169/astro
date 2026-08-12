@@ -3596,6 +3596,10 @@ void FarmWorker::run()
     int mmmTag = mmmTagGet(m_deviceId);
     qint64 lastDeathTime = 0;
     qint64 lastPingAt = QDateTime::currentMSecsSinceEpoch(); // watchdog de respawn
+    // v34: ultima actividad REAL de partida (op24 XP / op35 estado / op20).
+    // El server no corta TCP ni envia op33 al terminar la partida; solo deja
+    // de mandar XP. Este watchdog detecta la partida muerta y reconecta.
+    qint64 lastMatchActivityAt = QDateTime::currentMSecsSinceEpoch();
     emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
     emit stateChanged("Farming CTF... (press Stop to stop)");
     // diagnostico 2026-08-10: el auto-buy no corria — verificar que el flag
@@ -3890,6 +3894,7 @@ void FarmWorker::run()
                             emitLog("Resume key (40) recibido");
                         }
                     } else if (op == 20) {
+                        lastMatchActivityAt = now; // v34: SPAWNED = partida activa
                         if (matchEnded && m_autoRespawn) {
                             // Partida terminada (match_end.log): [33,null] + [20] -> el
                             // binario hace news -> openchest -> userinfo -> i18n ->
@@ -3972,6 +3977,8 @@ void FarmWorker::run()
                             nextMmm = now + 1500;
                             nextUpdateExp = now + 1000;
                             nextGemXpRead = now + 60000; // XP de la gema por HTTP: lectura del cexp, no updateexp
+                            if (m_nextFullRefresh < 0)
+                                m_nextFullRefresh = QDateTime::currentMSecsSinceEpoch() + 600000; // v35: refresh completo cada 10 min
                             // 2026-08-10 (fix auto-buy): programar el primer
                             // chequeo desde el SPAWNED con RELOJ REAL (el
                             // t0.elapsed() se reinicia en cada reconexion y el
@@ -3989,9 +3996,12 @@ void FarmWorker::run()
                         state.xpTotal += xp;
                         state.xpLast = xp;
                         m_sessionXpTotal = state.xpTotal;
+                        lastMatchActivityAt = now; // v34: partida viva (XP llega)
                         emit debugLog(QString("XP +%1 (total %2)").arg(xp, 0, 'f', 1).arg(state.xpTotal, 0, 'f', 1));
                         emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, state.spawned);
                     } else if (op == 35 || op == 10) {
+                        // v34: op35 = PLAYER_STATUS, op10 = MAP — actividad de partida
+                        lastMatchActivityAt = now;
                         // log del contenido: el binario recibe la XP de la gema como
                         // [35, [-1, "Has obtenido +XP"]] + [10, [26, ...]] (match_end.log)
                         QString dataStr;
@@ -4153,6 +4163,62 @@ void FarmWorker::run()
                 emitLog("WATCHDOG: play + JOIN enviados (respawn forzado)");
             } catch (...) {}
             lastPingAt = now;
+        }
+        // FIX 2026-08-11 v34+v36 (fin de partida SIN corte TCP - dato del test
+        // manual del usuario): cuando la partida CTF termina o el jugador
+        // muere, el server NO corta el TCP y NO envia op33 (TEAM_GAME_ENDED)
+        // — solo deja de enviar op24 (EXPERIENCE_GAIN) y op35 (PLAYER_STATUS).
+        // El bot quedaba colgado respondiendo PONGs a una partida muerta
+        // (respawns de 100-300s). Watchdog de ACTIVIDAD: si llevamos 10s
+        // spawnados sin op24/op35/op20, la partida termino o el jugador
+        // murio -> reconectar inmediatamente (el op24 llega cada ~2-5s en
+        // partida viva).
+        if (state.spawned && m_autoRespawn && now - lastMatchActivityAt >= 10000) {
+            emitLog("WATCHDOG: 10s sin XP/estado de partida - reconectando");
+            lastMatchActivityAt = now;
+            lastPingAt = 0; // fuerza el bloque de reconexion TCP
+            sock->abort();
+            continue;
+        }
+        // FIX 2026-08-11 v35 (pedido del usuario): REFRESH COMPLETO cada
+        // 600s. Verifica: (1) XP ganada (inventory slot=5), (2) gema rota
+        // por durabilidad -> reparar, (3) gema desaparecida -> equipar otra
+        // segun la gem priority, (4) x2 activo -> si no, recomprar.
+        if (now >= m_nextFullRefresh) {
+            m_nextFullRefresh = QDateTime::currentMSecsSinceEpoch() + 600000;
+            emitLog("REFRESH 600s: verificando gema + x2");
+            try {
+                QJsonObject invR = apiCall(&net, sk, magic, apiJson({ {"do", "inventory"}, {"slot", 5} }));
+                const QJsonArray items = invR.value("data").toObject().value("items").toArray();
+                const int activeId = invR.value("data").toObject().value("current").toInt(-1);
+                bool gemFound = false;
+                int gemDur = -1;
+                for (const auto &iv : items) {
+                    const QJsonObject item = iv.toObject();
+                    if (item.value("id").toInt() == m_gemItem) {
+                        gemFound = true;
+                        gemDur = item.value("durability").toInt();
+                        break;
+                    }
+                }
+                if (!gemFound && activeId != m_gemItem) {
+                    // La gema desaparecio (limite de XP -> a la tienda):
+                    // equipar la siguiente de la gem priority.
+                    emitLog("REFRESH: gema " + QString::number(m_gemItem) + " desaparecida - equipando otra segun prioridad");
+                    if (!m_gemPriorityList.isEmpty())
+                        switchToNextGem(&net, sk, magic, items);
+                } else if (gemDur <= 0 && m_autoRepair.load()) {
+                    // Gema rota por durabilidad -> reparar
+                    emitLog(QString("REFRESH: gema %1 rota (dur=%2) - reparando").arg(m_gemItem).arg(gemDur));
+                    try {
+                        QJsonObject rep = apiCall(&net, sk, magic, apiJson({ {"do", "repair"}, {"item", m_gemItem}, {"slot", 5} }));
+                        emitLog("REFRESH repair: " + rep.value("message").toString().left(50));
+                    } catch (...) {}
+                }
+                // x2: verificar activo y recomprar si expiro
+                if (m_autoBuyX2.load())
+                    checkX2(&net, sk, magic);
+            } catch (...) {}
         }
 
         // (MOVE keepalive SOLO UDP cada 1s: el TCP [10022] KICKEA — captura

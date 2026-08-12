@@ -373,7 +373,7 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     bool m_skipFinalCtfSpawn = false; // refreshXp: omite solo el spawn CTF final (el farm re-spawnea)
     int m_spawnDeadlineMs = 30000;    // spawnSession: deadline del [20] SPAWNED (15s refresh, 120s farm)
     int m_greetingTimeoutMs = 8000;  // spawnSession: tope del greeting/suffix (10s refresh, 8s farm; 20s hacia que el retry tardara minutos)
-    bool m_useRoom = true; // v21: sala privada con timeout ampliado (90s) — el amigo valido 9/9 cuentas 300s en sala privada. El CTF publico corta por anti-multibox.
+    bool m_useRoom = false; // v33: CTF PUBLICO (la sala privada no da XP - dato del usuario; el joinroom era de pruebas)publico corta por anti-multibox.
     QString m_deviceId;
     QString m_pemPath;
     QString m_authToken;      // token del connect (para el re-AUTH del respawn)
@@ -427,4 +427,12 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     // CTF mata la partida cada ~40s asi que el chequeo de 60s nunca alcanzaba.
     // m_nextAutoBuyX2 usa RELOJ REAL y persiste entre sesiones (miembro).
     qint64 m_nextAutoBuyX2 = -1; // -1 = programar al primer SPAWNED
+    // v35: refresh completo cada 600s (pedido del usuario): verifica XP ganada
+    // (inventory slot=5), repara gema rota por durabilidad, re-equipa si la
+    // gema desaparecio (gem priority) y re-compra x2 si expiro. RELOJ REAL.
+    qint64 m_nextFullRefresh = -1; // -1 = programar al primer SPAWNED
+    // v36: refresco al terminar cada partida (deteccion de fin de partida sin
+    // corte TCP): el server deja de enviar op24/op35 pero NO corta. Este flag
+    // marca que la partida termino y el loop debe reconectar al instante.
+    bool m_matchFinished = false;
 };
