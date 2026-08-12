@@ -864,6 +864,14 @@ Bytes makeNativePlayFrameKeyed(std::uint32_t seed, const QString &nonce, const B
     } else {
         toEncrypt = bytesOf(nonce);
     }
+    return makeNativePlayFrameKeyedRaw(seed, toEncrypt, key, flag);
+}
+
+// v28: JOIN que re-cifra el payload CRUDO del op53 (lo que el binario hace:
+// 're-encrypting op53 under a fixed key'). El raw es el frame AMF3 completo
+// [53, token] tal como llego del server, no un string reconstruido.
+Bytes makeNativePlayFrameKeyedRaw(std::uint32_t seed, const Bytes &toEncrypt, const Bytes &key, bool flag)
+{
     Bytes blob = m2xcEncryptFull(toEncrypt, key, 0, 0);
     QString challenge = m2xcFmt(blob);
     Bytes logical = amfArray({amfInt(5), amfArray({amfString(challenge), amfBool(flag)})});
@@ -2414,12 +2422,17 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
     try {
         httpApiDrain(apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
     } catch (...) {}
-    // FIX 2026-08-11 v14: el JOIN cifra con host+suffix (key del ACK), no
-    // solo suffix — el server no validaba el JOIN cifrado con suffix.
-    sendFrame(sock, tcp::makeNativePlayFrameFlag(state->seed,
-                                                       state->spawnToken.isEmpty() ? randomNonce() : state->spawnToken,
-                                                       suffix, false));
-    emitLog("play + JOIN (op5) con spawn token (key host+suffix)");
+    // FIX 2026-08-11 v28: el JOIN re-cifra el payload CRUDO del op53
+    // (state->spawnTokenRaw), no el string decodificado (que tenia prefijo
+    // '00000008' malinterpretado). Si no hay raw, fallback al string.
+    if (!state->spawnTokenRaw.empty()) {
+        sendFrame(sock, tcp::makeNativePlayFrameKeyedRaw(state->seed, state->spawnTokenRaw, bytesOf(suffix), false));
+    } else {
+        sendFrame(sock, tcp::makeNativePlayFrameFlag(state->seed,
+                                                     state->spawnToken.isEmpty() ? randomNonce() : state->spawnToken,
+                                                     suffix, false));
+    }
+    emitLog("play + JOIN (op5) con spawn token raw");
     drainMs(287);
     // FIX v6: el equip frame en el postSpawn empeoro (prom 55s vs 87s de la
     // config sin equip). El binario lo envia en rafagas tras el respawn pero
@@ -3832,8 +3845,9 @@ void FarmWorker::run()
                                 emitLog("op 51=" + QString::number(v.arr[1].i) + " (tick del server, no es muerte)");
                         }
                     } else if (op == 53 || op == 40) {
-                        // FIX 2026-08-11 v9: op53 = SPAWN TOKEN -> capturarlo
-                        // para el op5 JOIN (antes se usaba un nonce aleatorio).
+                        // FIX 2026-08-11 v9+v28: op53 = SPAWN TOKEN -> capturarlo
+                        // para el op5 JOIN. v28: guardar el payload CRUDO (el
+                        // JOIN re-cifra el op53 completo, no el string).
                         if (op == 53 && v.arr.size() >= 2) {
                             if (v.arr[1].type == tcp::AmfValue::Str)
                                 state.spawnToken = v.arr[1].s;
@@ -3841,7 +3855,9 @@ void FarmWorker::run()
                                 state.spawnToken = QString::number(v.arr[1].i);
                             else if (v.arr[1].type == tcp::AmfValue::Double)
                                 state.spawnToken = QString::number(v.arr[1].d);
-                            emitLog("SPAWN TOKEN (op53): " + state.spawnToken.left(20));
+                            state.spawnTokenRaw = payload;
+                            emitLog("SPAWN TOKEN (op53): " + state.spawnToken.left(20)
+                                    + " raw=" + QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(payload.data()), int(payload.size())).toHex().left(32)));
                         }
                         if (!readySent) {
                             // Orden exacto del binario (captura ctf_full.log):
@@ -3926,9 +3942,11 @@ void FarmWorker::run()
                             try {
                                 apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                             } catch (...) {}
-                            sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed,
+                    sendFrame(sock.get(), state.spawnTokenRaw.empty()
+                        ? tcp::makeNativePlayFrameFlag(state.seed,
                                                        state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
-                                                       state.suffix, false));
+                                                       state.suffix, false)
+                        : tcp::makeNativePlayFrameKeyedRaw(state.seed, state.spawnTokenRaw, bytesOf(state.suffix), false));
                             // el binario hace updateexp ~1s tras el play/respawn
                             nextUpdateExp = now + 1000;
                             emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
@@ -4118,9 +4136,11 @@ void FarmWorker::run()
             emitLog("WATCHDOG: 5s sin PINGs - forzando respawn");
             try {
                 apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
-                sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed,
-                                                       state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
-                                                       state.suffix, false));
+                sendFrame(sock.get(), state.spawnTokenRaw.empty()
+                    ? tcp::makeNativePlayFrameFlag(state.seed,
+                                                   state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
+                                                   state.suffix, false)
+                    : tcp::makeNativePlayFrameKeyedRaw(state.seed, state.spawnTokenRaw, bytesOf(state.suffix), false));
                 emitLog("WATCHDOG: play + JOIN enviados (respawn forzado)");
             } catch (...) {}
             lastPingAt = now;

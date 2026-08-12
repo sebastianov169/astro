@@ -100,6 +100,7 @@ Bytes makeNativePlayFrame(std::uint32_t seed, const QString &nonce, const QStrin
 // NATIVE_PLAY con flag explicito: el binario envia [5,[challenge,true]] y luego [5,[challenge,false]]
 Bytes makeNativePlayFrameFlag(std::uint32_t seed, const QString &nonce, const QString &suffix, bool flag);
 Bytes makeNativePlayFrameKeyed(std::uint32_t seed, const QString &nonce, const Bytes &key, bool flag);
+Bytes makeNativePlayFrameKeyedRaw(std::uint32_t seed, const Bytes &toEncrypt, const Bytes &key, bool flag);
 // NATIVE_PLAY de SPAWN real del juego: [5, [false]] + 3 ceros + resturple(seed)
 Bytes makeNativePlaySpawnFrame(std::uint32_t seed);
 // CLIENT_ENTITIES_INFO [10002, [0]] + CLIENT_EQUIPMENT_DATA [10037, []]
@@ -262,11 +263,15 @@ private:
         std::uint32_t seed = 0;
         int pingCount = 0;
         QString playerId;
-        // 2026-08-11 v9: el spawn token del op53 (el server lo envia si la
+        // 2026-08-11 v9+v28: el spawn token del op53 (el server lo envia si la
         // identidad es correcta; el op5 JOIN debe re-cifrarlo, no un nonce
         // aleatorio — el amigo: "the client turns the spawn token into a
         // join request, re-encrypting op53 under a fixed key").
         QString spawnToken;
+        // v28: payload CRUDO del frame op53 (el JOIN re-cifra el op53
+        // completo, no el string decodificado — el string tenia un prefijo
+        // '00000008' que el Amf3Decoder malinterpretaba).
+        Bytes spawnTokenRaw;
         double xpTotal = 0.0;
         double xpLast = 0.0;
         double coinsTotal = 0.0;
