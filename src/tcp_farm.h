@@ -99,6 +99,7 @@ Bytes makeTcpMove(double moveFirst, double angle, double power);
 Bytes makeNativePlayFrame(std::uint32_t seed, const QString &nonce, const QString &suffix);
 // NATIVE_PLAY con flag explicito: el binario envia [5,[challenge,true]] y luego [5,[challenge,false]]
 Bytes makeNativePlayFrameFlag(std::uint32_t seed, const QString &nonce, const QString &suffix, bool flag);
+Bytes makeNativePlayFrameKeyed(std::uint32_t seed, const QString &nonce, const Bytes &key, bool flag);
 // NATIVE_PLAY de SPAWN real del juego: [5, [false]] + 3 ceros + resturple(seed)
 Bytes makeNativePlaySpawnFrame(std::uint32_t seed);
 // CLIENT_ENTITIES_INFO [10002, [0]] + CLIENT_EQUIPMENT_DATA [10037, []]
@@ -254,10 +255,18 @@ private:
     double m_sessionXpTotal = 0.0;
     struct FarmState {
         QString suffix;
+        // 2026-08-11 v14: host del server (para la key del op5 JOIN =
+        // host + suffix, igual que el ACK del binario).
+        QString host;
         std::unique_ptr<tcp::MersenneTwister> mt;
         std::uint32_t seed = 0;
         int pingCount = 0;
         QString playerId;
+        // 2026-08-11 v9: el spawn token del op53 (el server lo envia si la
+        // identidad es correcta; el op5 JOIN debe re-cifrarlo, no un nonce
+        // aleatorio — el amigo: "the client turns the spawn token into a
+        // join request, re-encrypting op53 under a fixed key").
+        QString spawnToken;
         double xpTotal = 0.0;
         double xpLast = 0.0;
         double coinsTotal = 0.0;
@@ -359,10 +368,12 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     bool m_skipFinalCtfSpawn = false; // refreshXp: omite solo el spawn CTF final (el farm re-spawnea)
     int m_spawnDeadlineMs = 30000;    // spawnSession: deadline del [20] SPAWNED (15s refresh, 120s farm)
     int m_greetingTimeoutMs = 8000;  // spawnSession: tope del greeting/suffix (10s refresh, 8s farm; 20s hacia que el retry tardara minutos)
-    bool m_useRoom = false; // false = CTF publico europa (default), true = sala HM COMP MEX GEARS
+    bool m_useRoom = true; // v21: sala privada con timeout ampliado (90s) — el amigo valido 9/9 cuentas 300s en sala privada. El CTF publico corta por anti-multibox.
     QString m_deviceId;
     QString m_pemPath;
     QString m_authToken;      // token del connect (para el re-AUTH del respawn)
+    // 2026-08-11 v14: host del server actual (key del op5 JOIN = host+suffix)
+    QString m_currentHost;
     QString m_inviteString;   // invite de la sala (para el AUTH del respawn)
     int m_connectIndex = 0;   // indice "i" del connect (se incrementa con cada reconnect, como el binario)
     QString m_region;         // region CTF actual (random por sesion, ver pickRandomRegion)
@@ -401,11 +412,11 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     // 2026-08-11 v5: ultima reply CLIENT_EQUIPMENT_DATA a los frames 0x64
     // (el server pide el equip en el spawn/respawn; cooldown 3s).
     qint64 m_lastEquipReplyAt = 0;
-    // 2026-08-11 v3: tag GLOBAL del mmm (el binario lo lleva creciente 34->65+
-    // sin reset entre sesiones; el server corta si el tag vuelve a 2). El
-    // binario ARRANCA en 2 (v6: tag=20 inicial empeoro, prom 39s vs 87s de
-    // tag=2; los tags altos de la captura flush eran de un proceso longevo).
-    int m_mmmTag = 2;
+    // 2026-08-11 v13+v17: tag GLOBAL del mmm PERSISTENTE entre workers,
+    // con mutex (data race corrompia los tags y el server cortaba por tag
+    // bajo). Getter/setter seguros por deviceId.
+    static int mmmTagGet(const QString &deviceId);
+    static void mmmTagSet(const QString &deviceId, int value);
     // 2026-08-10 (bug auto-buy): los timers largos (updateexp/autoBuyX2) usaban
     // t0.elapsed() que se REINICIA en cada reconexion (continue del run()); el
     // CTF mata la partida cada ~40s asi que el chequeo de 60s nunca alcanzaba.

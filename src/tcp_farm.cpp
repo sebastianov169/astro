@@ -22,6 +22,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QStringList>
+#include <QHash>
+#include <QSettings>
 #include <cmath>
 
 #include <memory>
@@ -843,7 +845,26 @@ Bytes makeNativePlayFrame(std::uint32_t seed, const QString &nonce, const QStrin
 
 Bytes makeNativePlayFrameFlag(std::uint32_t seed, const QString &nonce, const QString &suffix, bool flag)
 {
-    Bytes blob = m2xcEncryptFull(bytesOf(nonce), bytesOf(suffix), 0, 0);
+    return makeNativePlayFrameKeyed(seed, nonce, bytesOf(suffix), flag);
+}
+
+// FIX 2026-08-11 v26 (amigo: "op5 JOIN — re-encrypting OP53 under a fixed
+// key"): el JOIN debe cifrar el op53 COMPLETO (el array AMF3 [53, token]),
+// NO solo el string token. El bot cifraba solo el token (20 bytes) -> olen
+// ~45 vs 51 del binario -> el server no reconocía el spawn -> la cuenta era
+// OBSERVADOR (sesión estable pero 0 XP: el op24 EXPERIENCE_GAIN nunca
+// llegaba). Ahora cifra el array [53, <token>] completo.
+Bytes makeNativePlayFrameKeyed(std::uint32_t seed, const QString &nonce, const Bytes &key, bool flag)
+{
+    Bytes toEncrypt;
+    if (nonce.size() >= 8 && nonce.left(8) == QStringLiteral("00000008")) {
+        // nonce es el spawnToken del op53: cifrar el op53 COMPLETO [53, token]
+        Bytes logical53 = amfArray({amfInt(53), amfString(nonce)});
+        toEncrypt = logical53;
+    } else {
+        toEncrypt = bytesOf(nonce);
+    }
+    Bytes blob = m2xcEncryptFull(toEncrypt, key, 0, 0);
     QString challenge = m2xcFmt(blob);
     Bytes logical = amfArray({amfInt(5), amfArray({amfString(challenge), amfBool(flag)})});
     Bytes padded = logical;
@@ -965,6 +986,11 @@ Bytes makeProofFrame(const QString &challenge, const QString &suffix, const QStr
                      std::uint32_t seedMt, const QString &attestPem, QString *proofStrOut,
                      const QString &nonceOverride)
 {
+    // El challenge del op52 es un blob M2XC cifrado; el plaintext (8 chars)
+    // es lo que se firma: SHA256(challenge_plaintext | deviceID | "100").
+    // El roundtrip HTTP al engine da ese plaintext; sin el (timeout), el
+    // decryptChallenge local produce el mismo resultado. v19 (firmar el crudo)
+    // era INCORRECTO: revertido a descifrar.
     QString decrypted = nonceOverride.isEmpty()
         ? decryptChallenge(challenge, suffix)
         : nonceOverride;
@@ -1002,6 +1028,45 @@ Bytes makeProofFrame(const QString &challenge, const QString &suffix, const QStr
 // ================================================================
 // FarmWorker
 // ================================================================
+// FIX 2026-08-11 v17: el tag del mmm debe ser CRECIENTE por cuenta aunque
+// el FarmWorker se recree (spawnOneFarm crea un worker nuevo por ciclo).
+// Mapa estatico deviceId -> tag (los 9 workers comparten el proceso).
+// v17: el QHash sin mutex tenia data race (9 threads incrementando a la
+// vez -> tags perdidos: 11-31 en 25 min en vez de ~140) -> el server veia
+// tags bajos y cortaba a los 40-120s. Mutex para serializar el acceso.
+static QHash<QString, int> s_mmmTags;
+static QMutex s_mmmTagMutex;
+
+int FarmWorker::mmmTagGet(const QString &deviceId)
+{
+    QMutexLocker locker(&s_mmmTagMutex);
+    if (s_mmmTags.contains(deviceId)) {
+        int tag = s_mmmTags.value(deviceId);
+        if (tag >= 2)
+            return tag;
+    }
+    // v18: PERSISTIR en QSettings entre procesos. Cada corrida nueva
+    // arrancaba en 2 -> el server veia el tag RETROCEDER (la cuenta ya
+    // habia llegado a 80+ en corridas anteriores) -> cortaba a los
+    // 40-120s. El binario nunca retrocede (proceso longevo). Con el tag
+    // persistido, la secuencia continua y TODAS las sesiones aguantan.
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    int tag = s.value(QStringLiteral("mmmTag_") + deviceId, 2).toInt();
+    if (tag < 2)
+        tag = 2;
+    s_mmmTags[deviceId] = tag;
+    return tag;
+}
+
+void FarmWorker::mmmTagSet(const QString &deviceId, int value)
+{
+    QMutexLocker locker(&s_mmmTagMutex);
+    s_mmmTags[deviceId] = value;
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    s.setValue(QStringLiteral("mmmTag_") + deviceId, value);
+    s.sync();
+}
+
 FarmWorker::FarmWorker(QObject *parent) : QObject(parent) {}
 FarmWorker::~FarmWorker()
 {
@@ -1534,11 +1599,27 @@ bool FarmWorker::readGemXp(const QJsonObject &invResp, qlonglong *cexpOut, qlong
     return false;
 }
 
+// FIX 2026-08-11 v24 (Jo/Ren: "manda todas las accs al MISMO server y rapido
+// no habra bots"): TODAS las cuentas deben ir al MISMO servidor/region. Si
+// van a servers random y se tardan, caen en partidas CON BOTS que terminan
+// en ~30s -> el server corta el TCP al terminar la partida (normal, confirmado
+// por Jo). Con todas al mismo server y rapidas, la partida se llena con las
+// cuentas del farm (sin bots) y dura mas. Region GLOBAL compartida: la
+// primera cuenta elige y las demas la usan.
+static QString s_globalRegion;
+static QMutex s_globalRegionMutex;
+
 void FarmWorker::pickRandomRegion()
 {
-    // elige una region random de las 4 y la guarda como la region CTF actual
-    const QString r = kFarmRegions.at(QRandomGenerator::global()->bounded(int(kFarmRegions.size())));
-    { QMutexLocker lk(&m_sessionMutex); m_region = r; }
+    // FIX 2026-08-11 v24 (Jo/Ren): TODAS las cuentas al MISMO server, en una
+    // region BUENA. La primera vez la eleccion random cayo en australia (ping
+    // alto). Fijada a europe (la region del farm, servidores cercanos).
+    QMutexLocker lk(&s_globalRegionMutex);
+    if (s_globalRegion.isEmpty()) {
+        s_globalRegion = QStringLiteral("europe");
+        emitLog("Region global fijada: europe (todas las cuentas al mismo server)");
+    }
+    { QMutexLocker lk2(&m_sessionMutex); m_region = s_globalRegion; }
 }
 
 void FarmWorker::restoreCtfMode(QNetworkAccessManager *net, const QString &sk, const QString &magic, const QString &avoidRegion)
@@ -1853,14 +1934,17 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
         }
         emitLog("LISTENER enviado: " + QString::fromUtf8(lst).left(60));
     }
-    // mmm del listener con tag FIJO 1 (config de la corrida 17:45, la mejor:
-    // prom 87s max 398s. El tag creciente aqui (v4) empeoro: el server ve
-    // tags raros en el listener y corta antes).
+    // mmm del listener con tag CRECIENTE del contador persistente (v18:
+    // TODOS los mmm deben incrementar el tag global; tag=1 fijo aqui dejaba
+    // el contador estancado y el server cortaba por tag bajo).
     if (!uid.isEmpty()) {
         try {
+            int tag = mmmTagGet(m_deviceId);
             httpApi(net, sk, magic, apiJson({{"do", "mmm"}, {"begin", false}, {"serching", false},
-                                                 {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", 1},
+                                                 {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", tag},
                                                  {"abandon", false}, {"mode", -1}, {"stop", false}}));
+            mmmTagSet(m_deviceId, tag + 1);
+            emitLog("mmm listener tag=" + QString::number(tag));
         } catch (...) {}
     }
     // handshake: [4] PLAYER_ID -> [52] SECURE_CHALLENGE -> PROOF TPM -> [53] ->
@@ -2007,11 +2091,30 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                         }
                     }
                 } else if (op == 51) {
-                    // [51,0] pre-spawn es CONFIRM_UDP: el binario NO responde nada
+                    // FIX 2026-08-11 v23 (amigo: "op51 — UDP/connection confirm"):
+                    // el binario responde el op51 con CLIENT_CONFIRM_UDP [10033]
+                    // en RESTURPLE (makeConfirmUdpFrame). El comentario viejo
+                    // decia que 10033 cortaba, pero era con el cifrado m2xc
+                    // equivocado. El frame del binario usa resturple.
+                    emitLog("op 51 -> CLIENT_CONFIRM_UDP [10033]");
+                    sendFrame(sock, tcp::makeConfirmUdpFrame(state->seed));
                 } else if (op == 28) {
                     // FIX v6: sin reply al op 28 (config 17:45, la mejor).
                     emitLog("op 28 (equipment request) - sin reply (vacio dania)");
                 } else if (op == 53 || op == 40) {
+                    // FIX 2026-08-11 v9 (amigo: op53 = SPAWN TOKEN): el token
+                    // que el server entrega aqui es el que el op5 JOIN debe
+                    // re-cifrar. Antes se ignoraba y el JOIN usaba un nonce
+                    // aleatorio -> el server no confiaba y cortaba a los ~60s.
+                    if (op == 53 && v.arr.size() >= 2) {
+                        if (v.arr[1].type == tcp::AmfValue::Str)
+                            state->spawnToken = v.arr[1].s;
+                        else if (v.arr[1].type == tcp::AmfValue::Int)
+                            state->spawnToken = QString::number(v.arr[1].i);
+                        else if (v.arr[1].type == tcp::AmfValue::Double)
+                            state->spawnToken = QString::number(v.arr[1].d);
+                        emitLog("SPAWN TOKEN (op53): " + state->spawnToken.left(20));
+                    }
                     if (!readySent) {
                         // orden exacto del binario (ctf_full.log): 53 ->
                         // inventory(ingame,slot=3) HTTP -> READY [10000,[true,1920,1080,1,true]].
@@ -2107,7 +2210,13 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
         // retenido (1 espera a la vez) el server NO corta, pero si el [20] no
         // llega en 15s el matchmaking esta lento: soltar y dejar que el caller
         // reintente con otro server (el retry ya pide server fresco).
-        if (readySent && readyT0.isValid() && readyT0.elapsed() > 15000) {
+        // FIX 2026-08-11 v21 (sala privada): el joinroom tarda mas en armar la
+        // partida (el server espera a llenar la sala con las cuentas). Con 15s
+        // el bot cortaba justo cuando el server iba a iniciar. La sala privada
+        // del amigo (validada 9/9, 300s) necesita esperar mas: 90s en modo
+        // sala, 15s en CTF publico.
+        const qint64 spawnTimeoutMs = m_useRoom ? 90000 : 15000;
+        if (readySent && readyT0.isValid() && readyT0.elapsed() > spawnTimeoutMs) {
             if (err) *err = "SPAWNED [20] timeout (matchmaking lento)";
             return false;
         }
@@ -2297,11 +2406,21 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
     // El frame sale en <1ms y los HTTPs van best-effort DESPUES (el flood
     // previo de ~8 HTTPs en 10s era lo que el server cortaba).
     emit debugLog(QString("TCP >> NATIVE_PLAY [5,[challenge,false]] seed=%1").arg(state->seed));
-    sendFrame(sock, tcp::makeNativePlayFrameFlag(state->seed, randomNonce(), suffix, false));
-    drainMs(287);
+    // FIX 2026-08-11 v10 (amigo: el orden importa): el binario hace play HTTP
+    // -> JOIN (wlen=52) 1ms DESPUES (frida_capture: play 12976 -> JOIN 12976;
+    // play 64322 -> JOIN 64323; 9 plays -> 9 JOINs). El play mint el spawn
+    // token y el op5 JOIN lo re-cifra. El bot lo enviaba al reves (JOIN antes
+    // del play) -> el server no tenia token minted y cortaba.
     try {
         httpApiDrain(apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
     } catch (...) {}
+    // FIX 2026-08-11 v14: el JOIN cifra con host+suffix (key del ACK), no
+    // solo suffix — el server no validaba el JOIN cifrado con suffix.
+    sendFrame(sock, tcp::makeNativePlayFrameFlag(state->seed,
+                                                       state->spawnToken.isEmpty() ? randomNonce() : state->spawnToken,
+                                                       suffix, false));
+    emitLog("play + JOIN (op5) con spawn token (key host+suffix)");
+    drainMs(287);
     // FIX v6: el equip frame en el postSpawn empeoro (prom 55s vs 87s de la
     // config sin equip). El binario lo envia en rafagas tras el respawn pero
     // con el frame GRANDE (4716-5100B con datos) que el bot no puede generar
@@ -3014,12 +3133,15 @@ void FarmWorker::run()
         {"i", connectI}, {"gm", -1}, {"retrying", false}, {"locale", "es_CO"},
     });
     emit debugLog(QString("connect i=%1").arg(connectI));
-    // mmm tag=1 despues del connect (config 17:45, la mejor)
+    // mmm del connect con tag CRECIENTE del contador persistente (v18)
     if (!uid.isEmpty()) {
         try {
+            int tag = mmmTagGet(m_deviceId);
             apiCall(&net, sk, magic, apiJson({{"do", "mmm"}, {"begin", false}, {"serching", false},
-                                                 {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", 1},
+                                                 {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", tag},
                                                  {"abandon", false}, {"mode", -1}, {"stop", false}}));
+            mmmTagSet(m_deviceId, tag + 1);
+            emitLog("mmm connect tag=" + QString::number(tag));
         } catch (...) {}
     }
     // joinroom: la sala que inicia el match (HM COMP MEX GEARS -> invite).
@@ -3041,9 +3163,12 @@ void FarmWorker::run()
                 conn = result2;
             if (!uid.isEmpty()) {
                 try {
+                    int tag = mmmTagGet(m_deviceId);
                     apiCall(&net, sk, magic, apiJson({{"do", "mmm"}, {"begin", false}, {"serching", false},
-                                                         {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", 1},
+                                                         {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", tag},
                                                          {"abandon", false}, {"mode", -1}, {"stop", false}}));
+                    mmmTagSet(m_deviceId, tag + 1);
+                    emitLog("mmm invite tag=" + QString::number(tag));
                 } catch (...) {}
             }
         }
@@ -3261,6 +3386,7 @@ void FarmWorker::run()
             emit stateChanged("Retry: new server " + server);
         }
         host = server.section(':', 0, 0);
+        m_currentHost = host;
         port = server.contains(':') ? server.section(':', 1, 1).toInt() : 443;
         // El server devuelve puertos alternativos (993) SOLO en los retries,
         // y ese puerto NO habla el protocolo M2XC (el handshake muere: "TCP
@@ -3345,6 +3471,7 @@ void FarmWorker::run()
                             server = serverR;
                             m_authToken = tokenR;
                             host = server.section(':', 0, 0);
+                            m_currentHost = host;
                             port = server.contains(':') ? server.section(':', 1, 1).toInt() : 443;
                             if (port != 443)
                                 port = 443;
@@ -3437,13 +3564,14 @@ void FarmWorker::run()
     // real del binario va por UDP (puerto 3724, opcode 0x002726) con los mismos
     // valores que el Python usa en send_udp_move. El op 24 EXPERIENCE_GAIN llega
     // igualmente estando quieto (match_end.log: +2070 XP a los 15s sin moves).
-    // FIX 2026-08-11 v3 (causa raiz de los cortes): el tag del mmm del binario
-    // es GLOBAL y CRECIENTE (frida_capture.log: tags 34->65+ sin reset entre
-    // sesiones; cada ~10.5s +1). El bot lo reseteaba a 2 en cada run() -> el
-    // server veia el tag volver a 2 -> detectaba la anomalia y cortaba (los
-    // cortes llegaban en el MISMO segundo del "mmm tag=2"). Ahora persiste en
-    // el worker (m_mmmTag miembro) y solo se inicializa la primera vez.
-    int mmmTag = m_mmmTag;
+    // FIX 2026-08-11 v3 + v13 (causa raiz de los cortes): el tag del mmm del
+    // binario es GLOBAL y CRECIENTE (frida_capture.log: tags 34->65+ sin reset
+    // entre sesiones; cada ~10.5s +1). El bot lo reseteaba a 2 en cada run()
+    // -> el server veia el tag volver a 2 -> detectaba la anomalia y cortaba.
+    // v13: ademas el spawnOneFarm crea un FarmWorker NUEVO por ciclo, asi que
+    // el tag de instancia se reiniciaba igualmente. Ahora persiste por
+    // deviceId en un mapa ESTATICO del proceso (s_mmmTags).
+    int mmmTag = mmmTagGet(m_deviceId);
     qint64 lastDeathTime = 0;
     qint64 lastPingAt = QDateTime::currentMSecsSinceEpoch(); // watchdog de respawn
     emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
@@ -3581,7 +3709,15 @@ void FarmWorker::run()
                 // el TCP ~2-3s despues de cada muerte.
                 // (v2 fallido: detectar cualquier 0x64 era flood — los 0x64
                 // cortos son broadcasts de entidades de los otros jugadores.)
-                if (flag == 1 && state.spawned && !payload.empty()
+                // FIX 2026-08-11 v11 (EL ASESINO REAL): el detector 0x641b
+                // disparaba MUERTE justo despues del SPAWNED+JOIN (el frame
+                // 641b len=20 tras el op35 Welcome NO es una muerte: es el
+                // frame normal de entidades del spawn). El respawn forzado
+                // (play+NATIVE_PLAY) en ese momento mataba la sesion recien
+                // iniciada (log 21:55:55: op35 -> MUERTE detectada -> corte).
+                // El respawn real lo maneja el op 20 (RESPAWNED) y el
+                // watchdog de 5s sin PINGs. DETECTOR DESACTIVADO.
+                if (false && flag == 1 && state.spawned && !payload.empty()
                     && payload[0] == 0x64 && payload.size() >= 2 && payload[1] == 0x1b
                     && !matchEnded && now - m_lastRespawnAt > 8000) {
                     m_lastRespawnAt = now;
@@ -3591,7 +3727,9 @@ void FarmWorker::run()
                     try {
                         apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                     } catch (...) {}
-                    sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed, randomNonce(), state.suffix, false));
+                    sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed,
+                                                       state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
+                                                       state.suffix, false));
                     nextUpdateExp = now + 1000;
                     emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
                 }
@@ -3694,6 +3832,17 @@ void FarmWorker::run()
                                 emitLog("op 51=" + QString::number(v.arr[1].i) + " (tick del server, no es muerte)");
                         }
                     } else if (op == 53 || op == 40) {
+                        // FIX 2026-08-11 v9: op53 = SPAWN TOKEN -> capturarlo
+                        // para el op5 JOIN (antes se usaba un nonce aleatorio).
+                        if (op == 53 && v.arr.size() >= 2) {
+                            if (v.arr[1].type == tcp::AmfValue::Str)
+                                state.spawnToken = v.arr[1].s;
+                            else if (v.arr[1].type == tcp::AmfValue::Int)
+                                state.spawnToken = QString::number(v.arr[1].i);
+                            else if (v.arr[1].type == tcp::AmfValue::Double)
+                                state.spawnToken = QString::number(v.arr[1].d);
+                            emitLog("SPAWN TOKEN (op53): " + state.spawnToken.left(20));
+                        }
                         if (!readySent) {
                             // Orden exacto del binario (captura ctf_full.log):
                             // 53 (6421ms) -> inventory(ingame,slot=3) HTTP (8038ms)
@@ -3758,12 +3907,28 @@ void FarmWorker::run()
                             state.deaths++;
                             lastDeathTime = 0;
                             emitLog(QString("RESPAWNED #%1 (op 20) - secuencia minima del binario").arg(state.deaths));
+                            // FIX 2026-08-11 v8 (el server corta en el mmm del respawn):
+                            // el binario real envia un mmm con add="" JUSTO ANTES del
+                            // play de cada respawn (frida_capture.log: mmm "" tag 40 a
+                            // 64277ms -> play a 64322; "" tag 41 a 74989 -> play 77305).
+                            // El bot mandaba solo null -> el server cortaba en el mmm
+                            // siguiente (tag=6 = corte en el MISMO segundo, log 21:03:19).
+                            if (!uid.isEmpty()) {
+                                try {
+                                    int preTag = mmmTagGet(m_deviceId);
+                                    apiCall(&net, sk, magic, apiJson({{"do", "mmm"}, {"begin", false}, {"serching", false},
+                                                                         {"add", QString("[%1,\"\",100,0]").arg(uid)}, {"tag", preTag},
+                                                                         {"abandon", false}, {"mode", -1}, {"stop", false}}));
+                                    mmmTagSet(m_deviceId, preTag + 1);
+                                    emitLog("mmm add=\"\" pre-respawn tag=" + QString::number(preTag));
+                                } catch (...) {}
+                            }
                             try {
                                 apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                             } catch (...) {}
-                            sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed, randomNonce(), state.suffix, true));
-                            QThread::msleep(130);
-                            sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed, randomNonce(), state.suffix, false));
+                            sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed,
+                                                       state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
+                                                       state.suffix, false));
                             // el binario hace updateexp ~1s tras el play/respawn
                             nextUpdateExp = now + 1000;
                             emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
@@ -3873,28 +4038,44 @@ void FarmWorker::run()
         // lectura HTTP exclusiva de la XP de la gema (inventory slot=5) cada
         // 60s: el op 24 TCP es XP del jugador/partida y NO se usa para las
         // gemas. El controller acumula con gemXpRead (delta entre lecturas).
-        // FIX 2026-08-11: el binario real NO hace inventory en partida (0 en
-        // 466s). El inventory periodico de 60s era trafico anomalo. El delta
-        // de XP de la gema se lee en el postSpawn (inventory slot=5) y el
-        // settle de la sesion; aqui NO se repite cada 60s.
-        // if (now >= nextGemXpRead) { ... }
-        // mmm periodico cada ~10.5s (2026-08-10, captura del binario en vivo
-        // capture_ctf.log): el binario manda mmm con tag CRECIENTE (2->28)
-        // durante TODA la sesion CTF publica, cada 10469-10659ms, formato
-        // {"do":"mmm","begin":false,"serching":false,
-        //  "add":"[<uid>,null,100,0]","tag":N,"abandon":false,"mode":-1,"stop":false}
-        // (null en partida, "" en lobby). El run Python validado 9/9 era SALA
-        // PRIVADA (sin matchmaking, sin mmm); el CTF publico SI lo necesita.
-        // El mmm es barato (1 HTTP / 10.5s) y httpApiDrain procesa PONGs.
+        // FIX 2026-08-11 v27: RESTAURADA la lectura de XP (inventory slot=5
+        // cada 60s). La XP de la gema se acumula en el server y el bot debe
+        // leerla para reportarla; sin esto el farm "funciona" pero nunca se
+        // ve la XP ganada (el op24 EXPERIENCE_GAIN llega al settle, no en
+        // vivo). 1 HTTP/60s no afecta la sesion.
+        if (now >= nextGemXpRead) {
+            try {
+                QJsonObject invResp = apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"slot", 5}}));
+                qlonglong cexpOut = -1, expOut = -1;
+                if (readGemXp(invResp, &cexpOut, &expOut) && cexpOut >= 0) {
+                    emit debugLog(QString("Gem XP (HTTP): cexp=%1 exp=%2").arg(cexpOut).arg(expOut));
+                    emit gemXpRead(cexpOut, expOut);
+                    emitLog(QString("GEM XP cexp=%1 exp=%2").arg(cexpOut).arg(expOut));
+                }
+            } catch (...) {}
+            nextGemXpRead = now + 60000;
+        }
+        // mmm periodico cada ~10.5s: el binario ALTERNA null/"" en el add
+        // (frida_capture.log tags 34-43: null,"","","",null,null,"","",null,null
+        // = bloques de 2-3). El bot mandaba SIEMPRE null -> el server lo
+        // detectaba como patron de bot y cortaba en el mmm (log: el corte
+        // llega en el MISMO segundo del mmm, ej. 22:06:29 mmm tag=6 -> corte).
+        // FIX v12: alternar null/"" como el binario ("" = lobby/matchmaking,
+        // null = partida estable; el bot alterna porque el server espera
+        // ambos estados).
         if (now >= nextMmm && !uid.isEmpty()) {
             try {
+                const bool usarVacio = (mmmTag % 4 == 0 || mmmTag % 4 == 1);
                 QJsonObject mmmBody = apiJson({ {"do", "mmm"}, {"begin", false}, {"serching", false},
-                                                {"add", QString("[%1,null,100,0]").arg(uid)}, {"tag", mmmTag},
+                                                {"add", usarVacio
+                                                    ? QString("[%1,\"\",100,0]").arg(uid)
+                                                    : QString("[%1,null,100,0]").arg(uid)},
+                                                {"tag", mmmTag},
                                                 {"abandon", false}, {"mode", -1}, {"stop", false} });
                 apiCall(&net, sk, magic, mmmBody);
-                emitLog(QString("mmm tag=%1").arg(mmmTag));
+                emitLog(QString("mmm tag=%1 add=%2").arg(mmmTag).arg(usarVacio ? "\"\"" : "null"));
                 ++mmmTag;
-                m_mmmTag = mmmTag;
+                mmmTagSet(m_deviceId, mmmTag);
             } catch (...) {}
             nextMmm = now + 10500;
         }
@@ -3924,17 +4105,23 @@ void FarmWorker::run()
         // WATCHDOG DE RESPAWN (2026-08-11, queja del usuario: "si matan la
         // cuenta que vuelva a entrar inmediatamente"): el server deberia
         // enviar el [20] de respawn solo tras la muerte, pero si no llega,
-        // la cuenta queda muerta en el limbo. Si llevamos 20s sin PINGs
+        // la cuenta queda muerta en el limbo. Si llevamos Ns sin PINGs
         // (op 1) estando spawnados, forzar el respawn con play + NATIVE_PLAY
         // (igual que la secuencia validada del respawn).
-        if (state.spawned && m_autoRespawn && now - lastPingAt >= 20000) {
-            emitLog("WATCHDOG: 20s sin PINGs - forzando respawn");
+        // FIX 2026-08-11 v8 (cortes a los ~30-60s): el server DEJA DE
+        // PINGUEAR al jugador muerto y corta a los ~6-10s si no recibe el
+        // play de respawn (log 21:23:03 mmm -> 21:23:09 corte = 6s sin
+        // PINGs). El binario real respawnea 2.4s tras la muerte (frida_v3:
+        // muerte 76224 -> play 78648). El watchdog de 20s era DEMASIADO
+        // TARDE: el server ya habia cortado. Reducido a 5s.
+        if (state.spawned && m_autoRespawn && now - lastPingAt >= 5000) {
+            emitLog("WATCHDOG: 5s sin PINGs - forzando respawn");
             try {
                 apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
-                sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed, randomNonce(), state.suffix, true));
-                QThread::msleep(130);
-                sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed, randomNonce(), state.suffix, false));
-                emitLog("WATCHDOG: play + NATIVE_PLAY enviados (respawn forzado)");
+                sendFrame(sock.get(), tcp::makeNativePlayFrameFlag(state.seed,
+                                                       state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
+                                                       state.suffix, false));
+                emitLog("WATCHDOG: play + JOIN enviados (respawn forzado)");
             } catch (...) {}
             lastPingAt = now;
         }
@@ -3985,7 +4172,7 @@ void FarmWorker::run()
                 if (durMs < 2000)
                     m_sessionBackoffMs = qMin(m_sessionBackoffMs * 2, 60000);
                 else if (durMs >= 10000)
-                    m_sessionBackoffMs = 4000;
+                    m_sessionBackoffMs = 2500; // v25: mas rapido (antes 4000)
                 // STAGGER por cuenta (test #32: tras el fin de partida global
                 // TODAS caen a la vez y reintentaban juntas -> el server cortaba
                 // los handshakes; el multi_test Python espaciaba 2s por cuenta).
@@ -4001,8 +4188,13 @@ void FarmWorker::run()
                 // instante a la partida siguiente. Reducido a 0-15s: suficiente
                 // para no saturar los handshakes (el server ve 1 conexion
                 // cada ~2s) sin el downtime de 30s.
-                const int staggerMs = (qHash(m_deviceId) % 16) * 1000;
-                const int waitMs = m_sessionBackoffMs + QRandomGenerator::global()->bounded(1500) + staggerMs;
+                // FIX 2026-08-11 v25 (Jo/Ren: "mandarlas al mismo server y
+                // rapido"): con TODAS las cuentas al mismo server, el stagger
+                // de 0-15s agrega ~7.5s de downtime por reconexion. Reducido
+                // a 0-6s: el g_spawnMutex ya serializa los handshakes TCP (1
+                // a la vez), el stagger solo evita el login HTTP simultaneo.
+                const int staggerMs = (qHash(m_deviceId) % 7) * 1000;
+                const int waitMs = m_sessionBackoffMs + QRandomGenerator::global()->bounded(1000) + staggerMs;
                 emitLog(QString("Reconnect backoff %1s (session was %2s, stagger %3s)").arg(waitMs / 1000).arg(durMs / 1000).arg(staggerMs / 1000));
                 QThread::msleep(waitMs);
             }
