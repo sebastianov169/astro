@@ -607,8 +607,11 @@ FarmController::FarmController(QObject *parent) : QObject(parent)
         m_autoBuyX2 = s.value(QStringLiteral("autoBuyX2"), false).toBool();
         const bool arEnabled = s.value(QStringLiteral("autoRefreshEnabled"), false).toBool();
         const int arInterval = s.value(QStringLiteral("autoRefreshInterval"), 600).toInt();
+        m_autoRefreshWanted = arEnabled;
         m_autoRefreshTimer->setInterval(qMax(10, arInterval) * 1000);
-        if (arEnabled)
+        // v44: el timer NO arranca aqui — solo con farms activos (spawn lo
+        // arranca). El switch del usuario queda en m_autoRefreshWanted.
+        if (arEnabled && (farmRunning() || !m_farms.isEmpty()))
             m_autoRefreshTimer->start();
     }
     // prioridad de gemas persistida (QSettings, misma org)
@@ -681,12 +684,22 @@ void FarmController::scanAllX2()
 {
     if (m_accounts.isEmpty())
         return;
+    if (m_scanX2Thread) {
+        // un scan ya en curso (arranque + refresco manual): no duplicar
+        appendLog(QStringLiteral("X2 scan ya en curso, ignorando"));
+        return;
+    }
     appendLog(QStringLiteral("X2 scan: %1 cuentas guardadas...").arg(m_accounts.size()));
-    // Snapshot de los devices (m_accounts puede cambiar mientras tanto)
+    // v42 (lag de arranque: la UI se congelaba ~10s): ANTES el loop de logins
+    // HTTP de cada cuenta (hasta 9 logins secuenciales + msleep 800ms) corria
+    // EN EL GUI THREAD -> la ventana no respondia. Ahora el scan corre en un
+    // hilo propio; los resultados vuelven al GUI con queued invokeMethod.
     struct ScanEntry {
         QString device;
         QString pemPath;
         int index = -1;
+        QString farmSk;
+        QString farmMagic;
     };
     QVector<ScanEntry> entries;
     for (int i = 0; i < m_accounts.size(); ++i) {
@@ -710,95 +723,122 @@ void FarmController::scanAllX2()
         e.device = dev;
         e.pemPath = fakeTpmPathForDevice(dev);
         e.index = i;
-        entries.append(e);
-    }
-    appendLog(QStringLiteral("X2 scan: %1 con device valido").arg(entries.size()));
-    for (const ScanEntry &e : entries) {
-        LoginManager local;
-        if (!e.pemPath.isEmpty()) {
-            QFile pf(e.pemPath);
-            if (pf.open(QIODevice::ReadOnly)) {
-                local.setAttestPem(QString::fromUtf8(pf.readAll()));
-                pf.close();
-            }
-        }
         // FIX 2026-08-11 (crash: el scan rompia la sesion del farm): si la
         // cuenta tiene farm activo, su worker ya tiene sk/magic validos. Usar
         // la sesion del worker (loginifneeded sin KNOCK/LIM/EH) en vez de
         // login completo - el login duplicado desconecta/crashea la sesion.
-        QString farmSk, farmMagic;
         for (const auto &fh : std::as_const(m_farms)) {
-            if (fh.deviceId == e.device && fh.worker) {
-                farmSk = fh.worker->sessionSk();
-                farmMagic = fh.worker->sessionMagic();
+            if (fh.deviceId == dev && fh.worker) {
+                e.farmSk = fh.worker->sessionSk();
+                e.farmMagic = fh.worker->sessionMagic();
                 break;
             }
         }
-        LoginResult r;
-        if (!farmSk.isEmpty()) {
-            // reutilizar sesion del worker: loginifneeded barato, no rompe nada
-            r.ok = local.loginWithSession(farmSk, farmMagic);
-            r.deviceId = e.device;
-            if (!r.ok)
-                writeLogFile(QStringLiteral("[DBG] X2 scan %1: sesion del farm invalida, fallback login").arg(logName(e.device, QString())));
-        }
-        if (!r.ok) {
-            for (int intento = 1; intento <= 2; ++intento) {
-                r = local.login(e.device);
-                if (r.ok)
-                    break;
-                writeLogFile(QStringLiteral("[DBG] X2 scan login %1 intento=%2 fallo: %3")
-                                 .arg(logName(e.device, QString())).arg(intento).arg(r.error));
-                if (intento < 2)
-                    QThread::msleep(1200);
-            }
-        }
-        if (!r.ok) {
-            writeLogFile(QStringLiteral("[DBG] X2 scan %1: login fallo (%2)")
-                             .arg(logName(e.device, QString())).arg(r.error.left(80)));
-            updateAccountX2(e.index, 2, QStringLiteral("scan: login fallo (%1)").arg(r.error.left(50)));
-            continue;
-        }
-        // Leer el inventario de consumibles (slots 3 y 4) y buscar el 8590.
-        bool found = false;
-        bool active = false;
-        QString name;
-        int dur = 0, maxDur = 0;
-        for (int slot : {3, 4}) {
-            const QJsonObject inv = local.apiCall(QStringLiteral("{\"do\":\"inventory\",\"slot\":%1}").arg(slot));
-            const QJsonArray items = inv.value(QStringLiteral("data")).toObject().value(QStringLiteral("items")).toArray();
-            for (const auto &iv : items) {
-                const QJsonObject item = iv.toObject();
-                if (item.value(QStringLiteral("id")).toInt() != 8590)
-                    continue;
-                found = true;
-                name = item.value(QStringLiteral("name")).toString();
-                dur = item.value(QStringLiteral("durability")).toInt();
-                maxDur = item.value(QStringLiteral("max_durability")).toInt();
-                if (dur > 0)
-                    active = true;
-            }
-        }
-        if (active) {
-            // boost de gemas VIGENTE en el inventario: verde.
-            updateAccountX2(e.index, 1, QStringLiteral("x2 gemas activo (%1 %2/%3)").arg(name).arg(dur).arg(maxDur));
-            writeLogFile(QStringLiteral("[DBG] X2 scan %1: %2 ACTIVO (%3/%4)")
-                             .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur));
-        } else if (found) {
-            updateAccountX2(e.index, 2, QStringLiteral("x2 gemas expirado (%1 %2/%3)").arg(name).arg(dur).arg(maxDur));
-            writeLogFile(QStringLiteral("[DBG] X2 scan %1: %2 expirado (%3/%4)")
-                             .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur));
-        } else {
-            updateAccountX2(e.index, 2, QStringLiteral("sin Double Gem XP en inventario"));
-            writeLogFile(QStringLiteral("[DBG] X2 scan %1: sin Double Gem XP (8590) en inventario")
-                             .arg(logName(e.device, QString())));
-        }
-        // pausa anti-bot entre cuentas (el server corta AUTHs simultaneos)
-        QThread::msleep(800);
+        entries.append(e);
     }
-    saveAccounts();
-    emit accountsChanged();
-    appendLog(QStringLiteral("X2 scan: completo (%1 cuentas)").arg(entries.size()));
+    appendLog(QStringLiteral("X2 scan: %1 con device valido").arg(entries.size()));
+    if (entries.isEmpty())
+        return;
+
+    QThread *thread = new QThread(this);
+    m_scanX2Thread = thread;
+    connect(thread, &QThread::started, thread, [this, thread, entries]() {
+        for (const ScanEntry &e : entries) {
+            LoginManager local;
+            if (!e.pemPath.isEmpty()) {
+                QFile pf(e.pemPath);
+                if (pf.open(QIODevice::ReadOnly)) {
+                    local.setAttestPem(QString::fromUtf8(pf.readAll()));
+                    pf.close();
+                }
+            }
+            LoginResult r;
+            if (!e.farmSk.isEmpty()) {
+                // reutilizar sesion del worker: loginifneeded barato, no rompe nada
+                r.ok = local.loginWithSession(e.farmSk, e.farmMagic);
+                r.deviceId = e.device;
+                if (!r.ok)
+                    writeLogFile(QStringLiteral("[DBG] X2 scan %1: sesion del farm invalida, fallback login").arg(logName(e.device, QString())));
+            }
+            if (!r.ok) {
+                for (int intento = 1; intento <= 2; ++intento) {
+                    r = local.login(e.device);
+                    if (r.ok)
+                        break;
+                    writeLogFile(QStringLiteral("[DBG] X2 scan login %1 intento=%2 fallo: %3")
+                                     .arg(logName(e.device, QString())).arg(intento).arg(r.error));
+                    if (intento < 2)
+                        QThread::msleep(1200);
+                }
+            }
+            if (!r.ok) {
+                writeLogFile(QStringLiteral("[DBG] X2 scan %1: login fallo (%2)")
+                                 .arg(logName(e.device, QString())).arg(r.error.left(80)));
+                QMetaObject::invokeMethod(this, [this, e, r]() {
+                    updateAccountX2(e.index, 2, QStringLiteral("scan: login fallo (%1)").arg(r.error.left(50)));
+                }, Qt::QueuedConnection);
+                continue;
+            }
+            // Leer el inventario de consumibles (slots 3 y 4) y buscar el 8590.
+            bool found = false;
+            bool active = false;
+            QString name;
+            int dur = 0, maxDur = 0;
+            for (int slot : {3, 4}) {
+                const QJsonObject inv = local.apiCall(QStringLiteral("{\"do\":\"inventory\",\"slot\":%1}").arg(slot));
+                const QJsonArray items = inv.value(QStringLiteral("data")).toObject().value(QStringLiteral("items")).toArray();
+                for (const auto &iv : items) {
+                    const QJsonObject item = iv.toObject();
+                    if (item.value(QStringLiteral("id")).toInt() != 8590)
+                        continue;
+                    found = true;
+                    name = item.value(QStringLiteral("name")).toString();
+                    dur = item.value(QStringLiteral("durability")).toInt();
+                    maxDur = item.value(QStringLiteral("max_durability")).toInt();
+                    if (dur > 0)
+                        active = true;
+                }
+            }
+            struct X2Out {
+                int index = -1;
+                int state = 0;
+                QString reason;
+                QString logLine;
+            } o;
+            if (active) {
+                o.state = 1;
+                o.reason = QStringLiteral("x2 gemas activo (%1 %2/%3)").arg(name).arg(dur).arg(maxDur);
+                o.logLine = QStringLiteral("[DBG] X2 scan %1: %2 ACTIVO (%3/%4)")
+                                .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur);
+            } else if (found) {
+                o.state = 2;
+                o.reason = QStringLiteral("x2 gemas expirado (%1 %2/%3)").arg(name).arg(dur).arg(maxDur);
+                o.logLine = QStringLiteral("[DBG] X2 scan %1: %2 expirado (%3/%4)")
+                                .arg(logName(e.device, QString())).arg(name).arg(dur).arg(maxDur);
+            } else {
+                o.state = 2;
+                o.reason = QStringLiteral("sin Double Gem XP en inventario");
+                o.logLine = QStringLiteral("[DBG] X2 scan %1: sin Double Gem XP (8590) en inventario")
+                                .arg(logName(e.device, QString()));
+            }
+            o.index = e.index;
+            writeLogFile(o.logLine);
+            QMetaObject::invokeMethod(this, [this, o]() {
+                updateAccountX2(o.index, o.state, o.reason);
+            }, Qt::QueuedConnection);
+            // pausa anti-bot entre cuentas (el server corta AUTHs simultaneos)
+            QThread::msleep(800);
+        }
+        QMetaObject::invokeMethod(this, [this, thread, count = entries.size()]() {
+            m_scanX2Thread = nullptr;
+            saveAccounts();
+            emit accountsChanged();
+            appendLog(QStringLiteral("X2 scan: completo (%1 cuentas)").arg(count));
+            thread->quit();
+        }, Qt::QueuedConnection);
+    }, Qt::DirectConnection);
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
 }
 
 // 2026-08-10: persiste el estado del x2 (detectado por scanAllX2) en la
@@ -885,6 +925,12 @@ FarmController::~FarmController()
         m_refreshAllThread->wait(15000);
         refreshAlive = m_refreshAllThread->isRunning();
     }
+    // v42: el scan x2 (hilo propio) tambien debe terminar antes de salir
+    if (m_scanX2Thread && m_scanX2Thread->isRunning()) {
+        m_scanX2Thread->wait(15000);
+        if (m_scanX2Thread->isRunning())
+            refreshAlive = true;
+    }
     // si un hilo sigue vivo (worker bloqueado en waitForReadyRead), el detach de
     // DLLs al final del proceso crashearia: se fuerza la salida inmediata del OS.
     // farmAlive cubre los threads de farm y de login del spawn (antes solo se
@@ -911,7 +957,12 @@ QString FarmController::resolveDeviceId() const
 
 bool FarmController::autoRefreshEnabled() const
 {
-    return m_autoRefreshTimer && m_autoRefreshTimer->isActive();
+    // v44 (bug: el switch parecia congelado): ANTES devolvia isActive() del
+    // timer. Con el timer limitado a "solo con farms", activar el switch sin
+    // farms dejaba el timer parado -> el getter devolvia false -> el switch
+    // se auto-deseleccionaba. Devolver el DESEO del usuario (m_autoRefreshWanted,
+    // persistido); el timer corre o no segun haya farms (spawn/stopFarm).
+    return m_autoRefreshWanted;
 }
 
 int FarmController::autoRefreshInterval() const
@@ -2268,6 +2319,9 @@ void FarmController::spawn()
         emit toastMessage(m_stateText);
         return;
     }
+    // v41: un STOP previo durante el spawn dejo el flag abortado; el nuevo
+    // RUN lo resetea (los singleShot del stagger lo checan y no crean nada).
+    m_abortingSpawn.store(false);
     m_spawning.store(true);
     emit spawningChanged();
     // Multi-farm PARALELO: spawnea UN farm por cada cuenta seleccionada con la
@@ -2423,7 +2477,18 @@ void FarmController::spawn()
                                 for (const auto &g : p.gems)
                                     if (g.itemLevel < 25) { gemId = g.id; src = QStringLiteral("first"); break; }
                             }
-                            if (gemId < 0 && !p.gems.isEmpty()) { gemId = p.gems.first().id; src = QStringLiteral("first(25+)"); }
+                            // v42 (PROHIBIDO farmear gemas lvl 25): si TODAS las
+                            // gemas del inventario son lvl 25, la cuenta NO
+                            // spawnea (el fallback "first(25+)" la farmeaba).
+                            if (gemId < 0) {
+                                writeLogFile(QStringLiteral("[DBG] spawn skip %1: todas las gemas son lvl 25 (PROHIBIDO farmearlas)")
+                                                 .arg(logName(p.deviceId, p.realName)));
+                                if (m_debugEnabled)
+                                    appendDebug(QStringLiteral("spawn skip %1 (solo gemas lvl 25)").arg(logName(p.deviceId, p.realName)));
+                                appendLog(QStringLiteral("Spawn skip (%1): solo gemas lvl 25 (PROHIBIDO farmearlas)")
+                                              .arg(logName(p.deviceId, p.realName)));
+                                continue;
+                            }
                             } // fin fallback local/server/first (solo si la prioridad no encontro)
                             const QString name = p.realName.isEmpty() ? p.deviceId.left(16) : p.realName;
                             writeLogFile(QStringLiteral("[DBG] spawn pick gem=%1 (%2) for %3")
@@ -2450,6 +2515,14 @@ void FarmController::spawn()
                                 const int grp = p.tpmGroup; // TEORIA 3 TPMs: grupo del prep
                                 ++spawnIdx;
                                 QTimer::singleShot(delayMs, this, [this, dev, gId, nm, sSk, sMg, grp]() {
+                                    // v41 (STOP durante el spawn): si el usuario
+                                    // aborto mientras esperaba su turno del stagger,
+                                    // NO crear el farm (los workers nuevos se habrian
+                                    // quedado sin stop -> "el boton de stop no para").
+                                    if (m_abortingSpawn.load()) {
+                                        writeLogFile(QStringLiteral("[DBG] spawn cancelado por STOP: %1").arg(nm));
+                                        return;
+                                    }
                                     spawnOneFarm(dev, gId, nm, sSk, sMg, grp); // loguea "Spawning ..."
                                 });
                             }
@@ -2562,6 +2635,10 @@ void FarmController::spawn()
                             const QString itemCk = gemColorKey(gemSpritePath(s.name, s.level));
                             if (itemCk != ck)
                                 continue;
+                            // v42 (pedido del usuario): el auto-buy SI compra
+                            // gemas lvl 25 (solo COMPRAR y guardar en el
+                            // inventario). El farm nunca las equipa: el pick
+                            // del spawn filtra itemLevel >= 25.
                             if (s.owned || !s.purchasable)
                                 continue;
                             if (prep.coins > 0 && s.price > prep.coins)
@@ -2675,7 +2752,18 @@ void FarmController::spawn()
                             for (const auto &g : p.gems)
                                 if (g.itemLevel < 25) { gemId = g.id; src = QStringLiteral("first"); break; }
                         }
-                        if (gemId < 0 && !p.gems.isEmpty()) { gemId = p.gems.first().id; src = QStringLiteral("first(25+)"); }
+                        // v42 (PROHIBIDO farmear gemas lvl 25): si TODAS las
+                        // gemas del inventario son lvl 25, la cuenta NO spawnea
+                        // (el fallback "first(25+)" la farmeaba).
+                        if (gemId < 0) {
+                            writeLogFile(QStringLiteral("[DBG] spawn skip %1: todas las gemas son lvl 25 (PROHIBIDO farmearlas)")
+                                             .arg(logName(p.deviceId, p.realName)));
+                            if (m_debugEnabled)
+                                appendDebug(QStringLiteral("spawn skip %1 (solo gemas lvl 25)").arg(logName(p.deviceId, p.realName)));
+                            appendLog(QStringLiteral("Spawn skip (%1): solo gemas lvl 25 (PROHIBIDO farmearlas)")
+                                          .arg(logName(p.deviceId, p.realName)));
+                            continue;
+                        }
                         } // fin fallback local/server/first (solo si la prioridad no encontro)
                         const QString name = p.realName.isEmpty() ? p.deviceId.left(16) : p.realName;
                         writeLogFile(QStringLiteral("[DBG] spawn pick gem=%1 (%2) for %3")
@@ -2769,6 +2857,10 @@ void FarmController::spawn()
     // "Spawning" en el log - ver BUG 2026-08-08).
     m_spawning.store(false);
     emit spawningChanged();
+    // v44 (auto-refresh solo con farms): el switch del usuario activa el
+    // timer SOLO mientras hay farms corriendo.
+    if (m_autoRefreshWanted && m_autoRefreshTimer && !m_autoRefreshTimer->isActive())
+        m_autoRefreshTimer->start();
 }
 
 // ===================== SPAWN ONE FARM =====================
@@ -2805,6 +2897,7 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
     fh.pemPath = pemPath;
     fh.accountName = accountName;
     fh.gemName = gemName;
+    fh.gemId = gemId;
 
     QThread *thread = new QThread(this);
     FarmWorker *worker = new FarmWorker();
@@ -2854,9 +2947,19 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
     // -> crash latente al dar STOP). El handle se remueve de m_farms en el
     // mismo momento, asi la UI nunca muestra sesiones muertas.
     connect(thread, &QThread::finished, worker, &QObject::deleteLater);
-    connect(thread, &QThread::finished, this, [this, worker]() {
+    // v41 (bug 2026-08-12: handles huerfanos tras STOP/refresh): el worker se
+    // destruye en SU thread cuando run() sale, y el QPointer del handle se
+    // anula a nullptr. El lambda comparaba el QPointer (ya null) contra el
+    // puntero crudo capturado -> nunca coincidian -> el handle quedaba en
+    // m_farms para siempre ("9 farms vivos", sin respawn, doble login en el
+    // refresh). Ahora se busca por deviceId (unico por handle, estable).
+    // v43 (bug: el respawn crea un handle NUEVO con el mismo deviceId mientras
+    // el viejo aun termina): buscar SOLO por deviceId removeria el handle del
+    // farm NUEVO cuando el viejo emite finished. Comparar ademas el thread:
+    // solo se remueve el handle cuyo thread es EL que termino.
+    connect(thread, &QThread::finished, this, [this, deviceId, thread]() {
         for (int i = m_farms.size() - 1; i >= 0; --i) {
-            if (m_farms.at(i).worker == worker) {
+            if (m_farms.at(i).deviceId == deviceId && m_farms.at(i).thread == thread) {
                 m_farms.removeAt(i);
                 break;
             }
@@ -2865,6 +2968,26 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
         emit farmRunningChanged();
         scheduleUiFlush();
     });
+
+    // v42 (STOP no paraba todo): el singleShot del stagger y el click de STOP
+    // pueden expirar en el MISMO ms del event loop — si el timer corre antes,
+    // el check del singleShot ve el flag false y spawnea igual. Chequear el
+    // flag AQUI, ya dentro de spawnOneFarm y antes de arrancar el thread: si
+    // el usuario pidio STOP en cualquier instante anterior, no se crea nada.
+    if (m_abortingSpawn.load()) {
+        writeLogFile(QStringLiteral("[DBG] spawnOneFarm cancelado por STOP (flag ya puesto): %1").arg(accountName));
+        for (int i = m_farms.size() - 1; i >= 0; --i) {
+            if (m_farms.at(i).deviceId == deviceId) {
+                m_farms.removeAt(i);
+                break;
+            }
+        }
+        delete worker;
+        delete thread;
+        rebuildActiveSessions();
+        emit farmRunningChanged();
+        return;
+    }
 
     appendLog(QStringLiteral("Spawning %1 with gem %2 (%3)")
                   .arg(accountName, QString::number(gemId), gemName));
@@ -2943,14 +3066,12 @@ void FarmController::onGemXpRead(FarmWorker *w, qlonglong cexp, qlonglong exp)
     const qlonglong delta = cexp - fh->lastGemCexp;
     fh->lastGemCexp = cexp;
 
-    // 2026-08-11 (queja del usuario: "el refresh no muestra el avance del XP"):
-    // el cexp de la gema (inventory slot=5) SE CONGELA mientras la cuenta esta
-    // en partida (el server lo materializa al terminar la sesion). El avance
-    // real en vivo esta en el XP del op 24 (fh->lastXp). Combinar ambos para
-    // que el dashboard SIEMPRE muestre progreso.
-    const qlonglong liveXp = qlonglong(fh->lastXp);
-    const qlonglong shownXp = qMax(cexp, liveXp);
-    const qlonglong shownDelta = qMax(qlonglong(0), qMax(delta, liveXp > 0 ? liveXp : 0));
+    // v83 (FIX del contador dañado): el cexp de la gema (inventory slot=5) es
+    // la UNICA fuente del XP de la gema. El op24 (fh->lastXp) es XP del MAPA
+    // y NO debe mezclarse con el de las gemas — el qMax anterior pisaba el
+    // cexp real con el del mapa y corrompia el contador persistido.
+    const qlonglong shownXp = cexp;
+    const qlonglong shownDelta = qMax(qlonglong(0), delta);
 
     // Actualiza el texto de XP de la gema (solo si es la cuenta activa)
     if (fh->deviceId == resolveDeviceId()) {
@@ -3097,6 +3218,15 @@ void FarmController::shutdown()
 
 void FarmController::stopFarm()
 {
+    // v41 (bug 2026-08-12: "el boton de stop no para nada"): si el STOP se
+    // pulsa durante el pre-spawn en cascada (stagger de 5s por cuenta, hasta
+    // 40s), los QTimer::singleShot pendientes SEGUIAN creando farms nuevos
+    // despues del stop (los workers nuevos no recibian stop -> el farm no
+    // paraba) y el orquestador de logins seguia vivo -> AV rip=0 con TPM
+    // logins + recvFrame corrupto en el crash (workers abortados a mitad de
+    // handshake mientras el spawn creaba mas). Abortar el spawn aqui: los
+    // singleShot chequean el flag y no crean nada mas.
+    m_abortingSpawn.store(true);
     // Parar todos los workers: cada uno aborta su socket y sale de run()
     // en <1s (recvFrame/waitForReadyRead se desbloquea con el abort).
     // NO se espera aqui: el wait(8000) por farm congelaba la UI hasta 72s
@@ -3110,12 +3240,28 @@ void FarmController::stopFarm()
     m_totalXpGained = 0;
     m_deaths = 0;
     m_spawned = false;
+    // v45 (bug: "el stop no detiene el contador ni quita el Connecting"): los
+    // handles de m_farms quedaban hasta que cada thread terminara (los
+    // workers en reconnect pueden tardar segundos) -> la UI seguia mostrando
+    // "Connecting"/"Farming" y el contador corria. Limpiar m_farms AHORA:
+    // los workers vivos tienen m_stop=true y mueren solos (su lambda de
+    // finished ya no encuentra el handle -> no pasa nada, solo rebuilds).
+    m_farms.clear();
     emit farmRunningChanged();
     emit totalXpGainedChanged();
     emit xpTextChanged();
     rebuildActiveSessions();
+    // v45: el QML limpia el contador cuando workflowAccounts deja de traer
+    // farmStatus; emitir accountsChanged YA para que la UI reaccione al
+    // instante (no esperar al proximo flush).
+    emit accountsChanged();
     m_stateText = QStringLiteral("Stopping farms...");
     emit stateTextChanged();
+    // v44 (bug: "el autorefresh nunca se paro con el stop"): el timer del
+    // auto-refresh seguia disparando refreshAll aunque no hubiera farms.
+    // Pararlo aqui; spawn() lo reactiva si el switch sigue activo.
+    if (m_autoRefreshTimer)
+        m_autoRefreshTimer->stop();
     appendLog(QStringLiteral("Farm stop requested by user"));
 }
 
@@ -3299,11 +3445,42 @@ QVariantList FarmController::workflowAccounts() const
         if (!m_farmSelection.contains(dev))
             continue;
         // Enriquecer con datos de runtime del farm activo
+        bool hasFarm = false;
         for (const auto &fh : m_farms) {
             if (fh.deviceId == dev && fh.thread) {
+                hasFarm = true;
                 am.insert(QStringLiteral("lastXp"), fh.lastXp);
                 // El delegate del dashboard lee xpGained (alias de lastXp)
                 am.insert(QStringLiteral("xpGained"), fh.lastXp);
+                // v42 (bug workflow: mostraba la gema del cache, no la que se
+                // farmeaba): el spawn elige la gema por PRIORIDAD (p.ej. rosa)
+                // aunque el cache persistido diga otra (p.ej. roja) — el XP en
+                // vivo y la barra deben mostrar la gema REAL del worker
+                // (worker->gemItem()), no la del accounts.json. Buscarla en el
+                // cache de la cuenta y sobrescribir sprite/summary/cexp/exp.
+                const int liveGemId = (fh.worker && fh.thread->isRunning())
+                    ? fh.worker->gemItem() : fh.gemId;
+                if (liveGemId > 0) {
+                    const QVariantList cached = am.value(QStringLiteral("gems")).toList();
+                    for (const auto &gv : cached) {
+                        const QVariantMap gm = gv.toMap();
+                        if (gm.value(QStringLiteral("id")).toInt() != liveGemId)
+                            continue;
+                        const QString name = gm.value(QStringLiteral("name")).toString();
+                        const QString sprite = gm.value(QStringLiteral("sprite")).toString();
+                        const int lvl = gm.value(QStringLiteral("level")).toInt();
+                        if (!sprite.isEmpty())
+                            am.insert(QStringLiteral("sprite"), sprite);
+                        if (!name.isEmpty())
+                            am.insert(QStringLiteral("gemSummary"),
+                                      QStringLiteral("%1 Lv%2").arg(name).arg(lvl));
+                        am.insert(QStringLiteral("gemLevel"), lvl);
+                        am.insert(QStringLiteral("cexp"), gm.value(QStringLiteral("cexp")));
+                        am.insert(QStringLiteral("exp"), gm.value(QStringLiteral("exp")));
+                        am.insert(QStringLiteral("equippedGemId"), liveGemId);
+                        break;
+                    }
+                }
                 // 2026-08-11: el cexp de la gema se congela en partida; el
                 // avance real va en fh.lastXp (op 24). Combinar para que el
                 // "cexp / exp" del dashboard avance en vivo.
@@ -3314,9 +3491,14 @@ QVariantList FarmController::workflowAccounts() const
                 am.insert(QStringLiteral("deaths"), fh.deaths);
                 am.insert(QStringLiteral("spawned"), fh.spawned);
                 am.insert(QStringLiteral("startedAt"), fh.startedAt);
+                // v44 (bug: el contador no se detenia con STOP): fh.spawned
+                // queda true cuando el worker muere pero el handle aun esta en
+                // m_farms (ventana hasta el lambda de finished) -> farmStatus
+                // "Farming" -> el timer QML seguia corriendo. "Farming" SOLO si
+                // el thread sigue vivo; thread muerto = Idle (para el contador).
                 am.insert(QStringLiteral("farmStatus"),
-                    fh.spawned ? QStringLiteral("Farming") :
-                    (fh.thread->isRunning() ? QStringLiteral("Connecting") : QStringLiteral("Idle")));
+                    (fh.thread && fh.thread->isRunning() && fh.spawned) ? QStringLiteral("Farming") :
+                    (fh.thread && fh.thread->isRunning() ? QStringLiteral("Connecting") : QStringLiteral("Idle")));
                 // 2026-08-10: estado REAL del auto-buy x2 (indicador por cuenta)
                 // 2026-08-12 (crash STOP): el worker se destruye en el thread
                 // cuando run() sale, ANTES de que el GUI procese el lambda de
@@ -3341,6 +3523,53 @@ QVariantList FarmController::workflowAccounts() const
                               m_autoBuyX2 ? QStringLiteral("activado, esperando sesion de farm")
                                           : QStringLiteral("auto-buy x2 desactivado"));
                 }
+                break;
+            }
+        }
+        // v44 (bug workflow: mostraba la gema VIEJA del cache cuando no hay
+        // farm activo — p.ej. Hades66 con la roja persistida aunque el RUN
+        // equipara la rosa por prioridad): simular la MISMA eleccion del
+        // spawn() sobre el cache de la cuenta y mostrar ESA gema. Asi el
+        // dashboard siempre anticipa la gema que se farmeara (y el refresh
+        // de XP actualiza la correcta).
+        if (!hasFarm) {
+            const QVariantList cached = am.value(QStringLiteral("gems")).toList();
+            int pickId = -1;
+            // 1. prioridad de color (m_gemPriority): primera del cache del
+            //    color mas preferido con itemLevel < 25 (igual que spawn()).
+            for (int ci : m_gemPriority) {
+                if (ci < 0 || ci >= 20) continue;
+                for (const auto &gv : cached) {
+                    const QVariantMap gm = gv.toMap();
+                    if (gm.value(QStringLiteral("level")).toInt() >= 25) continue;
+                    if (gemColorIndexByName(gm.value(QStringLiteral("name")).toString()) == ci) {
+                        pickId = gm.value(QStringLiteral("id")).toInt();
+                        break;
+                    }
+                }
+                if (pickId > 0) break;
+            }
+            // 2. gema equipada persistida, 3. primera del cache
+            if (pickId < 0)
+                pickId = am.value(QStringLiteral("equippedGemId")).toInt();
+            if (pickId < 0 && !cached.isEmpty())
+                pickId = cached.first().toMap().value(QStringLiteral("id")).toInt();
+            for (const auto &gv : cached) {
+                const QVariantMap gm = gv.toMap();
+                if (gm.value(QStringLiteral("id")).toInt() != pickId)
+                    continue;
+                const QString name = gm.value(QStringLiteral("name")).toString();
+                const QString sprite = gm.value(QStringLiteral("sprite")).toString();
+                const int lvl = gm.value(QStringLiteral("level")).toInt();
+                if (!sprite.isEmpty())
+                    am.insert(QStringLiteral("sprite"), sprite);
+                if (!name.isEmpty())
+                    am.insert(QStringLiteral("gemSummary"),
+                              QStringLiteral("%1 Lv%2").arg(name).arg(lvl));
+                am.insert(QStringLiteral("gemLevel"), lvl);
+                am.insert(QStringLiteral("cexp"), gm.value(QStringLiteral("cexp")));
+                am.insert(QStringLiteral("exp"), gm.value(QStringLiteral("exp")));
+                am.insert(QStringLiteral("equippedGemId"), pickId);
                 break;
             }
         }
@@ -3498,6 +3727,14 @@ void FarmController::maybeStartRefreshAllLogin()
 {
     if (!m_refreshingAll)
         return;
+    // v41: limpiar handles huerfanos (worker o thread ya muertos pero aun en
+    // m_farms por el bug del QPointer). Sin esto el poll los contaba como
+    // "farms vivos" y el login del refresh nunca arrancaba.
+    for (int i = m_farms.size() - 1; i >= 0; --i) {
+        const FarmHandle &fh = m_farms.at(i);
+        if (!fh.thread || !fh.thread->isRunning())
+            m_farms.removeAt(i);
+    }
     if (m_refreshWaitingFarms && !m_farms.isEmpty()) {
         // v40: timeout — si un worker no termina, no bloquear el refresh para
         // siempre. Los devices cuyo thread sigue vivo se quitan del respawn.
@@ -3517,9 +3754,16 @@ void FarmController::maybeStartRefreshAllLogin()
                      .arg(m_accounts.size()).arg(m_refreshRespawnDevices.size()));
 
     // Snapshot de devices (GUI thread): TODAS las cuentas, sin saltarse las
-    // que farmeaban (ya estan paradas). Se capturan tambien el orden de
-    // colores priorizados (para re-equipar segun prioridad si la gema
-    // desaparecio) y el cache de gemas de cada cuenta.
+    // que farmeaban. Se capturan tambien el orden de colores priorizados
+    // (para re-equipar segun prioridad si la gema desaparecio) y el cache de
+    // gemas de cada cuenta.
+    // v43 (pedido del usuario: "espera 30s y vuelve a hacer el login de las
+    // cuentas y todo lo demas"): ANTES se EXCLUIA del login a las cuentas
+    // cuyo worker seguia vivo tras el timeout -> esas cuentas nunca se
+    // refrescaban y el respawn daba 0. AHORA se loguean TODAS: el login
+    // nuevo kicnea la sesion vieja del worker en el server (que ya tiene
+    // m_stop=true, no reintenta), el worker viejo muere solo y el respawn
+    // final solo descarta las que genuinamente sigan colgadas.
     QStringList priorityColors;
     for (int ci : m_gemPriority) {
         if (ci < 0 || ci >= 20) continue;
@@ -3563,8 +3807,11 @@ void FarmController::maybeStartRefreshAllLogin()
                 QString name;
                 qlonglong coins = 0;
                 QVector<GemInfo> gems;
+                int equippedId = -1;     // v41: data.current del inventario (la EQUIPADA real)
                 QString repairLog;   // v39: resultado del auto-repair
                 QString reequipLog;  // v39: resultado del re-equip por prioridad
+                int x2State = -1;    // v44: x2 detectado/comrado en el refresh
+                QString x2Reason;
             } out;
             if (!pemPath.isEmpty()) {
                 LoginManager local;
@@ -3579,32 +3826,84 @@ void FarmController::maybeStartRefreshAllLogin()
                     out.name = local.fetchAccountName();
                     out.coins = local.lastCoins();
                     out.gems = local.fetchInventory(5);
+                    out.equippedId = local.lastCurrentItem();
                     if (out.gems.isEmpty()) {
                         QThread::msleep(1000);
                         out.gems = local.fetchInventory(5);
+                        out.equippedId = local.lastCurrentItem();
                     }
                     // v39 (pedido del usuario): el refresh mantiene las gemas
-                    // operativas. 1) REPAIR: la gema equipada danada por
-                    // durabilidad se repara. 2) RE-EQUIP: si el inventario
-                    // quedo vacio (la gema desaparecio/rotura total), se
-                    // equipa otra segun el gem priority de la cuenta.
+                    // operativas. 1) REPAIR: la gema EQUIPADA (data.current,
+                    // no gems.first()) solo se repara si esta ROTA de verdad
+                    // (durability 0 — las gemas no se danan parcialmente,
+                    // pasan de sanas a 0/100). 2) RE-EQUIP: si la gema
+                    // equipada DESAPARECIO del inventario (limite de XP o
+                    // rotura total), se equipa otra segun el gem priority.
+                    // v45 (bug: el re-equip solo corria con el inventario
+                    // VACIO — la gema que llega al limite de XP se va sola
+                    // pero quedan otras gemas, y el fallback gems.first()
+                    // la equipaba sin respetar la prioridad).
                     if (!out.gems.isEmpty()) {
-                        const GemInfo &eg = out.gems.first();
-                        if (eg.maxDurability > 0 && eg.durability < eg.maxDurability) {
-                            const QJsonObject resp = local.apiCall(
-                                QStringLiteral("{\"do\":\"repair\",\"item\":%1,\"slot\":5}").arg(eg.id));
-                            const bool okRepair = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
-                            out.repairLog = okRepair
-                                ? QStringLiteral("repaired gem %1 (%2/%3)")
-                                      .arg(eg.id).arg(eg.durability).arg(eg.maxDurability)
-                                : QStringLiteral("repair gem %1 failed: %2")
-                                      .arg(eg.id).arg(resp.value(QStringLiteral("message")).toString().left(40));
-                            if (okRepair) {
-                                QThread::msleep(600);
-                                out.gems = local.fetchInventory(5);
+                        const GemInfo *egPtr = nullptr;
+                        for (const GemInfo &g : out.gems) {
+                            if (g.id == out.equippedId) { egPtr = &g; break; }
+                        }
+                        if (egPtr) {
+                            // la equipada sigue en el inventario: repair si rota
+                            const GemInfo &eg = *egPtr;
+                            if (eg.maxDurability > 0 && eg.durability == 0) {
+                                const QJsonObject resp = local.apiCall(
+                                    QStringLiteral("{\"do\":\"repair\",\"item\":%1,\"slot\":5}").arg(eg.id));
+                                const bool okRepair = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                                out.repairLog = okRepair
+                                    ? QStringLiteral("repaired gem %1 (%2/%3)")
+                                          .arg(eg.id).arg(eg.durability).arg(eg.maxDurability)
+                                    : QStringLiteral("repair gem %1 failed: %2")
+                                          .arg(eg.id).arg(resp.value(QStringLiteral("message")).toString().left(40));
+                                if (okRepair) {
+                                    QThread::msleep(600);
+                                    out.gems = local.fetchInventory(5);
+                                    out.equippedId = local.lastCurrentItem();
+                                }
+                            }
+                        } else {
+                            // la equipada desaparecio (limite de XP): elegir la
+                            // siguiente por PRIORIDAD entre las gemas del
+                            // inventario REAL (no el cache viejo).
+                            int bestId = -1;
+                            QString bestCk;
+                            for (int ci : m_gemPriority) {
+                                if (ci < 0 || ci >= 20) continue;
+                                for (const GemInfo &g : out.gems) {
+                                    if (g.itemLevel >= 25) continue;
+                                    if (gemColorIndexByName(g.name) != ci) continue;
+                                    if (g.id == out.equippedId) continue;
+                                    if (g.durability == 0 && g.maxDurability > 0) continue;
+                                    bestId = g.id;
+                                    bestCk = QString::number(ci);
+                                    break;
+                                }
+                                if (bestId > 0) break;
+                            }
+                            if (bestId > 0) {
+                                const QJsonObject resp = local.apiCall(
+                                    QStringLiteral("{\"do\":\"equip\",\"item\":%1,\"slot\":5}").arg(bestId));
+                                const bool okEquip = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                                out.reequipLog = okEquip
+                                    ? QStringLiteral("gema equipada desaparecio (limite XP) - re-equipped gem %1 por prioridad (%2)")
+                                          .arg(bestId).arg(bestCk)
+                                    : QStringLiteral("re-equip gem %1 failed: %2")
+                                          .arg(bestId).arg(resp.value(QStringLiteral("message")).toString().left(40));
+                                if (okEquip) {
+                                    QThread::msleep(600);
+                                    out.gems = local.fetchInventory(5);
+                                    out.equippedId = local.lastCurrentItem();
+                                }
+                            } else {
+                                out.reequipLog = QStringLiteral("gema equipada desaparecio y no hay otra gema valida para re-equipar");
                             }
                         }
-                    } else if (out.gems.isEmpty() && !priorityColors.isEmpty()) {
+                    } else if (!priorityColors.isEmpty()) {
                         // buscar en el cache de la cuenta la primera gema cuyo
                         // color este mas arriba en la prioridad
                         const QVariantList cached = targets.at(k).cachedGems;
@@ -3617,6 +3916,9 @@ void FarmController::maybeStartRefreshAllLogin()
                                     continue;
                                 const int dur = gm.value(QStringLiteral("durability")).toInt();
                                 if (dur <= 0)
+                                    continue;
+                                // v42: las gemas lvl 25 estan PROHIBIDAS
+                                if (gm.value(QStringLiteral("level")).toInt() >= 25)
                                     continue;
                                 bestId = gm.value(QStringLiteral("id")).toInt();
                                 bestCk = ck;
@@ -3640,6 +3942,83 @@ void FarmController::maybeStartRefreshAllLogin()
                         }
                     }
                     out.gemsEmptyConfirmed = out.gems.isEmpty();
+                    // v44 (pedido del usuario: "si el x2 se acaba, el refresh
+                    // deberia detectarlo y volverlo a comprar"): el worker ya
+                    // renueva el x2 cada 5 min MIENTRAS farmea (checkX2), pero
+                    // las cuentas sin farm no. Aqui, con el login nuevo, se
+                    // verifica el consumible 8590 (Double Gem XP) en slots 3/4:
+                    // activo -> x2State=1; agotado/ausente + autoBuyX2 ON ->
+                    // COMPRAR del store (cat 6); sin coins -> 3.
+                    if (m_autoBuyX2) {
+                        bool x2Found = false;
+                        bool x2Active = false;
+                        QString x2Name;
+                        for (int slot : {3, 4}) {
+                            const QJsonObject inv = local.apiCall(
+                                QStringLiteral("{\"do\":\"inventory\",\"slot\":%1}").arg(slot));
+                            const QJsonArray items = inv.value(QStringLiteral("data")).toObject()
+                                                         .value(QStringLiteral("items")).toArray();
+                            for (const auto &iv : items) {
+                                const QJsonObject item = iv.toObject();
+                                if (item.value(QStringLiteral("id")).toInt() != 8590)
+                                    continue;
+                                x2Found = true;
+                                x2Name = item.value(QStringLiteral("name")).toString();
+                                if (item.value(QStringLiteral("durability")).toInt() > 0)
+                                    x2Active = true;
+                            }
+                        }
+                        if (x2Active) {
+                            out.x2State = 1;
+                            out.x2Reason = QStringLiteral("x2 gemas activo (%1)").arg(x2Name);
+                        } else if (x2Found) {
+                            // expirado (durability 0): comprar de nuevo
+                            const QJsonObject store = local.apiCall(
+                                QStringLiteral("{\"do\":\"store\",\"category\":6,\"evo\":false}"));
+                            const QJsonArray storeItems = store.value(QStringLiteral("data")).toObject()
+                                                              .value(QStringLiteral("items")).toArray();
+                            int x2StoreId = -1;
+                            qlonglong x2Price = 0;
+                            for (const auto &si : storeItems) {
+                                const QJsonObject item = si.toObject();
+                                if (item.value(QStringLiteral("id")).toInt() != 8590)
+                                    continue;
+                                x2StoreId = item.value(QStringLiteral("id")).toInt();
+                                x2Price = item.value(QStringLiteral("price")).toVariant().toLongLong();
+                                break;
+                            }
+                            if (x2StoreId > 0 && out.coins >= x2Price) {
+                                const QJsonObject buy = local.apiCall(
+                                    QStringLiteral("{\"do\":\"buy\",\"item\":%1}").arg(x2StoreId));
+                                const QString buyMsg = buy.value(QStringLiteral("message")).toString();
+                                const bool buyOk = buy.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                                if (buyOk) {
+                                    out.x2State = 1;
+                                    out.x2Reason = QStringLiteral("x2 de gemas comprado (expirado): %1").arg(x2Name);
+                                } else if (buyMsg.contains(QLatin1String("already_owned"))) {
+                                    out.x2State = 1;
+                                    out.x2Reason = QStringLiteral("x2 de gemas ya activo (already_owned)");
+                                } else {
+                                    out.x2State = 2;
+                                    out.x2Reason = QStringLiteral("buy x2 fallo: %1").arg(buyMsg.left(50));
+                                }
+                            } else if (x2StoreId > 0) {
+                                out.x2State = 3;
+                                out.x2Reason = QStringLiteral("sin coins para Double Gem XP (necesita %1, tiene %2)")
+                                                   .arg(x2Price).arg(out.coins);
+                            } else {
+                                out.x2State = 2;
+                                out.x2Reason = QStringLiteral("Double Gem XP no disponible en tienda");
+                            }
+                        } else {
+                            // v64 (bug: el badge x2 oscilaba): el 8590 no
+                            // aparece en este login (hiccup) pero el x2 ya
+                            // estaba ACTIVO — no tocar el estado persistido
+                            // (queda verde). Solo se cambia cuando hay
+                            // confirmacion real de expiracion (x2Found).
+                            // out.x2State queda -1: el aplicador no lo escribe.
+                        }
+                    }
                 }
             }
             const RefreshOut o = out;
@@ -3658,14 +4037,34 @@ void FarmController::maybeStartRefreshAllLogin()
                         if (o.coins > 0)
                             am.insert(QStringLiteral("coins"), o.coins);
                         if (!o.gems.isEmpty()) {
-                            const GemInfo &eg = o.gems.first();
+                            // v41: la gema del dashboard debe ser la EQUIPADA
+                            // (data.current), no la primera del inventario —
+                            // antes mostraba una gema sin prioridad.
+                            const GemInfo *egPtr = nullptr;
+                            for (const GemInfo &g : o.gems) {
+                                if (g.id == o.equippedId) { egPtr = &g; break; }
+                            }
+                            const GemInfo &eg = egPtr ? *egPtr : o.gems.first();
                             // v39: XP ganado desde el ultimo refresh (delta del
                             // cexp persistido) para mostrarlo bajo la barra de
                             // la gema en el dashboard.
-                            const qlonglong prevCexp = am.value(QStringLiteral("cexp")).toLongLong();
+                            // v44 (bug: el refresh re-equipa por prioridad y el
+                            // delta se calculaba contra el cexp de la gema VIEJA
+                            // -> gemas nuevas con cexp menor no mostraban nada).
+                            // Comparar la MISMA gema (id) contra su cexp en el
+                            // cache viejo; si es gema nueva, sin delta previo.
                             const qlonglong newCexp = qlonglong(eg.cexp);
-                            if (newCexp >= prevCexp && prevCexp > 0)
-                                am.insert(QStringLiteral("xpGainRefresh"), newCexp - prevCexp);
+                            qlonglong prevCexpSameGem = -1;
+                            const QVariantList oldCache = am.value(QStringLiteral("gems")).toList();
+                            for (const auto &gv : oldCache) {
+                                const QVariantMap gm = gv.toMap();
+                                if (gm.value(QStringLiteral("id")).toInt() == eg.id) {
+                                    prevCexpSameGem = gm.value(QStringLiteral("cexp")).toLongLong();
+                                    break;
+                                }
+                            }
+                            if (prevCexpSameGem >= 0 && newCexp > prevCexpSameGem)
+                                am.insert(QStringLiteral("xpGainRefresh"), newCexp - prevCexpSameGem);
                             am.insert(QStringLiteral("sprite"), gemSpritePath(eg.name, eg.itemLevel));
                             am.insert(QStringLiteral("gemSummary"),
                                       QStringLiteral("%1 Lv%2").arg(translateGemName(eg.name)).arg(eg.itemLevel));
@@ -3684,6 +4083,17 @@ void FarmController::maybeStartRefreshAllLogin()
                             am.remove(QStringLiteral("gems"));
                         }
                         am.insert(QStringLiteral("lastRefresh"), qint64(QDateTime::currentSecsSinceEpoch()));
+                        // v44: persiste el x2 detectado/comprado en el refresh
+                        if (o.x2State >= 0) {
+                            am.insert(QStringLiteral("x2State"), o.x2State);
+                            am.insert(QStringLiteral("x2Reason"), o.x2Reason);
+                            appendLog(QStringLiteral("[Refresh] %1: x2 -> %2 (%3)")
+                                          .arg(am.value(QStringLiteral("name")).toString().isEmpty()
+                                                   ? shortDevice(deviceId)
+                                                   : am.value(QStringLiteral("name")).toString())
+                                          .arg(o.x2State)
+                                          .arg(o.x2Reason));
+                        }
                         if (!o.repairLog.isEmpty())
                             appendLog(QStringLiteral("[Refresh] %1: %2")
                                           .arg(am.value(QStringLiteral("name")).toString().isEmpty()
@@ -3713,22 +4123,15 @@ void FarmController::maybeStartRefreshAllLogin()
                                   .arg(total).arg(m_refreshRespawnDevices.size()));
                     writeLogFile(QStringLiteral("[Refresh] done %1 cuentas, respawn %2")
                                      .arg(total).arg(m_refreshRespawnDevices.size()));
-                    // v38: las cuentas que estaban farmeando se re-spawnean
-                    // (el STOP anterior las saco; el refresh de data termino).
-                    // v40: filtrar AHORA los devices cuyo thread sigue vivo
-                    // (colgados tras el timeout) para no duplicar sesiones.
+                    // v38: las cuentas que estaban farmeando se re-spawnean.
+                    // v43 (pedido del usuario: "espera 30s y vuelve a hacer el
+                    // login de las cuentas y todo lo demas"): el login nuevo
+                    // ya kicneo las sesiones viejas (los workers tienen m_stop
+                    // y mueren solos). Esperar hasta 30s mas a que terminen
+                    // antes de respawnear — no descartarlos como antes.
                     if (!m_refreshRespawnDevices.isEmpty()) {
-                        for (const auto &fh : m_farms) {
-                            if (fh.thread && fh.thread->isRunning())
-                                m_refreshRespawnDevices.removeAll(fh.deviceId);
-                        }
-                        if (m_refreshRespawnDevices.isEmpty()) {
-                            appendLog(QStringLiteral("Refresh: sin respawn (farms aun corriendo)"));
-                            writeLogFile(QStringLiteral("[Refresh] sin respawn (farms aun vivos)"));
-                        }
-                        const QStringList toRespawn = m_refreshRespawnDevices;
-                        m_refreshRespawnDevices.clear();
-                        respawnDevices(toRespawn);
+                        m_refreshWaitDeadline = QDateTime::currentMSecsSinceEpoch() + 30000;
+                        maybeRespawnAfterRefresh();
                     }
                 }
             }, Qt::QueuedConnection);
@@ -3759,6 +4162,57 @@ void FarmController::respawnDevices(const QStringList &devices)
     spawn();
     m_farmSelection = savedSelection;
     emit farmSelectionChanged();
+}
+
+// v43 (pedido del usuario: "espera 30s y vuelve a hacer el login de las
+// cuentas y todo lo demas"): tras el login nuevo, los workers viejos tienen
+// m_stop=true y mueren solos (su sesion fue kicneada por el login). Poll de
+// hasta 30s esperando a que m_farms quede vacio; cuando ocurre (o el plazo
+// expira) se respawnean los devices que quedan pendientes.
+void FarmController::maybeRespawnAfterRefresh()
+{
+    // v43: NO chequear m_refreshingAll aqui — el caller (progress==total) ya
+    // lo puso false antes de llamarnos. Solo la lista pendiente gobierna.
+    if (m_refreshRespawnDevices.isEmpty())
+        return;
+    bool anyAlive = false;
+    for (const auto &fh : m_farms) {
+        if (fh.thread && fh.thread->isRunning()) {
+            anyAlive = true;
+            break;
+        }
+    }
+    if (anyAlive) {
+        if (QDateTime::currentMSecsSinceEpoch() < m_refreshWaitDeadline) {
+            QTimer::singleShot(500, this, [this]() { maybeRespawnAfterRefresh(); });
+            return;
+        }
+        appendLog(QStringLiteral("Refresh: %1 farm(s) aun vivos tras 30s de espera, respawn sin ellos")
+                      .arg(m_farms.size()));
+        writeLogFile(QStringLiteral("[Refresh] %1 farms vivos tras espera, respawn sin ellos")
+                         .arg(m_farms.size()));
+    }
+    const QStringList toRespawn = m_refreshRespawnDevices;
+    m_refreshRespawnDevices.clear();
+    if (toRespawn.isEmpty()) {
+        appendLog(QStringLiteral("Refresh: sin respawn"));
+        writeLogFile(QStringLiteral("[Refresh] sin respawn"));
+        return;
+    }
+    // v43 (respawn bloqueado por farmRunning): los workers viejos tienen
+    // m_stop=true (mueren solos, sus threads se limpian via deleteLater del
+    // finished) pero pueden seguir en m_farms (colgados esperando el mutex de
+    // login del refresh) -> farmRunning()==true -> spawn() abortaba con "A
+    // farm is already running" y el respawn quedaba en 0. Limpiar los handles
+    // viejos de los devices a respawnear: el worker viejo muere solo (m_stop)
+    // y el nuevo puede arrancar.
+    for (int i = m_farms.size() - 1; i >= 0; --i) {
+        if (toRespawn.contains(m_farms.at(i).deviceId))
+            m_farms.removeAt(i);
+    }
+    appendLog(QStringLiteral("Refresh: respawn de %1 farm(s)").arg(toRespawn.size()));
+    writeLogFile(QStringLiteral("[Refresh] respawn %1").arg(toRespawn.size()));
+    respawnDevices(toRespawn);
 }
 
 // ===================== REFRESH XP =====================
@@ -3867,11 +4321,15 @@ void FarmController::loadQwsFiles(const QVariantList &paths)
 void FarmController::configureAutoRefresh(bool enabled, int intervalSeconds)
 {
     const int secs = qMax(10, intervalSeconds);
+    m_autoRefreshWanted = enabled;
     m_autoRefreshTimer->setInterval(secs * 1000);
-    if (enabled)
-        m_autoRefreshTimer->start();
-    else
+    // v44: el timer solo corre con farms activos (spawn lo arranca, stopFarm
+    // lo para). Aqui se aplica el estado solo si hay farms o el usuario pide
+    // apagar.
+    if (!enabled)
         m_autoRefreshTimer->stop();
+    else if (farmRunning() || !m_farms.isEmpty())
+        m_autoRefreshTimer->start();
     // Persistir
     QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
     s.setValue(QStringLiteral("autoRefreshEnabled"), enabled);

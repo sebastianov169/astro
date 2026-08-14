@@ -101,6 +101,12 @@ Bytes makeNativePlayFrame(std::uint32_t seed, const QString &nonce, const QStrin
 Bytes makeNativePlayFrameFlag(std::uint32_t seed, const QString &nonce, const QString &suffix, bool flag);
 Bytes makeNativePlayFrameKeyed(std::uint32_t seed, const QString &nonce, const Bytes &key, bool flag);
 Bytes makeNativePlayFrameKeyedRaw(std::uint32_t seed, const Bytes &toEncrypt, const Bytes &key, bool flag);
+// v92 (CAPTURA 2026-08-14): JOIN op5 con el TOKEN PLANO (b64 de 52 chars
+// "00000008TTJYQ...") como challenge del frame [5,[token,false]] — SIN AES
+// del contenido. El binario re-cifra el token solo con el cifrado del WIRE
+// (seed), no con eb(suffix): el string del frame del binario mide lo MISMO
+// que el op53 (52 chars, no 84+ del m2xc con AES).
+Bytes makeJoinFramePlain(std::uint32_t seed, const QString &token, bool flag);
 // NATIVE_PLAY de SPAWN real del juego: [5, [false]] + 3 ceros + resturple(seed)
 Bytes makeNativePlaySpawnFrame(std::uint32_t seed);
 // CLIENT_ENTITIES_INFO [10002, [0]] + CLIENT_EQUIPMENT_DATA [10037, []]
@@ -272,6 +278,12 @@ private:
         // completo, no el string decodificado — el string tenia un prefijo
         // '00000008' que el Amf3Decoder malinterpretaba).
         Bytes spawnTokenRaw;
+        // v78 (captura del binario real 2026-08-13): el play HTTP responde
+        // con un NONCE de 8 chars ("PhudtAu3"); el binario lo cifra con
+        // eb(suffix) y ESE blob es el challenge del op5 JOIN. El v28
+        // cifraba el op53 completo -> el server descifraba un array AMF3,
+        // no 8 chars -> JOIN invalido -> dejaba de pinguear -> corte ~30s.
+        QString playNonce;
         double xpTotal = 0.0;
         double xpLast = 0.0;
         double coinsTotal = 0.0;
@@ -316,6 +328,7 @@ private:
     // Secuencia post-SPAWNED del binario (ctf_full.log): inventory slot=5 -> news ->
     // equip verificado (current == m_gemItem) -> play + NATIVE_PLAY [true] -> play +
     // NATIVE_PLAY [false] -> gamemode. Usada por run (spawn inicial y respawn).
+    void sendJoinFrame(QTcpSocket *sock, FarmState &st);
     void postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net, const QString &sk,
                            const QString &magic, FarmState *state, const QString &suffix);
     // Handshake de spawn completo sobre un socket YA conectado: greeting -> suffix ->
@@ -351,6 +364,11 @@ private:
     // (fin de partida global) reintentaban juntas y el server cortaba los
     // handshakes. Protegido por m_sessionMutex.
     int m_sessionBackoffMs = 4000;
+    // EXPERIMENTO UDP KEEPALIVE (2026-08-14, pedido del usuario): la skill dice
+    // que el binario NO envia UDP (0 datagramas), pero se prueba como flag para
+    // medir si mantiene mas cuentas en partida. Formato = make_udp_afk_packet
+    // del Python: prefix(9B) + seq BE + opcode 0x002726 + 3 floats + ffffffff00000000.
+    static const bool kUdpKeepalive = true;
     // Keepalive de partida del CTF publico (headless_bot.py validado): el
     // server corta a los ~7-12s si el cliente no envia MOVE. TCP MOVE [10022]
     // cada 1s + UDP MOVE (puerto 3724, opcode 0x002726) cada 1s, con valores
@@ -377,6 +395,16 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     QString m_deviceId;
     QString m_pemPath;
     QString m_authToken;      // token del connect (para el re-AUTH del respawn)
+    // v77b+v78: nonce de 8 chars que el play HTTP responde (captura del
+    // binario 29025ms: "PhudtAu3"). El binario lo cifra con eb(suffix) y ESE
+    // blob es el challenge del op5 JOIN. Se limpia tras cada JOIN.
+    QString m_lastPlayToken;
+    // v92 (CAPTURA 2026-08-14): el "PgiLmpnC" que el binario reenvia plano
+    // tras CADA play es el nonceRt del roundtrip del op52 (derivado de la key
+    // del device, constante). El server mint el token del JOIN solo si recibe
+    // play + este eco. Se guarda al resolver el op52 y se ecosea en cada play.
+    QString m_nonceRt;
+    bool m_lastPlayEchoSent = false; // v92: 1 eco por ciclo de play (el binario ecosea tras cada play)
     // 2026-08-11 v14: host del server actual (key del op5 JOIN = host+suffix)
     QString m_currentHost;
     QString m_inviteString;   // invite de la sala (para el AUTH del respawn)
@@ -398,6 +426,12 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     // Socket activo del farm: permite a stop() abortar el socket desde el
     // hilo principal sin esperar que el worker lo haga (UAF fix STOP).
     QTcpSocket *m_activeSock = nullptr;
+    // v43: descriptor como int puro (stop() lo usa desde el GUI thread sin
+    // tocar el objeto Qt — socketDescriptor() cross-thread era UB).
+    qintptr m_activeFd = -1;
+    // v58: intentos de play+JOIN en el mismo socket del watchdog de actividad
+    // (max 3, luego reconectar) — la solucion de la conexion.
+    int m_sameSocketPlayAttempts = 0;
     mutable QMutex m_socketMutex;
     // QNetworkAccessManager UNICO del worker, creado LAZY en run()/refreshXp()
     // bajo g_loginMutex: los ctor/dtor de QNAM concurrentes (9 farms a la vez)

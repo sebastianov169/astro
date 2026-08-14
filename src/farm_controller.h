@@ -162,6 +162,7 @@ public slots:
     // de las cuentas que estaban farmeando (pedido: "volver a hacer todo").
     void maybeStartRefreshAllLogin();                         // poll hasta que los farms terminen
     void respawnDevices(const QStringList &devices);          // re-spawn tras el refresh
+    void maybeRespawnAfterRefresh();                          // v43: poll del respawn post-login
     Q_INVOKABLE void configureAutoRefresh(bool enabled, int intervalSeconds); // timer auto-refresh (intervalo >= 10s)
     // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
     // las cuentas guardadas"): login secuencial de cada cuenta (aunque no
@@ -332,6 +333,7 @@ private:
         QString pemPath;
         QString accountName;
         QString gemName;
+        int gemId = -1;          // v42: id de la gema REAL que farmea el worker
         double lastXp = 0;
         int deaths = 0;
         bool spawned = false;
@@ -349,12 +351,18 @@ private:
     int m_refreshAllProgress = 0;
     QString m_refreshAllStatus;
     QThread *m_refreshAllThread = nullptr;
+    QThread *m_scanX2Thread = nullptr;     // v42: scan x2 en hilo propio (no congelar la UI)
     bool m_refreshWaitingFarms = false;      // v38: esperando el STOP de los farms
     qint64 m_refreshWaitDeadline = 0;        // v40: timeout de 15s de la espera
     QStringList m_refreshRespawnDevices;     // v38: devices a re-spawnear al terminar
     QString m_accountSearch;
     QVariantList m_farmSelection; // devices seleccionados para farmear (max 10)
     QTimer *m_autoRefreshTimer = nullptr; // auto-refresh de cuentas (intervalo en ms)
+    // v44 (bug: "el autorefresh nunca se paro con el stop"): el timer seguia
+    // activo tras STOP (refreshAll cada intervalo sin farms). m_autoRefreshWanted
+    // guarda el switch del usuario; el timer SOLO corre mientras hay farms
+    // (spawn lo arranca, stopFarm lo para).
+    bool m_autoRefreshWanted = false;
     // Coalescing de updates de alta frecuencia (onFarmXp/onGemXpRead): con 9
     // farms cada xpUpdate/gemXpRead emitia accountsChanged + rebuilds, y la
     // GUI reconstruia los modelos QML a rafagas. Un QTimer de 300ms agrupa

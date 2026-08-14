@@ -895,32 +895,6 @@ Bytes makeNativePlayFrameKeyedRaw(std::uint32_t seed, const Bytes &toEncrypt, co
     return frame;
 }
 
-// v92: JOIN op5 con el token PLANO del op53/play (b64 "00000008TTJYQ...")
-// como challenge — SIN m2xcEncryptFull del contenido. El binario (captura
-// 2026-08-14) manda el string del frame con la MISMA longitud que el op53
-// (52 chars): el "re-encrypting op53 under a fixed key" del doc = solo el
-// cifrado del wire (seed/suffix del socket), no AES del payload.
-Bytes makeJoinFramePlain(std::uint32_t seed, const QString &token, bool flag)
-{
-    Bytes logical = amfArray({amfInt(5), amfArray({amfString(token), amfBool(flag)})});
-    Bytes padded = logical;
-    padded.push_back(0x00);
-    int half = int(padded.size()) / 2;
-    Bytes wire = m2xcTcpEnc(xorStep(interleave(padded, half, int(seed & 1)), seed), seed, 100);
-    Bytes frame;
-    auto pushU32 = [&](std::uint32_t v) {
-        frame.push_back(std::uint8_t((v >> 24) & 0xFF));
-        frame.push_back(std::uint8_t((v >> 16) & 0xFF));
-        frame.push_back(std::uint8_t((v >> 8) & 0xFF));
-        frame.push_back(std::uint8_t(v & 0xFF));
-    };
-    pushU32(std::uint32_t(wire.size()));
-    pushU32(std::uint32_t(logical.size()));
-    frame.push_back(std::uint8_t(seed % 63));
-    frame.insert(frame.end(), wire.begin(), wire.end());
-    return frame;
-}
-
 QString decryptChallenge(const QString &challenge, const QString &suffix)
 {
     QString c = challenge.trimmed();
@@ -1401,44 +1375,6 @@ QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, 
                 resp = resp2; t = t2;
             } else {
                 parsed = parseJsonObj(resp2);
-            }
-        }
-        // v92 (CAPTURA DEL BINARIO 2026-08-14): el binario reenvia el nonceRt
-        // del op52 (8 chars, plano en el body) tras CADA play, sin esperar
-        // challenge. El server mint el token del JOIN solo si recibe play+eco.
-        if (payload.value("do").toString() == "play" && !m_nonceRt.isEmpty() && !m_lastPlayEchoSent) {
-            m_lastPlayEchoSent = true;
-            emitLog(QString("PLAY ECHO nonceRt '%1' (v92)").arg(m_nonceRt));
-            QByteArray resp2 = echoPlayChallenge(net, QUrl(url), m_nonceRt, magicc,
-                [&](const QByteArray &body) { return httpPostTcp(net, QUrl(url), body, &m_stop); });
-            QString t2 = QString::fromUtf8(resp2).trimmed();
-            // v92e: la respuesta del eco tambien viene tBB CIFRADA -> descifrar.
-            if (t2.startsWith("tBB,")) {
-                QString b64 = t2.mid(12);
-                QString padded = b64;
-                int pad = (4 - (padded.size() % 4)) % 4;
-                padded += QString(pad, QLatin1Char('='));
-                QByteArray blobBytes = QByteArray::fromBase64(padded.toLatin1());
-                Bytes blob(blobBytes.begin(), blobBytes.end());
-                if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2' && blob[2] == 'X' && blob[3] == 'C') {
-                    Bytes dec = m2xcDecryptFull(blob, bytesOf(magicc));
-                    t2 = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                } else {
-                    Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(magicc, 100), false);
-                    while (!dec.empty() && dec.back() == 0)
-                        dec.pop_back();
-                    t2 = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                }
-            }
-            if (!t2.isEmpty()) {
-                QString tt = t2;
-                if (tt.size() >= 20 && tt.left(8) == QStringLiteral("00000008")) {
-                    // el eco devolvio el TOKEN del JOIN (b64 de 52 chars)
-                    m_lastPlayToken = tt;
-                    emitLog(QString("PLAY ECHO -> TOKEN FRESCO %1 chars (v92)").arg(tt.size()));
-                } else {
-                    emitLog(QString("PLAY ECHO respuesta len=%1: '%2'").arg(tt.size()).arg(tt.left(40)));
-                }
             }
         }
     } else {
@@ -2198,48 +2134,16 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                     emitLog("Desafio seguro recibido, enviando PROOF TPM...");
                     // challenge_roundtrip HTTP (el binario envia el challenge al
                     // engine y recibe el plaintext de 8 chars)
-                    // FIX v92 (el mismo del loop 4025): NO esperar g_loginMutex
-                    // (con 9 cuentas se cuelga y nonceRt queda vacio -> PROOF
-                    // con nonce incorrecto -> m_nonceRt vacio -> el eco del play
-                    // nunca se envia). Sin mutex + try/catch + log de respuesta.
                     QString nonceRt;
-                    try {
+                    {
+                        QMutexLocker locker(&g_loginMutex); // QNetworkRequest internos
                         QString u = kEngine + "?_sid=" + urlEncodeTcp(sk, false) + "&rndx=" + rndxTcp();
-                        // v92f (REVERSION de v92e: +749 vs +4467 — el challenge
-                        // CIFRADO rompia el enganche, op19 mediana 64s): body
-                        // PLANO como en v92c/v92d. El roundtrip devuelve
-                        // result:ko de todos modos (nonceRt queda vacio), pero
-                        // con plano la sesion engancha igual (+4467/5min).
-                        QByteArray rt = httpPostTcp(net, QUrl(u), v.arr[1].s.toUtf8(), &m_stop, 3000);
+                        QByteArray rt = httpPostTcp(net, QUrl(u), v.arr[1].s.toUtf8());
                         QString t = QString::fromUtf8(rt).trimmed();
-                        // v92d (log v92c "len=132 tBB,00000072TTJYQ..."): la
-                        // respuesta del roundtrip es un blob tBB CIFRADO (m2xc).
-                        if (t.startsWith("tBB,")) {
-                            QString b64 = t.mid(12);
-                            QString padded = b64;
-                            int pad = (4 - (padded.size() % 4)) % 4;
-                            padded += QString(pad, QLatin1Char('='));
-                            QByteArray blobBytes = QByteArray::fromBase64(padded.toLatin1());
-                            Bytes blob(blobBytes.begin(), blobBytes.end());
-                            if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2' && blob[2] == 'X' && blob[3] == 'C') {
-                                Bytes dec = m2xcDecryptFull(blob, bytesOf(magic));
-                                t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                            } else {
-                                Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(magic, 100), false);
-                                while (!dec.empty() && dec.back() == 0)
-                                    dec.pop_back();
-                                t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                            }
-                        }
                         if (t.size() == 8) {
                             nonceRt = t;
-                            m_nonceRt = t; // v92: eco del play (el binario lo reenvia plano tras cada play)
                             emitLog("Challenge roundtrip HTTP OK: " + t);
-                        } else {
-                            emitLog("Challenge roundtrip HTTP raro (len=" + QString::number(t.size()) + "): '" + t.left(20) + "'");
                         }
-                    } catch (const std::exception &e) {
-                        emitLog("Challenge roundtrip HTTP fallo: " + QString::fromUtf8(e.what()).left(60));
                     }
                     QFile pf(m_pemPath);
                     if (pf.open(QIODevice::ReadOnly)) {
@@ -2401,28 +2305,29 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
     return false;
 }
 
-// v92 (CAPTURA DEL BINARIO 2026-08-14): el JOIN op5 lleva el TOKEN PLANO
-// (b64 "00000008TTJYQ...", 52 chars) como challenge del frame [5,[token,false]]
-// — el string del frame del binario mide lo MISMO que el op53 (sin AES del
-// contenido; solo wire seed). El token fresco lo mint el play+eco del nonceRt
-// (m_lastPlayToken si el eco devolvio uno) o el op53 del handshake.
+// v77b: op5 JOIN con el token fresco acuñado por el do:play que acaba de
+// correr (doc OurClient: "op5 turns THE spawn token into a join request,
+// re-encrypting op53 under a fixed key"). Si el play no devolvio challenge
+// (spawn inicial), fallback al spawnTokenRaw del op53 del handshake.
+// v78+v91 (CAPTURA DEL BINARIO REAL 2026-08-13/14): el JOIN op5 re-cifra
+// SIEMPRE el op53 COMPLETO (33 bytes, prefijo comun "00000008TTJYQ") bajo
+// eb(suffix) con makeNativePlayFrameKeyedRaw UNA sola capa. El "nonce" de
+// 8 chars del play NO entra en el blob del JOIN (el blob del binario mide
+// 52 chars, no 20) — era una pista falsa del v77/v78. Sin spawnTokenRaw el
+// fallback Flag con el string b64 producia un blob invalido (semi-enganchado).
 void FarmWorker::sendJoinFrame(QTcpSocket *sock, FarmState &st)
 {
-    QString token;
-    if (!m_lastPlayToken.isEmpty() && m_lastPlayToken.size() >= 20
-        && m_lastPlayToken.left(8) == QStringLiteral("00000008")) {
-        token = m_lastPlayToken; // token fresco del play+eco
-        emitLog(QString("JOIN op5 con token FRESCO del play+eco (%1 chars, v92)").arg(token.size()));
-    } else if (!st.spawnToken.isEmpty()) {
-        token = st.spawnToken; // op53 del handshake
-        emitLog(QString("JOIN op5 con token del op53 (%1 chars, v92)").arg(token.size()));
-    } else {
-        emitLog("JOIN op5 SIN token - fallback random (anomalo)");
-        sendFrame(sock, tcp::makeNativePlayFrameFlag(st.seed, randomNonce(), st.suffix, false));
+    if (!st.spawnTokenRaw.empty()) {
+        // challenge = m2xc_encrypt(eb(op53), eb(suffix)), UNA capa.
+        sendFrame(sock, tcp::makeNativePlayFrameKeyedRaw(st.seed,
+                    st.spawnTokenRaw, bytesOf(st.suffix), false));
+        emitLog(QString("JOIN op5 con op53 completo (%1 bytes, v91)").arg(int(st.spawnTokenRaw.size())));
         return;
     }
-    sendFrame(sock, tcp::makeJoinFramePlain(st.seed, token, false));
-    m_lastPlayToken.clear();
+    sendFrame(sock, tcp::makeNativePlayFrameFlag(st.seed,
+                                st.spawnToken.isEmpty() ? randomNonce() : st.spawnToken,
+                                st.suffix, false));
+    emitLog("JOIN op5 SIN op53 - fallback flag (anomalo)");
 }
 
 // v77: experimento decisivo — true = los watchdogs SOLO DETECTAN (loguean
@@ -2630,7 +2535,6 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
     // "semi-enganchada" (op19 cada 15s vs 1s del binario, XP bajo). El play
     // debe correr SIEMPRE (httpApi completo) para capturar el nonce.
     {
-        m_lastPlayEchoSent = false; // v92: eco del nonceRt tras el play
         QJsonObject playResp = httpApi(net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
         Q_UNUSED(playResp);
     }
@@ -3422,7 +3326,6 @@ void FarmWorker::run()
 try {
     apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"ingame", true}, {"slot", 3}}));
     apiCall(&net, sk, magic, apiJson({{"do", "news"}}));
-    m_lastPlayEchoSent = false; // v92: eco del nonceRt tras el play
     httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}})); // captura nonce -> m_lastPlayToken
     apiCall(&net, sk, magic, apiJson({{"do", "gamemode"}, {"index", 1}, {"mode", 3}}));
 } catch (...) {}
@@ -3987,9 +3890,7 @@ try {
                         // (73562/73762/73958); el mmm va cada 10.5s aparte. El
                         // "mmm pre-play" (v67) era trafico extra que inflaba el
                         // tag a 1000+ y el server cortaba. SOLO play HTTP.
-                        // v92: httpApi + eco del nonceRt (el binario ecosea tras cada play)
-                        m_lastPlayEchoSent = false;
-                        httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
+                        apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                     } catch (...) {}
                     sendJoinFrame(sock.get(), state); // v77b
                     nextUpdateExp = now + 1000;
@@ -4077,35 +3978,10 @@ try {
                         QString nonceRt;
                         try {
                             QString u = kEngine + "?_sid=" + urlEncodeTcp(sk, false) + "&rndx=" + rndxTcp();
-                            // v92f (REVERSION de v92e: +749 vs +4467 — el challenge
-                            // CIFRADO rompia el enganche, op19 mediana 64s): body
-                            // PLANO como en v92c/v92d. El roundtrip devuelve
-                            // result:ko de todos modos (nonceRt queda vacio), pero
-                            // con plano la sesion engancha igual (+4467/5min).
                             QByteArray rt = httpPostTcp(&net, QUrl(u), v.arr[1].s.toUtf8(), &m_stop, 3000);
                             QString t = QString::fromUtf8(rt).trimmed();
-                            // v92d (log v92c "len=132 tBB,00000072TTJYQ..."): la
-                            // respuesta del roundtrip es un blob tBB CIFRADO (m2xc).
-                            if (t.startsWith("tBB,")) {
-                                QString b64 = t.mid(12);
-                                QString padded = b64;
-                                int pad = (4 - (padded.size() % 4)) % 4;
-                                padded += QString(pad, QLatin1Char('='));
-                                QByteArray blobBytes = QByteArray::fromBase64(padded.toLatin1());
-                                Bytes blob(blobBytes.begin(), blobBytes.end());
-                                if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2' && blob[2] == 'X' && blob[3] == 'C') {
-                                    Bytes dec = m2xcDecryptFull(blob, bytesOf(magic));
-                                    t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                                } else {
-                                    Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(magic, 100), false);
-                                    while (!dec.empty() && dec.back() == 0)
-                                        dec.pop_back();
-                                    t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                                }
-                            }
                             if (t.size() == 8) {
                                 nonceRt = t;
-                                m_nonceRt = t; // v92: eco del play (el binario lo reenvia plano tras cada play)
                                 emitLog("Challenge roundtrip HTTP OK: " + t);
                             } else {
                                 emitLog("Challenge roundtrip HTTP raro (len=" + QString::number(t.size()) + "): '" + t.left(20) + "'");
@@ -4232,9 +4108,9 @@ try {
                             // cada 10.5s aparte. El "mmm pre-play" (v8/v67) era
                             // trafico extra que inflaba el tag a 1000+ y el server
                             // cortaba. ELIMINADO: solo play HTTP.
-                            // v92: httpApi + eco del nonceRt (el binario ecosea tras cada play)
-                            m_lastPlayEchoSent = false;
-                            httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
+                            try {
+                                apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
+                            } catch (...) {}
                     sendJoinFrame(sock.get(), state); // v77b
                             // el binario hace updateexp ~1s tras el play/respawn
                             nextUpdateExp = now + 1000;
@@ -4402,11 +4278,6 @@ try {
         // en el build de las 23:47, el mejor resultado de XP de toda la noche).
         // Los intentos v84 (add fijo -192895987 y mmm OFF) DEGRADARON el farm
         // (+980 a +1966 vs +7824). Los datos empiricos mandan: UID activo.
-        // v92 (CAPTURA 2026-08-14, cap_partida_v88.log): el binario real manda
-        // add FIJO [-192895987,null/\"\",100,0] SIEMPRE (tags 33-49, cada
-        // ~10.5s). El UID kickea el TCP ~7s post-[20] (v84 lo detecto). El
-        // v84 fue CONTAMINADO por el JOIN roto; con el JOIN corregido se
-        // reproba el FIJO del binario como fuente de verdad.
         if (now >= nextMmm && !uid.isEmpty()) {
             try {
                 // v80b: leer el tag SIEMPRE del mapa (mmmTagGet) — la variable
@@ -4416,8 +4287,8 @@ try {
                 const bool usarVacio = (mmmTag % 4 == 0 || mmmTag % 4 == 1);
                 QJsonObject mmmBody = apiJson({ {"do", "mmm"}, {"begin", false}, {"serching", false},
                                                 {"add", usarVacio
-                                                    ? QString("[-192895987,\"\",100,0]")
-                                                    : QString("[-192895987,null,100,0]")},
+                                                    ? QString("[%1,\"\",100,0]").arg(uid)
+                                                    : QString("[%1,null,100,0]").arg(uid)},
                                                 {"tag", mmmTag},
                                                 {"abandon", false}, {"mode", -1}, {"stop", false} });
                 apiCall(&net, sk, magic, mmmBody);
@@ -4546,8 +4417,7 @@ try {
                     mmmTagSet(m_deviceId, preTag + 1);
                     emitLog("WATCHDOG: mmm add=\"\" pre-play tag=" + QString::number(preTag));
                 }
-                m_lastPlayEchoSent = false;
-                httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}})); // v92: + eco nonceRt
+                apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                 sendFrame(sock.get(), state.spawnTokenRaw.empty()
                     ? tcp::makeNativePlayFrameFlag(state.seed,
                                                    state.spawnToken.isEmpty() ? randomNonce() : state.spawnToken,
@@ -4593,9 +4463,7 @@ try {
                 emitLog("WATCHDOG: 30s sin XP - play+JOIN en el MISMO socket (intento 1/1)");
                 try {
                     // v81: sin mmm pre-play (el binario no lo hace en respawn)
-                    // v92: httpApi + eco del nonceRt
-                    m_lastPlayEchoSent = false;
-                    httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
+                    apiCall(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
                     sendJoinFrame(sock.get(), state); // v77b
                     emitLog("WATCHDOG: play + JOIN enviados (mismo socket)");
                     // v76b: updateexp ~1s tras el play (como el binario)

@@ -245,24 +245,27 @@ ApplicationWindow {
         }
         function onAccountsChanged() {
             root.syncPriority()
-            // sincroniza accountStartTimes con el farmStatus real de cada
-            // cuenta (el Connections { target: null } dentro de los delegates
-            // nunca se disparaba, asi que el timer de duracion del farm no
-            // aparecia). accountsChanged se emite en C++ cada vez que cambia
-            // el status de un farm (onFarmState/onFarmXp/onFarmFinished).
-            var accs = farm.accounts
+            // sincroniza accountStartTimes con el farmStatus REAL de cada
+            // cuenta. v44 (bug contador): ANTES usaba farm.accounts, que NO
+            // tiene farmStatus (solo workflowAccounts lo enriquece) -> la
+            // sincronizacion nunca detectaba "Farming"/"Idle" y el contador
+            // no arrancaba ni paraba. workflowAccounts deriva farmStatus de
+            // fh.spawned/thread->isRunning (tambien cuando el handle se va).
+            var accs = farm.workflowAccounts
             var start = root.accountStartTimes
             var changed = false
             for (var i = 0; i < accs.length; i++) {
                 var dev = accs[i].device
+                // v44: el contador arranca SOLO cuando la cuenta esta en
+                // "Farming" (no en Connecting/Respawning: la cuenta puede
+                // tardar 40s en conectarse y el timer no debe correr antes).
                 if (accs[i].farmStatus === "Farming" && !start[dev]) {
                     start = Object.assign({}, start, {[dev]: Date.now()})
                     changed = true
-                } else if ((accs[i].farmStatus === "Idle" || accs[i].farmStatus === "") && start[dev]) {
-                    // Solo se limpia cuando la cuenta para DE VERDAD (Idle/vacio).
-                    // Estados intermedios (Refreshing/Connecting/Respawning) NO
-                    // reinician el timer: el refresh marca "Refreshing" mientras
-                    // corre y el farm sigue contando desde el mismo inicio.
+                } else if ((accs[i].farmStatus === "Idle" || accs[i].farmStatus === "" || accs[i].farmStatus === undefined) && start[dev]) {
+                    // Se limpia cuando la cuenta para DE VERDAD (Idle/vacio/
+                    // sin handle). Estados intermedios (Connecting) NO
+                    // reinician el timer mientras el farm sigue vivo.
                     var copy = Object.assign({}, start)
                     delete copy[dev]
                     start = copy
@@ -1042,13 +1045,6 @@ ApplicationWindow {
                                         }
                                     }
                                 }
-                                GhostButton {
-                                    text: "Stop"
-                                    Layout.fillWidth: true
-                                    enabled: farm.farmRunning
-                                    onClicked: farm.stopFarm()
-                                }
-
                                 Rectangle { Layout.fillWidth: true; height: 1; color: colors.borderSoft }
 
                                 SectionHeader { title: "REFRESH" }
@@ -1139,11 +1135,20 @@ ApplicationWindow {
                                     StatusPill { value: farm.farmSelection.length + " SELECTED"; accent: farm.farmSelection.length > 0 ? colors.amber : colors.faint }
                                 }
                                 ListView {
+                                    id: workflowList
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     Layout.minimumHeight: 120
                                     clip: true
                                     spacing: 4
+                                    // v42 (bug scroll accounts/workflow): el modelo
+                                    // QVariantList se reconstruye en cada
+                                    // accountsChanged (flush de XP) y el ListView
+                                    // saltaba arriba. Preservar contentY entre
+                                    // rebuilds.
+                                    property real savedY: 0
+                                    onContentYChanged: { if (workflowList.moving || workflowList.flicking) workflowList.savedY = workflowList.contentY }
+                                    onCountChanged: Qt.callLater(function() { workflowList.contentY = workflowList.savedY })
                                     // Solo cuentas SELECCIONADAS: la desmarcada
                                     // desaparece del dashboard al instante
                                     model: farm.workflowAccounts
@@ -1215,10 +1220,15 @@ ApplicationWindow {
                                                     horizontalAlignment: Text.AlignRight
                                                 }
                                                 SmallCaption {
-                                                    visible: modelData.farmStatus === "Farming" && modelData.startedAt > 0
+                                                    // v44 (bug contador): ANTES usaba modelData.startedAt
+                                                    // (C++ lo setea al CREAR el thread, antes de conectar ->
+                                                    // el timer corria 40s de mas). Ahora usa
+                                                    // root.accountStartTimes[device], que arranca cuando el
+                                                    // farmStatus llega a "Farming" y se limpia al parar.
+                                                    visible: modelData.farmStatus === "Farming" && root.accountStartTimes[modelData.device] !== undefined
                                                     text: {
                                                         timerTick.tick
-                                                        var start = modelData.startedAt
+                                                        var start = root.accountStartTimes[modelData.device]
                                                         if (!start) return ""
                                                         var elapsed = Math.floor((Date.now() - start) / 1000)
                                                         var h = Math.floor(elapsed / 3600)
@@ -1437,7 +1447,13 @@ ApplicationWindow {
                                     LabelText { visible: farm.farmSelection.length > 0; text: farm.farmSelection.length + " sel"; color: colors.amber; font.pixelSize: 9; font.weight: Font.DemiBold }
                                     GhostButton { visible: farm.farmSelection.length > 0; text: "Clear"; Layout.preferredWidth: 52; Layout.preferredHeight: 22; onClicked: farm.clearFarmSelection() }
                                 }
-                                ListView { Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 120; clip: true; spacing: 3; model: farm.filteredAccounts; ScrollBar.vertical: ThemedScrollBar { }
+                                ListView { id: accountsList
+                                    Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 120; clip: true; spacing: 3; model: farm.filteredAccounts; ScrollBar.vertical: ThemedScrollBar { }
+                                    // v42 (bug scroll): el modelo se reconstruye en
+                                    // cada accountsChanged -> contentY saltaba a 0.
+                                    property real savedY: 0
+                                    onContentYChanged: { if (accountsList.moving || accountsList.flicking) accountsList.savedY = accountsList.contentY }
+                                    onCountChanged: Qt.callLater(function() { accountsList.contentY = accountsList.savedY })
                                     delegate: Rectangle {
                                         width: ListView.view.width
                                         height: 72
@@ -1954,10 +1970,14 @@ ApplicationWindow {
                         width: ListView.view.width
                         height: 48
                         radius: 5
-                        // sticky: la fila seleccionada (primer click) se resalta
-                        color: root.priorityDragStart === prioRow.index ? Qt.lighter(colors.amber, 2.3) : (prioHover.containsMouse ? Qt.lighter(colors.surface2, 1.15) : colors.surface2)
+                        // sticky: la fila seleccionada (primer click) se resalta.
+                        // v42: el resaltado requiere TAMBIEN priorityDragActive —
+                        // con solo priorityDragStart, syncPriority (que reconstruye
+                        // el modelo al aplicar el orden) recreaba delegates con el
+                        // flag viejo y la gema quedaba "seleccionada" tras el swap.
+                        color: (root.priorityDragActive && root.priorityDragStart === prioRow.index) ? Qt.lighter(colors.amber, 2.3) : (prioHover.containsMouse ? Qt.lighter(colors.surface2, 1.15) : colors.surface2)
                         Behavior on color { ColorAnimation { duration: 100 } }
-                        border.color: root.priorityDragStart === prioRow.index ? colors.amber : "transparent"
+                        border.color: (root.priorityDragActive && root.priorityDragStart === prioRow.index) ? colors.amber : "transparent"
                         border.width: 1
                         RowLayout { anchors.fill: parent; anchors.leftMargin: 8; anchors.rightMargin: 8; spacing: 8
                             LabelText { text: (prioRow.index + 1).toString().padStart(2, "0"); color: colors.faint; font.pixelSize: 11; Layout.preferredWidth: 34 }
@@ -2000,12 +2020,20 @@ ApplicationWindow {
                                 ArrowButton {
                                     arrow: "\u25B2"
                                     enabled: prioRow.index > 0
-                                    onClicked: farm.moveGemPriority(prioRow.index, prioRow.index - 1)
+                                    onClicked: {
+                                        root.priorityDragStart = -1
+                                        root.priorityDragActive = false
+                                        farm.moveGemPriority(prioRow.index, prioRow.index - 1)
+                                    }
                                 }
                                 ArrowButton {
                                     arrow: "\u25BC"
                                     enabled: prioRow.index < priorityList.count - 1
-                                    onClicked: farm.moveGemPriority(prioRow.index, prioRow.index + 1)
+                                    onClicked: {
+                                        root.priorityDragStart = -1
+                                        root.priorityDragActive = false
+                                        farm.moveGemPriority(prioRow.index, prioRow.index + 1)
+                                    }
                                 }
                             }
                         }
@@ -2033,12 +2061,19 @@ ApplicationWindow {
                                     // click en otra -> intercambiar posiciones
                                     var from = root.priorityDragStart
                                     var to = prioRow.index
+                                    // v42: limpiar la seleccion ANTES de
+                                    // applyPriorityOrder — ese call dispara
+                                    // gemPriorityChanged -> syncPriority que
+                                    // reconstruye el modelo; si el flag seguia
+                                    // puesto, los delegates nuevos nacian con
+                                    // la fila marcada ("la gema sigue
+                                    // seleccionada despues del swap").
+                                    root.priorityDragStart = -1
+                                    root.priorityDragActive = false
                                     // mueve el item de 'from' a 'to' (desplaza el resto)
                                     priorityQmlModel.move(from, to, 1)
                                     // sincroniza el backend con el orden final
                                     farm.applyPriorityOrder(priorityQmlModel)
-                                    root.priorityDragStart = -1
-                                    root.priorityDragActive = false
                                     root.toast("Priority updated")
                                 }
                             }
