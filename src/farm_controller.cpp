@@ -2943,14 +2943,13 @@ void FarmController::onGemXpRead(FarmWorker *w, qlonglong cexp, qlonglong exp)
     const qlonglong delta = cexp - fh->lastGemCexp;
     fh->lastGemCexp = cexp;
 
-    // 2026-08-11 (queja del usuario: "el refresh no muestra el avance del XP"):
-    // el cexp de la gema (inventory slot=5) SE CONGELA mientras la cuenta esta
-    // en partida (el server lo materializa al terminar la sesion). El avance
-    // real en vivo esta en el XP del op 24 (fh->lastXp). Combinar ambos para
-    // que el dashboard SIEMPRE muestre progreso.
-    const qlonglong liveXp = qlonglong(fh->lastXp);
-    const qlonglong shownXp = qMax(cexp, liveXp);
-    const qlonglong shownDelta = qMax(qlonglong(0), qMax(delta, liveXp > 0 ? liveXp : 0));
+    // v83 (FIX 2026-08-14, queja del usuario "ya dañaste el contador de xp"):
+    // el cexp de la gema (inventory slot=5) ES la unica fuente real del XP de
+    // gemas. El qMax con fh->lastXp (XP del MAPA, op24) mezclaba gemas con
+    // mapa y el delta salia inflado (DrugDealer mostraba 8283 cuando el real
+    // era 8935). Mostrar SOLO cexp.
+    const qlonglong shownXp = cexp;
+    const qlonglong shownDelta = qMax(qlonglong(0), delta);
 
     // Actualiza el texto de XP de la gema (solo si es la cuenta activa)
     if (fh->deviceId == resolveDeviceId()) {
