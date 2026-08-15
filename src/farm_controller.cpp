@@ -2135,6 +2135,10 @@ void FarmController::runStoreAutoBuy()
         return;
     if (m_shopBusy || m_qwsLoading || m_fetching || m_spawning.load())
         return;
+    // v97af (pedido del usuario 2026-08-15): auto-buy TOTALMENTE desactivado
+    // (tanto el de rotacion de tienda como el de prioridad en el spawn).
+    Q_UNUSED(m_autoBuyColors);
+    return;
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     const int hourUtc = nowUtc.time().hour();
     const int minuteUtc = nowUtc.time().minute();
@@ -2620,47 +2624,13 @@ void FarmController::spawn()
                     QThread::msleep(1000);
                     prep.gems = local.fetchInventory(5);
                 }
-                // COMPRA AUTOMATICA segun prioridad (pedido 2026-08-09): si la
-                // cuenta NO tiene gema equipada, se compra del shop la primera
-                // gema cuyo color este mas arriba en la prioridad (y que la
-                // cuenta pueda pagar). El store usa ids de CATALOGO distintos
-                // del inventario; la compra es {"do":"buy","item":<id>}.
+                // v97af (pedido del usuario 2026-08-15): auto-buy de gemas por
+                // prioridad ELIMINADO TOTALMENTE — el bot ya no compra gemas
+                // del shop. Si la cuenta no tiene gema equipada, queda sin
+                // gema (el farm no la spawneara).
                 if (prep.gems.isEmpty() && !priorityColors.isEmpty()) {
-                    writeLogFile(QStringLiteral("[DBG] spawnLogin %1 sin gema, consultando shop para prioridad %2")
-                                     .arg(logName(deviceId, prep.realName))
-                                     .arg(priorityColors.join(QLatin1Char(','))));
-                    const QVector<StoreItem> store = local.fetchStore(10);
-                    for (const QString &ck : priorityColors) {
-                        for (const StoreItem &s : store) {
-                            const QString itemCk = gemColorKey(gemSpritePath(s.name, s.level));
-                            if (itemCk != ck)
-                                continue;
-                            // v42 (pedido del usuario): el auto-buy SI compra
-                            // gemas lvl 25 (solo COMPRAR y guardar en el
-                            // inventario). El farm nunca las equipa: el pick
-                            // del spawn filtra itemLevel >= 25.
-                            if (s.owned || !s.purchasable)
-                                continue;
-                            if (prep.coins > 0 && s.price > prep.coins)
-                                continue; // no alcanza: pasa al siguiente color
-                            const QJsonObject resp = local.apiCall(QStringLiteral("{\"do\":\"buy\",\"item\":%1}").arg(s.id));
-                            const bool bought = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
-                            writeLogFile(QStringLiteral("[DBG] spawnLogin %1 auto-buy %2 (%3) -> %4")
-                                             .arg(logName(deviceId, prep.realName)).arg(s.name).arg(ck)
-                                             .arg(bought ? QStringLiteral("ok") : resp.value(QStringLiteral("message")).toString()));
-                            if (bought) {
-                                prep.boughtByPriority = true; // 2026-08-10: badge PRIORIDAD
-                                QThread::msleep(1200); // asienta la compra
-                                prep.gems = local.fetchInventory(5);
-                                prep.equippedId = local.lastCurrentItem();
-                            }
-                            break; // un intento por color
-                        }
-                        if (!prep.gems.isEmpty())
-                            break;
-                    }
-                    writeLogFile(QStringLiteral("[DBG] spawnLogin %1 tras auto-buy: gems=%2 current=%3")
-                                     .arg(logName(deviceId, prep.realName)).arg(prep.gems.size()).arg(prep.equippedId));
+                    writeLogFile(QStringLiteral("[DBG] spawnLogin %1 sin gema (auto-buy DESACTIVADO)")
+                                     .arg(logName(deviceId, prep.realName)));
                 }
                 prep.equippedId = local.lastCurrentItem(); // data.current real
                 prep.realName = local.fetchAccountName();  // loginifneeded
@@ -3094,6 +3064,26 @@ void FarmController::onFarmFinished(FarmWorker *w, bool ok, const QString &error
     // El farm termino; si auto-respawn esta ON, el worker internamente
     // ya deberia estar re-spawneando (su loop run() lo maneja). Si no
     // esta activo, el worker simplemente sale.
+    // v97e (pedido del usuario: "mate la cuenta y nunca se autorespawneo"):
+    // el worker que muere por fail() (15 sesiones fallidas, TCP fail, etc.)
+    // SALE del run() y NADIE lo re-lanza -> la cuenta queda parada hasta el
+    // refresh de 600s (Expend +481 vs Action +2225 en el test 12min). Si el
+    // autoRespawn esta ON, re-lanzar el spawn de ESA cuenta tras 8s.
+    // Excepciones: "stopped" (stop manual o del refresh — el refresh ya
+    // respawnea) y "Not spawning" (gema prohibida/agotada — el refresh
+    // re-equipa por prioridad; reintentar aqui quemaria logins).
+    if (!ok && fh && m_autoRespawn
+        && !error.contains(QStringLiteral("stopped"))
+        && !error.contains(QStringLiteral("Not spawning"))) {
+        const QString deviceId = fh->deviceId;
+        appendLog(QStringLiteral("[%1] autoRespawn: re-lanzando en 8s (error del farm)")
+                      .arg(name));
+        QTimer::singleShot(8000, this, [this, deviceId]() {
+            if (m_autoRespawn) {
+                respawnDevices({deviceId});
+            }
+        });
+    }
     // Actualiza la UI
     emit farmRunningChanged();
     rebuildActiveSessions();

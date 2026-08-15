@@ -295,7 +295,7 @@ private:
     bool sendFrame(QTcpSocket *sock, const Bytes &data);
     bool decodeFrame(const Bytes &payload, std::uint32_t seed, tcp::AmfValue *out);
     void doLogin(QString *sk, QString *magic, QString *accountName, QByteArray *sessionCookies);
-    QJsonObject httpApi(QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload);
+    QJsonObject httpApi(QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload, int timeoutMs = 8000);
     // Version best-effort del httpApi para el postSpawn/respawn: tryLock
     // 350ms del g_loginMutex global. Si la cola de los otros farms esta
     // ocupada, SALTAR el HTTP (devolver vacio) en vez de esperar 5-14s sin
@@ -378,7 +378,8 @@ QScopedPointer<QUdpSocket> m_udpSock{nullptr};
 QByteArray m_udpPrefix;   // 9 bytes: 0x80|rand + 8 chars del charset del binario
 quint32 m_udpSeq = 0;     // secuencia del UDP MOVE (incrementa por envio)
 // coordenadas pseudo-aleatorias del UDP MOVE (simulan movimiento de jugador)
-double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
+    double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
+    qint64 m_udpNextDrift = 0; // v97ah: proximo paso del random walk del jugador
     QString m_udpIp;          // IP resuelta del server (QHostAddress NO resuelve nombres)
     // Aborto cooperativo EXTERNO (verificado 2026-08-08, familia 0x1CE857):
     // el refreshXp del worker local del refreshAll pollea el settle hasta
@@ -404,7 +405,20 @@ double m_udpX = 34.0, m_udpY = -3.084, m_udpZ = 0.9309;
     // del device, constante). El server mint el token del JOIN solo si recibe
     // play + este eco. Se guarda al resolver el op52 y se ecosea en cada play.
     QString m_nonceRt;
-    bool m_lastPlayEchoSent = false; // v92: 1 eco por ciclo de play (el binario ecosea tras cada play)
+    bool m_lastPlayEchoSent = false; // v92: 1 eco por ciclo de play (el binario ecosea t
+    // v97ab: uid/chattoken del ultimo pre-flow — en la reconexion se saltan
+    // los 3 HTTPs del pre-flow (i18n/loginifneeded/chattoken ~3s).
+    QString m_lastUid;
+    QString m_lastCtToken;
+    // v97al (CAPTURA cap_reconexion.log 2026-08-15): el binario intenta
+    // RESUMIR la sesion al reconectar (HTTP "resume::<key>" + frame TCP con
+    // seed=0). La key viene del op40 (RESUME_KEY) de la sesion anterior.
+    QString m_resumeKey;
+    QString m_lastSuffix; // suffix del greeting de la sesion anterior (para el resume)
+    // v97as: reconexion directa a la MISMA partida (TCP al mismo server con el
+    // mismo token, sin login ni connect HTTP). El flag evita reintentar el
+    // directo en bucle: si falla, el siguiente ciclo hace el connect fresco.
+    bool m_directReconnectTried = false;
     // 2026-08-11 v14: host del server actual (key del op5 JOIN = host+suffix)
     QString m_currentHost;
     QString m_inviteString;   // invite de la sala (para el AUTH del respawn)

@@ -746,6 +746,51 @@ Bytes makeAuthFrame(const QString &host, const QString &suffix, const QString &t
     return makeClientFrame(payload, int(logical.size()), std::uint8_t(chk), 0);
 }
 
+// v97al (CAPTURA cap_reconexion.log 2026-08-15): el binario intenta RESUMIR la
+// sesion al reconectar — HTTP "resume::<key>" + frame TCP wlen=56 seed=0
+// "00000016TTJYQ..." (el MISMO formato que el AUTH: amfString del m2xc del
+// plaintext "resume::<key>" con la key host+suffix de la sesion anterior).
+Bytes makeResumeFrame(const QString &host, const QString &suffix, const QString &resumeKey,
+                      QString *bodyHttpOut)
+{
+    const QString plaintext = QStringLiteral("resume::") + resumeKey;
+    Bytes key = bytesOf(host + suffix);
+    Bytes blob = m2xcEncryptFull(bytesOf(plaintext), key, 0, 0);
+    QString s = m2xcFmt(blob);
+    if (bodyHttpOut)
+        *bodyHttpOut = s;
+    Bytes logical = amfString(s);
+    Bytes payload = logical;
+    payload.push_back(0x00);
+    std::int32_t chk = getByteKey(logical) & 0x3F;
+    return makeClientFrame(payload, int(logical.size()), std::uint8_t(chk), 0);
+}
+
+// v97al (CAPTURA cap_reconexion.log): el binario manda el MOVE CRUDO por TCP:
+// 00002726 (opcode BE) + 3 floats BE (34.0, 0.648, 0.402), 5 veces en rafaga
+// tras el resume. wlen=16 sin AMF3 ni cifrado (seed=0).
+Bytes makeMoveRaw2726(double x, double angle, double power)
+{
+    Bytes pkt;
+    auto pushU32 = [&](std::uint32_t v) {
+        pkt.push_back(std::uint8_t((v >> 24) & 0xFF));
+        pkt.push_back(std::uint8_t((v >> 16) & 0xFF));
+        pkt.push_back(std::uint8_t((v >> 8) & 0xFF));
+        pkt.push_back(std::uint8_t(v & 0xFF));
+    };
+    auto pushF = [&](double d) {
+        float f = float(d);
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &f, 4);
+        pushU32(bits);
+    };
+    pushU32(0x2726);
+    pushF(x);
+    pushF(angle);
+    pushF(power);
+    return pkt;
+}
+
 Bytes makePongFrame(std::uint32_t seed, double nowMs)
 {
     Bytes logical = amfArray({amfDouble(10001.0), amfDouble(nowMs), amfInt(std::int32_t(seed % 100))});
@@ -1093,10 +1138,12 @@ int FarmWorker::mmmTagGet(const QString &deviceId)
     // RESETEA POR SESION (binario: tags 5->15 hoy, 83->91 ayer = sesiones
     // distintas, NO continuas). El v18 persistia el tag en QSettings -> el
     // bot arrancaba cada corrida con 800-1000+ y el server cortaba el TCP
-    // en el mismo segundo del mmm. El tag vive SOLO en el mapa del proceso
-    // y el reset de run()/spawnSession lo pone a 2 en cada sesion.
-    s_mmmTags[deviceId] = 2;
-    return 2;
+    // en el mismo segundo del mmm. El tag vive SOLO en el mapa del proceso.
+    // v97bh (cortes de HOY en el mmm con tags 2-4): el binario arranca en
+    // tag 5 (captura: 3->5 en handshake, 5->15 en partida) — los tags 2-4
+    // son senal de bot. Arrancar en 5 como el binario.
+    s_mmmTags[deviceId] = 5;
+    return 5;
 }
 
 void FarmWorker::mmmTagSet(const QString &deviceId, int value)
@@ -1370,7 +1417,7 @@ static QByteArray echoPlayChallenge(QNetworkAccessManager *net, const QUrl &url,
     return resp2;
 }
 
-QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload)
+QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload, int timeoutMs)
 {
     // 2026-08-10 FINAL: HTTP FUERA del mutex global. Cada worker tiene su
     // propio QNetworkAccessManager (m_net, creado bajo lock una vez) y su
@@ -1380,6 +1427,9 @@ QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, 
     // crashes 0x1CF461/0x1C8A4E) y el parseo (g_jsonParseMutex). Serializar el
     // HTTP global era el bug: con 10 farms cada postSpawn esperaba la cola de
     // los otros 9 (test #27: 5 farming, peor que el skip del #26 con 9).
+    // v97ba (cortes EN el segundo del mmm): el POST colgado del loop bloquea
+    // los PONGs hasta timeoutMs (antes 8000 fijo) — el server corta a los
+    // ~12s sin PONGs. Los HTTPs periodicos del loop pasan timeoutMs corto.<｜end▁of▁thinking｜>
     QJsonDocument doc(payload);
     QString bodyJson = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
     Bytes enc;
@@ -1391,8 +1441,12 @@ QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, 
     }
     emit debugLog(QString("%1 HTTP >> %2").arg(m_deviceId.left(10)).arg(bodyJson));
     writeWorkerLog(QString("%1 HTTP >> %2").arg(m_deviceId.left(10)).arg(bodyJson.left(80)));
-    QByteArray resp = httpPostTcp(net, QUrl(url), m2xcFmt(enc).toUtf8(), &m_stop);
+    QByteArray resp = httpPostTcp(net, QUrl(url), m2xcFmt(enc).toUtf8(), &m_stop, timeoutMs);
     QString t = QString::fromUtf8(resp);
+    // v97bb (diagnostico): la respuesta CRUDA del play (el binario recibe un
+    // nonce de 8 chars que ecoea; el bot debe ecoear LO MISMO).
+    if (payload.value("do").toString() == "play")
+        emitLog(QString("PLAY raw: len=%1 '%2'").arg(t.size()).arg(t.left(48)));
     QJsonObject parsed;
     if (!t.startsWith("tBB,")) {
         parsed = parseJsonObj(resp);
@@ -1405,7 +1459,7 @@ QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, 
             // siguiente NATIVE_PLAY (makeNativePlayFrameKeyedRaw con nonce).
             m_lastPlayToken = t;
             QByteArray resp2 = echoPlayChallenge(net, QUrl(url), t, magicc,
-                [&](const QByteArray &body) { return httpPostTcp(net, QUrl(url), body, &m_stop); });
+                [&](const QByteArray &body) { return httpPostTcp(net, QUrl(url), body, &m_stop, timeoutMs); });
             QString t2 = QString::fromUtf8(resp2);
             if (t2.startsWith("tBB,")) {
                 resp = resp2; t = t2;
@@ -1421,11 +1475,21 @@ QJsonObject FarmWorker::httpApi(QNetworkAccessManager *net, const QString &skk, 
             m_lastPlayEchoSent = true;
             emitLog(QString("PLAY ECHO nonceRt '%1' (v95)").arg(m_nonceRt));
             QByteArray resp2 = echoPlayChallenge(net, QUrl(url), m_nonceRt, magicc,
-                [&](const QByteArray &body) { return httpPostTcp(net, QUrl(url), body, &m_stop); });
+                [&](const QByteArray &body) { return httpPostTcp(net, QUrl(url), body, &m_stop, timeoutMs); });
             QString t2 = QString::fromUtf8(resp2).trimmed();
             emitLog(QString("PLAY ECHO respuesta len=%1: '%2'").arg(t2.size()).arg(t2.left(40)));
         }
     } else {
+        // v97bb: la respuesta tBB del play contiene el token FRESCO del JOIN
+        // en claro ("tBB,00000062TTJYQ...", 40 chars). El binario lo usa en el
+        // op5 [5,[token,false]]. Capturarlo aqui para el sendJoinFrame.
+        if (payload.value("do").toString() == "play") {
+            int tb = t.indexOf(QStringLiteral("00000062TTJYQ"));
+            if (tb >= 0 && t.size() - tb >= 40) {
+                m_lastPlayToken = t.mid(tb, 40);
+                emitLog(QString("PLAY token del JOIN: %1").arg(m_lastPlayToken));
+            }
+        }
         QString b64 = t.mid(12);
         QString padded = b64;
         int pad = (4 - (padded.size() % 4)) % 4;
@@ -1860,7 +1924,7 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
     // Resetear AQUI al inicio de la sesion cubre TODOS los mmm (listener,
     // connect, loop, respawn, watchdog) — el reset en run() no cubria los
     // que corren antes (listener/connect) y dejaban el tag persistido en 900+.
-    mmmTagSet(m_deviceId, 2);
+        // v97av: reset del tag ELIMINADO — el binario NO resetea (tags 40->68 continuos); el tag bajo repetido corta las sesiones a ~30s
     // SPAWN SERIALIZADO con g_spawnMutex (verificado 2026-08-08 v3): el
     // arranque en paralelo fue posible cuando los crashes rdi=9 eran SOLO los
     // QNAM ctor (ahora lazy bajo lock), pero el SEH de la familia 0x1CE857
@@ -1878,36 +1942,80 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
     // esas conexiones inactivas ("TCP disconnected during handshake").
     // Ahora el connect + UDP init viven DENTRO del lock: el server ve 1
     // conexion de la IP a la vez, como el binario con una sola cuenta.
-    QMutexLocker spawnLocker(&g_spawnMutex);
-    if (sock->state() != QAbstractSocket::ConnectedState) {
-        sock->connectToHost(resolveHostMutexed(host), port);
-        const qint64 connT0 = QDateTime::currentMSecsSinceEpoch();
-        // 2026-08-10 (test #44): timeout 7s. El server saturado a veces
-        // acepta el SYN a los 5-6s; 4s dejaba "Operacion socket expirada"
-        // en las mismas 4 cuentas en cada intento (Andy/Anisa/DeRene/Meet).
-        // Con el lock serializado el costo de esperar 7s es solo para la
-        // cuenta en turno, no para las demas (esperan el mutex).
-        while (!sock->waitForConnected(200) && !m_stop && !aborted()
-               && QDateTime::currentMSecsSinceEpoch() - connT0 < 7000) {}
-        if (m_stop || aborted()) {
-            if (err) *err = "aborted during TCP connect";
-            return false;
+    // v97q (fix del v97p: handshakes en paralelo = el server corta TODAS las
+    // conexiones "TCP disconnected during handshake" masivo): el mutex debe
+    // cubrir connect + handshake hasta el op53 (el server exige 1 conexion
+    // activa a la vez durante el AUTH/proof). Se LIBERA tras el op53: la
+    // espera del [20] responde PINGs (no es inactiva) y puede ir en paralelo.
+    // v97z (downtime medio de 83s = la COLA del mutex): tryLock con timeout de
+    // 20s — si la cuenta espera mas de 20s su turno, entra SIN mutex (con
+    // stagger extra) — pocas cuentas a la vez, riesgo limitado, cola fluida.
+    struct SpawnLockGuard {
+        QMutex *m = nullptr;
+        bool locked = false;
+        SpawnLockGuard(QMutex *mut, std::atomic<bool> *stopFlag, const std::function<bool()> &abortedFn)
+            : m(mut) {
+            // v97ae (bug: "el segundo autorefresh no funciona"): el tryLock de
+            // 10s NO chequeaba m_stop — los workers atrapados en la cola no
+            // morian con el stop del refresh (el poll de 30s expiraba, el
+            // respawn fallaba con "A farm is already running" y las cuentas
+            // quedaban paradas para SIEMPRE). Loop de 500ms con chequeo.
+            const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
+            while (!locked) {
+                locked = mut->tryLock(500);
+                if (locked)
+                    break;
+                if ((stopFlag && stopFlag->load()) || abortedFn())
+                    break;
+                if (QDateTime::currentMSecsSinceEpoch() - t0 >= 10000)
+                    break;
+            }
         }
+        void unlockEarly() {
+            if (locked) { m->unlock(); locked = false; }
+        }
+        ~SpawnLockGuard() {
+            if (locked) m->unlock();
+        }
+    };
+    SpawnLockGuard spawnGuard(&g_spawnMutex, &m_stop, [this]() { return aborted(); });
+    if (!spawnGuard.locked) {
+        emitLog("SPAWN MUTEX: cola >20s - entrando sin mutex (v97z)");
+        QThread::msleep(300 + (qHash(m_deviceId) % 9) * 700);
+    }
+    {
         if (sock->state() != QAbstractSocket::ConnectedState) {
-            if (err) *err = "TCP connect failed: " + sock->errorString();
-            return false;
-        }
-        sock->setSocketOption(QAbstractSocket::LowDelayOption, 1);
-        emit stateChanged("TCP connected " + host + ":" + QString::number(port));
-        if (doUdpInit) {
-            // FIX 2026-08-11 (captura frida_v3 del binario REAL en partida):
-            // el cliente real NO envia NINGUN datagrama UDP (0 eventos en la
-            // captura con hook de sendto/recvfrom activo). El UDP INIT de aqui
-            // (headless_bot.py, no del binario) era trafico anomalo que el
-            // server podia detectar y cortar. Desactivado: solo TCP + HTTP.
-            emitLog("UDP INIT omitido (el binario real no envia UDP)");
+            sock->connectToHost(resolveHostMutexed(host), port);
+            const qint64 connT0 = QDateTime::currentMSecsSinceEpoch();
+            // 2026-08-10 (test #44): timeout 7s. El server saturado a veces
+            // acepta el SYN a los 5-6s; 4s dejaba "Operacion socket expirada"
+            // en las mismas 4 cuentas en cada intento (Andy/Anisa/DeRene/Meet).
+            // Con el lock serializado el costo de esperar 7s es solo para la
+            // cuenta en turno, no para las demas (esperan el mutex).
+            while (!sock->waitForConnected(200) && !m_stop && !aborted()
+                   && QDateTime::currentMSecsSinceEpoch() - connT0 < 7000) {}
+            if (m_stop || aborted()) {
+                if (err) *err = "aborted during TCP connect";
+                return false;
+            }
+            if (sock->state() != QAbstractSocket::ConnectedState) {
+                if (err) *err = "TCP connect failed: " + sock->errorString();
+                return false;
+            }
+            sock->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+            emit stateChanged("TCP connected " + host + ":" + QString::number(port));
+            if (doUdpInit) {
+                // v97ak (REVERTIDO el v97aj — el usuario confirmo que NO se
+                // necesita UDP): el binario real NO envia datagramas UDP.
+                emitLog("UDP INIT omitido (sin UDP — confirmado por el usuario)");
+            }
         }
     }
+    // v97aq (REVERTIDO el v97am: el resume/MOVEs en el socket NUEVO ANTES del
+    // greeting rompian el handshake — "No greeting" en bucle. El server habla
+    // PRIMERO (greeting) y el cliente espera. El resume del binario va en el
+    // socket VIEJO aun abierto; en el socket nuevo el binario espera el
+    // greeting limpio y recien entonces manda el AUTH).
     // greeting -> suffix (seed=0). El flujo exacto del run(): el greeting trae el
     // suffix numerico que seedea el MT de los encoding seeds.
     {
@@ -1930,6 +2038,7 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                 }
                 if (allDigits) {
                     state->suffix = v.s.mid(v.s.size() - 8);
+            m_lastSuffix = state->suffix; // v97al: para el resume de la proxima reconexion
                     state->mt = std::make_unique<tcp::MersenneTwister>(tcp::getStrKey(state->suffix));
                     state->seed = 0;
                     emitLog("Suffix: " + state->suffix);
@@ -2047,6 +2156,8 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
         }
         emitLog("LISTENER enviado: " + QString::fromUtf8(lst).left(60));
     }
+    // v97d: mmm del listener REVERTIDO (v97c bajo a +3371; sin el mmm listener
+    // el v97 dio +3998).
     // v81 (captura binario cap_partida2.log 2026-08-13): el binario NO hace
     // mmm del listener. Su unico mmm es el periodico del loop (~10.5s, tags
     // 5->15 en 120s). El mmm del listener (v18) era trafico EXTRA que
@@ -2158,6 +2269,12 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                 // (SEED_SYNC) los detecta, aqui NO se avanza el MT de nuevo.
                 if (op == 1 && state->mt) {
                     state->pingCount++;
+                    // v97bc (diagnostico): el [20] del binario llega 1ms tras el
+                    // PONG del [40] — ver si el PING llega y el PONG sale aqui.
+                    emitLog(QString("PING hs#%1 -> PONG eco ts=%2 seed=%3")
+                                .arg(state->pingCount)
+                                .arg(v.arr[1].d, 0, 'f', 1)
+                                .arg(state->seed));
                     if (state->pingCount == 1)
                         state->seed = state->mt->nextVal() % 99999;
                     // PONG REAL del binario (mitosis_client.py make_real_ping_frame):
@@ -2168,8 +2285,8 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                     // [10001.0, ts_local, seed%100] con chk = seed % 63.
                     emit debugLog(QString("TCP >> PONG [10001.0, ts, %1] seed=%2 chk=%3")
                                       .arg(state->seed % 100).arg(state->seed).arg(state->seed % 63));
-                    tcp::sleepHumanJitter(); // v94b: RTT humano (60-180ms)
-                    sendFrame(sock, tcp::makePongFrame(state->seed, double(QDateTime::currentMSecsSinceEpoch())));
+
+                    sendFrame(sock, tcp::makePongFrame(state->seed, v.arr[1].d));
                 } else if (op == 4 && v.arr.size() >= 2) {
                     if (v.arr[1].type == tcp::AmfValue::Int) {
                         state->playerId = QString::number(v.arr[1].i);
@@ -2182,50 +2299,26 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                     if (state->seed == 0 && state->mt)
                         state->seed = state->mt->nextVal() % 99999;
                     emitLog("Desafio seguro recibido, enviando PROOF TPM...");
-                    // challenge_roundtrip HTTP: el binario DES-CIFRA el challenge
-                    // con eb(suffix) y envia el PLAINTEXT al engine; recibe el
-                    // nonce de 8 chars (el "Uz5:YDXX" de la captura, constante
-                    // por sesion = el eco del play). v95: probar el body
-                    // DESCIFRADO (decryptChallenge) — el crudo daba result:ko.
+                    // v97n (CAPTURA cap_muerte_play3.log): el eco "Uz5:YDXX"
+                    // (8 chars) que el binario reenvia tras CADA play es el
+                    // nonceRt de la sesion. El challenge del op52 DES-CIFRADO
+                    // con eb(suffix) da EXACTAMENTE 8 chars (v95 lo confirmo:
+                    // "DESCIFRADO (8 chars body)"). El roundtrip HTTP que el
+                    // bot intentaba (POST del challenge -> 8 chars) SIEMPRE
+                    // fallo (len=0/result:ko) — pero NO hace falta: el nonceRt
+                    // ES el challenge descifrado. Usarlo directo: el eco del
+                    // play se activa y el server completa el do:play (mint el
+                    // token) -> respawn en el MISMO socket como el binario.
                     QString nonceRt;
-                    try {
+                    {
                         const QString chPlain = tcp::decryptChallenge(v.arr[1].s, state->suffix);
-                        const QByteArray body = chPlain.isEmpty() ? v.arr[1].s.toUtf8() : chPlain.toUtf8();
-                        emitLog(QString("roundtrip: challenge %1 (%2 chars body)").arg(chPlain.isEmpty() ? "CRUDO" : "DESCIFRADO").arg(body.size()));
-                        // v95b: el binario CIFRA todos los bodies HTTP con m2xc
-                        // (el driver muestra "Uz5:YDXX" descifrado, igual que los
-                        // JSON). El body plano daba len=0/result:ko.
-                        Bytes encBody = m2xcEncryptFull(Bytes(body.begin(), body.end()), bytesOf(magic), 0, 0);
-                        QString u = kEngine + "?_sid=" + urlEncodeTcp(sk, false) + "&rndx=" + rndxTcp();
-                        QByteArray rt = httpPostTcp(net, QUrl(u), m2xcFmt(encBody).toUtf8(), &m_stop, 8000);
-                        QString t = QString::fromUtf8(rt).trimmed();
-                        // si la respuesta viene tBB cifrada, descifrarla
-                        if (t.startsWith("tBB,")) {
-                            QString b64 = t.mid(12);
-                            QString padded = b64;
-                            int pad = (4 - (padded.size() % 4)) % 4;
-                            padded += QString(pad, QLatin1Char('='));
-                            QByteArray blobBytes = QByteArray::fromBase64(padded.toLatin1());
-                            Bytes blob(blobBytes.begin(), blobBytes.end());
-                            if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2' && blob[2] == 'X' && blob[3] == 'C') {
-                                Bytes dec = m2xcDecryptFull(blob, bytesOf(magic));
-                                t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                            } else {
-                                Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(magic, 100), false);
-                                while (!dec.empty() && dec.back() == 0)
-                                    dec.pop_back();
-                                t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                            }
-                        }
-                        if (t.size() == 8) {
-                            nonceRt = t;
-                            m_nonceRt = t; // v95: eco del play (el binario lo ecosea tras cada play)
-                            emitLog("Challenge roundtrip HTTP OK: " + t);
+                        if (chPlain.size() == 8) {
+                            nonceRt = chPlain;
+                            m_nonceRt = chPlain;
+                            emitLog("nonceRt = challenge descifrado: " + chPlain + " (v97n, sin roundtrip)");
                         } else {
-                            emitLog("Challenge roundtrip HTTP raro (len=" + QString::number(t.size()) + "): '" + t.left(20) + "'");
+                            emitLog(QString("challenge descifrado raro (len=%1): '%2'").arg(chPlain.size()).arg(chPlain.left(20)));
                         }
-                    } catch (const std::exception &e) {
-                        emitLog("Challenge roundtrip HTTP fallo: " + QString::fromUtf8(e.what()).left(60));
                     }
                     QFile pf(m_pemPath);
                     if (pf.open(QIODevice::ReadOnly)) {
@@ -2276,20 +2369,32 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                         state->spawnTokenRaw = payload;
                         emitLog("SPAWN TOKEN (op53): " + state->spawnToken.left(20)
                                 + " raw=" + QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(payload.data()), int(payload.size())).toHex().left(32)));
+                        // v97q: token recibido = el server ya acepto la identidad
+                        // (AUTH+proof OK). Liberar el g_spawnMutex: la espera del
+                        // [20] responde PINGs y no es "conexion inactiva" — puede
+                        // ir en paralelo con las otras cuentas (sin la cola de
+                        // minutos del mutex completo).
+                        spawnGuard.unlockEarly();
                     }
                     if (!readySent) {
                         // orden exacto del binario (ctf_full.log): 53 ->
                         // inventory(ingame,slot=3) HTTP -> READY [10000,[true,1920,1080,1,true]].
-                        // La espera de 1500ms NO bloquea: procesa frames y PONGs.
-                        try {
-                            httpApi(net, sk, magic, apiJson({{"do", "inventory"}, {"ingame", true}, {"slot", 3}}));
-                        } catch (...) {}
+                        // v97bg (fix del respawn: [40] sin [20] y corte a los
+                        // 12s): el inventory SINCRONO (timeout 8s) ANTES del
+                        // READY lo retrasaba — el server manda el [40] y espera
+                        // el READY para el [20]. El binario manda inventory y
+                        // READY con 1ms de diferencia (no espera la respuesta).
+                        // El READY sale INMEDIATO; el inventory va despues,
+                        // best-effort, con timeout corto.
                         readySent = true;
-                        if (waitProcess(1500))
-                            return true;
                         emit debugLog(QString("TCP >> READY [10000,[true,1920,1080,1,true]] seed=%1 chk=%2").arg(state->seed).arg(state->seed % 63));
                         sendFrame(sock, tcp::makeReadyFrame(state->seed));
-                        emitLog("READY tras inventory(ingame)");
+                        emitLog("READY tras op53 (inmediato, v97bg)");
+                        try {
+                            httpApi(net, sk, magic, apiJson({{"do", "inventory"}, {"ingame", true}, {"slot", 3}}), 1500);
+                        } catch (...) {}
+                        if (waitProcess(300))
+                            return true;
                         // 2026-08-10 (test #43): el server SOLO tolera UNA
                         // cuenta en espera de [20] por IP. Liberar el mutex en
                         // el READY dejaba 3+ esperas simultaneas -> el server
@@ -2307,8 +2412,18 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                         // Timeout del [20] (15s, abajo) para limitar la cola.
                         readyT0.start();
                     }
-                    if (op == 40 && !nativeSent)
+                    if (op == 40 && !nativeSent) {
                         emitLog("Resume key (40) recibido");
+                        // v97al: guardar la resume key para el resume de la
+                        // proxima reconexion (captura: resume::<key>).
+                        if (v.arr.size() >= 2) {
+                            if (v.arr[1].type == tcp::AmfValue::Str)
+                                m_resumeKey = v.arr[1].s;
+                            else if (v.arr[1].type == tcp::AmfValue::Int)
+                                m_resumeKey = QString::number(v.arr[1].i);
+                            emitLog("resumeKey=" + m_resumeKey.left(8));
+                        }
+                    }
                 } else if (op == 20) {
                     if (!state->spawned) {
                         state->spawned = true;
@@ -2377,7 +2492,10 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
         // el bot cortaba justo cuando el server iba a iniciar. La sala privada
         // del amigo (validada 9/9, 300s) necesita esperar mas: 90s en modo
         // sala, 15s en CTF publico.
-        const qint64 spawnTimeoutMs = m_useRoom ? 90000 : 15000;
+        // v97v/v97ac: 6s — el [20] del binario llega ~1s tras el READY, pero
+        // el matchmaking a veces tarda 5-8s (el 4s del v97ab cortaba intentos
+        // validos y bajo el farm a +4314 vs +7150 del v97aa).
+        const qint64 spawnTimeoutMs = m_useRoom ? 90000 : 6000;
         if (readySent && readyT0.isValid() && readyT0.elapsed() > spawnTimeoutMs) {
             if (err) *err = "SPAWNED [20] timeout (matchmaking lento)";
             return false;
@@ -2395,10 +2513,12 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
 void FarmWorker::sendJoinFrame(QTcpSocket *sock, FarmState &st)
 {
     QString token;
-    if (!m_lastPlayToken.isEmpty() && m_lastPlayToken.size() >= 20
-        && m_lastPlayToken.left(8) == QStringLiteral("00000008")) {
+    // v97bb (dato del log: PLAY raw = 'tBB,00000062TTJYQ...'): el token fresco
+    // del play lleva el prefijo 00000062 (no 00000008). Aceptar ambos.
+    if (!m_lastPlayToken.isEmpty() && m_lastPlayToken.size() >= 40
+        && m_lastPlayToken.left(6) == QStringLiteral("000000")) {
         token = m_lastPlayToken; // token fresco del play+eco
-        emitLog(QString("JOIN op5 con token FRESCO del play+eco (%1 chars, v92)").arg(token.size()));
+        emitLog(QString("JOIN op5 con token FRESCO del play (%1 chars, v97bb)").arg(token.size()));
     } else if (!st.spawnToken.isEmpty()) {
         token = st.spawnToken; // op53 del handshake
         emitLog(QString("JOIN op5 con token del op53 (%1 chars, v92)").arg(token.size()));
@@ -2493,14 +2613,18 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
                 && v.arr[0].type == tcp::AmfValue::Int && v.arr[0].i == 1) {
                     // PING del server: PONG (el seed lo sincroniza el SEED_SYNC)
                     state->pingCount++;
+                    // v97bc (diagnostico): ver si el PING del [40] llega y si el
+                    // PONG sale en el handshake (el [20] del binario llega 1ms
+                    // tras el PONG del [40]).
+                    emitLog(QString("PING handshake #%1 -> PONG eco ts=%2").arg(state->pingCount).arg(v.arr[1].d, 0, 'f', 1));
                     // v75 (v73 estaba INCOMPLETO): el ts del PONG es SIEMPRE el reloj
                     // LOCAL del cliente (mitosis_client.py make_real_ping_frame:
                     // time.time()*1000), NUNCA el ts del PING del server. Este era el
                     // 4to sitio que faltaba: los PINGs que llegaban durante el drain
                     // del postSpawn (equip/repair/play, ~1s) salian con el ts del
                     // server -> RTT~0 constante, detectable justo tras el SPAWNED.
-                    tcp::sleepHumanJitter(); // v94b: RTT humano (60-180ms)
-                    sendFrame(sock, tcp::makePongFrame(state->seed, double(QDateTime::currentMSecsSinceEpoch())));
+
+                    sendFrame(sock, tcp::makePongFrame(state->seed, v.arr[1].d));
                 } else if (decoded && v.type == tcp::AmfValue::Arr && !v.arr.empty()
                     && v.arr[0].type == tcp::AmfValue::Int && v.arr[0].i == 28) {
                     // FIX v6: sin reply al op 28 (vacio dania; config 17:45).
@@ -2619,7 +2743,9 @@ void FarmWorker::postSpawnSequence(QTcpSocket *sock, QNetworkAccessManager *net,
     {
         m_lastPlayEchoSent = false; // v92: eco del nonceRt tras el play
         QJsonObject playResp = httpApi(net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
-        Q_UNUSED(playResp);
+        // v97bb (diagnostico): que devuelve el play del bot vs el binario
+        // (el binario recibe un nonce de 8 chars y lo ecoea).
+        emitLog(QString("PLAY resp: %1").arg(QString::fromUtf8(QJsonDocument(playResp).toJson(QJsonDocument::Compact)).left(140)));
     }
     sendJoinFrame(sock, *state); // v77b: usa el token fresco del play si lo hay
     if (m_lastPlayToken.isEmpty())
@@ -2691,6 +2817,8 @@ void FarmWorker::checkX2(QNetworkAccessManager *net, const QString &sk, const QS
             }
         }
         if (x2Active) {
+            // v97x REVERTIDO (el re-buy en cada check era spam; el refresh de
+            // 600s ya re-compra el x2 cuando falta).
             // boost REALMENTE vigente en el inventario: verde.
             setX2State(1, QStringLiteral("x2 gemas activo (%1 en inventario)").arg(x2Name));
             return;
@@ -2961,7 +3089,7 @@ void FarmWorker::refreshXp()
     int ffaPort = server.contains(':') ? server.section(':', 1, 1).toInt() : 443;
     if (!m_skipFinalCtfSpawn) {
         m_spawnDeadlineMs = 10000; // refresh: tope corto (antes 15s) para no colgarse
-        m_greetingTimeoutMs = 4000;
+        m_greetingTimeoutMs = 3000;
         QString spawnErr;
         // 1 intento (antes 2): el refresh solo necesita el settle, no una
         // partida estable; si el spawn falla, el poll detecta igual o el
@@ -3043,8 +3171,8 @@ void FarmWorker::refreshXp()
                         if (ffaState.pingCount == 1)
                             ffaState.seed = ffaState.mt->nextVal() % 99999;
                         // v73: ts del PONG = reloj LOCAL (como el binario real)
-                        tcp::sleepHumanJitter(); // v94b: RTT humano (60-180ms)
-                        sendFrame(&ffaSock, tcp::makePongFrame(ffaState.seed, double(QDateTime::currentMSecsSinceEpoch())));
+
+                        sendFrame(&ffaSock, tcp::makePongFrame(ffaState.seed, v.arr[1].d));
                     } else if (op == 28) {
                         emitLog("op 28 (FFA) - sin reply");
                     }
@@ -3205,6 +3333,12 @@ void FarmWorker::run()
     // comparten proceso; el static anterior era una data race). Reseteado por
     // run: logea los primeros 10 frames UNDEC de cada run.
     m_undecCount = 0;
+    // v97bf (fix del "CTF connect failed {}"): el connect i del binario es
+    // 1-3 por SESION del juego (captura: i=1, i=2, i=3) — el bot lo dejaba
+    // crecer sin limite (cientos tras horas) y el server empezo a devolver
+    // connect VACIO. Resetear a 0 al arrancar el run: cada farm = sesion
+    // nueva con i pequeno, como el juego real.
+    { QMutexLocker lk(&m_sessionMutex); m_connectIndex = 0; }
     while (!m_stop) {
     if (m_stop) { emit finishedOk(false, "stopped"); return; }
     // Si el refresh corre en paralelo (thread separado), el farm espera a que
@@ -3234,7 +3368,7 @@ void FarmWorker::run()
     // (i18n/loginifneeded/connect): el connect mmm corria ANTES del reset
     // viejo (que estaba tras "CTF mode...") y dejaba tags 900+ -> el server
     // cortaba el TCP en el MISMO segundo del mmm (61/82 cortes en el test).
-    mmmTagSet(m_deviceId, 2);
+        // v97av: reset del tag ELIMINADO — el binario NO resetea (tags 40->68 continuos); el tag bajo repetido corta las sesiones a ~30s
     auto fail = [this](const QString &e) {
         emit stateChanged("ERROR: " + e);
         emit finishedOk(false, e);
@@ -3268,7 +3402,7 @@ void FarmWorker::run()
             // server HTTP y el matchmaking encola -> timeouts de spawn)
             // 2026-08-11 (farm inestable: 372 XP en 10 min): jitter ampliado +
             // sesgo por deviceId para des-sincronizar los reintentos masivos.
-            QThread::msleep(2000 + reconnectJitterMs() + (qHash(m_deviceId) % 3000));
+            QThread::msleep(1000 + reconnectJitterMs() + (qHash(m_deviceId) % 2000));
             continue;
         }
     }
@@ -3283,8 +3417,8 @@ void FarmWorker::run()
     }
 
     // HTTP API helper (mismo patron que do_login del Python)
-    auto apiCall = [&](QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload) -> QJsonObject {
-        return httpApi(net, skk, magicc, payload);
+    auto apiCall = [&](QNetworkAccessManager *net, const QString &skk, const QString &magicc, const QJsonObject &payload, int timeoutMs = 8000) -> QJsonObject {
+        return httpApi(net, skk, magicc, payload, timeoutMs);
     };
 
     // QNAM unico del farm (creado UNA vez bajo lock: ctor/dtor de QNAM
@@ -3298,29 +3432,41 @@ void FarmWorker::run()
     // ---- Pre-flow del binario: i18n -> loginifneeded -> chattoken ----
     QString uid;
     QString ctToken;
+    // v97ab (optimizacion de reconexion): si la sesion HTTP se reutiliza y ya
+    // tenemos el uid/chattoken del ciclo anterior, saltar los 3 HTTPs del
+    // pre-flow (i18n/loginifneeded/chattoken ~3s). El server los conoce.
+    if (reuseSession && !m_lastUid.isEmpty()) {
+        uid = m_lastUid;
+        ctToken = m_lastCtToken;
+        emit stateChanged("Login... (pre-flow saltado, uid reutilizado)");
+    } else {
     try {
         apiCall(&net, sk, magic, apiJson({{"do", "i18n"}, {"update", qint64(QDateTime::currentSecsSinceEpoch())}, {"locale", "es_CO"}}));
         QJsonObject li = apiCall(&net, sk, magic, apiJson({{"do", "loginifneeded"}, {"at", ""}, {"wt", ""}, {"usertoken", QJsonValue()}}));
         QJsonObject ctResp = apiCall(&net, sk, magic, apiJson({{"do", "chattoken"}}));
         ctToken = ctResp.value("data").toObject().value("token").toString();
-        emitLog("chattoken: " + ctToken.left(20) + "...");
         // el uid viene como numero (7741654): toString() da vacio, usar toInt
         uid = QString::number(li.value("data").toObject().value("uid").toInt());
+        // v97ab: guardar para saltar el pre-flow en la reconexion
+        m_lastUid = uid;
+        m_lastCtToken = ctToken;
         emitLog("uid=" + uid);
         // FIX 2026-08-11 (cuentas que no conectan: loginifneeded {} + uid=0):
         // una sesion reutilizada que el server ya rechazo devuelve {} o uid 0.
         // Si pasa, la sesion esta MUERTA: limpiarla y forzar login fresco en el
         // proximo ciclo (como el "Sesion reutilizada fallando" del connect).
         if (uid.isEmpty() || uid == QLatin1String("0")) {
-            emitLog("loginifneeded vacio/uid=0: sesion invalida, se limpiara para login fresco");
-            { QMutexLocker lk(&m_sessionMutex); m_sk.clear(); m_magic.clear(); }
+            // v97ar: NUNCA re-loggear — si el loginifneeded da uid=0 con la
+            // sesion reutilizada, reintentar con la MISMA sesion (el server
+            // puede tardar); el login fresco kickea la cuenta.
+            emitLog("loginifneeded vacio/uid=0: reintentando con la misma sesion (v97ar)");
             consecutiveSessionFailures++;
             if (consecutiveSessionFailures >= 15) {
                 fail("Sesion invalida (15 intentos seguidos): loginifneeded vacio");
                 return;
             }
             emit stateChanged(QString("Sesion invalida (loginifneeded vacio), login fresco en ~5s (%1/15)...").arg(consecutiveSessionFailures));
-            QThread::msleep(2000 + reconnectJitterMs() + (qHash(m_deviceId) % 3000));
+            QThread::msleep(1000 + reconnectJitterMs() + (qHash(m_deviceId) % 2000));
             continue;
         }
         // el nombre real de la cuenta sale del loginifneeded: data.username,
@@ -3340,6 +3486,7 @@ void FarmWorker::run()
             account = liName;
         emitLog("loginifneeded: " + QString::fromUtf8(QJsonDocument(li).toJson(QJsonDocument::Compact)));
     } catch (...) {}
+    }
     emit stateChanged("Account: " + (account.isEmpty() ? "?" : account));
 
     // ---- CTF + region random ----
@@ -3349,18 +3496,34 @@ void FarmWorker::run()
     // spawnSession). El binario resetea el tag por sesion (captura 2026-08-13:
     // tags 5->15). Sin esto, los mmm del connect/listener leian el tag
     // persistido de 900+ y el server cortaba el TCP en el mismo segundo.
-    mmmTagSet(m_deviceId, 2);
-    apiCall(&net, sk, magic, apiJson({{"do", "gamemode"}, {"index", 1}, {"mode", 3}}));
-    emit accountState("CTF", m_region);
-    apiCall(&net, sk, magic, apiJson({{"do", "servers"}, {"change", m_region}}));
-    apiCall(&net, sk, magic, apiJson({{"do", "i18n"}, {"update", qint64(QDateTime::currentSecsSinceEpoch())}, {"locale", "es_CO"}}));
+        // v97av: reset del tag ELIMINADO — el binario NO resetea (tags 40->68 continuos); el tag bajo repetido corta las sesiones a ~30s
+    // v97ab: en la reconexion la region y el modo NO cambian — saltar los
+    // 3 HTTPs (gamemode+servers+i18n ~2-3s). El connect fresco los cubre.
+    if (!(reuseSession && !m_lastUid.isEmpty())) {
+        apiCall(&net, sk, magic, apiJson({{"do", "gamemode"}, {"index", 1}, {"mode", 3}}));
+        emit accountState("CTF", m_region);
+        apiCall(&net, sk, magic, apiJson({{"do", "servers"}, {"change", m_region}}));
+        apiCall(&net, sk, magic, apiJson({{"do", "i18n"}, {"update", qint64(QDateTime::currentSecsSinceEpoch())}, {"locale", "es_CO"}}));
+    }
+    // v97d: mmm del connect REVERTIDO (v97c bajo a +3371; sin el mmm connect
+    // el v97 dio +3998). El mmm del loop con UID se mantiene.
     // v88: sin sala privada — inviteString queda vacio siempre (CTF publico).
     QString inviteString;
+    // v97ax (dato del usuario: "entré a Olise y nunca me reconectó" + captura
+    // cap_handshake_completo.log): el binario en CADA reconexion hace el connect
+    // HTTP FRESCO (i=2, i=3...) — el server le manda el [20] en ~2s. El directo
+    // al server viejo (v97as) llegaba al op53 pero el server NO mandaba el [20]
+    // (la partida murio con el corte) -> cuenta colgada en el limbo. El connect
+    // HTTP NO es un login (el loginifneeded ya esta saltado con m_lastUid) —
+    // es el matchmaking, y es OBLIGATORIO en cada reconexion.
+    QJsonObject conn;
+    QString server;
+    QString token;
+    int connectI = 0;
     // connect i=1 (lobby) - como el binario. El "i" se INCREMENTA con cada
     // reconnect (captura servers_cap.log: i=2, i=3, i=4 en los cambios de server).
-    int connectI;
     { QMutexLocker lk(&m_sessionMutex); m_connectIndex += 1; connectI = m_connectIndex; }
-    QJsonObject conn = apiCall(&net, sk, magic, QJsonObject{
+    conn = apiCall(&net, sk, magic, QJsonObject{
         {"do", "connect"}, {"invite", false}, {"defered", true},
         {"i", connectI}, {"gm", -1}, {"retrying", false}, {"locale", "es_CO"},
     });
@@ -3374,9 +3537,13 @@ void FarmWorker::run()
     // El joinroom con invite (HM COMP MEX GEARS) solo podia meter a la cuenta
     // en una sala sin XP. SIEMPRE CTF publico: connect i=1 sin invite.
     emit stateChanged("Public CTF mode (matchmaking)");
-    QString server = conn.value("data").toObject().value("server").toString();
-    QString token = conn.value("data").toObject().value("token").toString();
-    m_authToken = token;
+    server = conn.value("data").toObject().value("server").toString();
+    token = conn.value("data").toObject().value("token").toString();
+    // v97at: NO pisar el token guardado con uno vacio (el connect fallido
+    // dejaba m_authToken vacio y el directo de la reconexion dejaba de
+    // correr — bucle de "CTF connect failed").
+    if (!token.isEmpty())
+        m_authToken = token;
     m_inviteString = inviteString;
     if (server.isEmpty() || token.isEmpty()) {
         // Connect HTTP fallido (httpApi devolvio {}: red caida, server
@@ -3385,33 +3552,41 @@ void FarmWorker::run()
         // Ahora se trata como fallo de sesion con backoff, igual que el spawn
         // fallido: solo fail() tras 15 sesiones seguidas.
         consecutiveSessionFailures++;
+        // v97be (diagnostico): ver QUE devuelve el connect cuando falla.
+        emitLog(QString("CONNECT resp cruda: %1").arg(QString::fromUtf8(QJsonDocument(conn).toJson(QJsonDocument::Compact)).left(220)));
+        // v97au (fix del v97ar: el connect fallido = la sesion HTTP se
+        // INVALIDO y la cuenta NO esta en partida — el login fresco aqui es
+        // SEGURO y necesario para renovar la sesion. El re-login prohibido
+        // era el de la RECONEXION EN PARTIDA, que sigue eliminado).
         if (reuseSession && consecutiveSessionFailures >= 3) {
             { QMutexLocker lk(&m_sessionMutex); m_sk.clear(); m_magic.clear(); }
-            emit stateChanged("Sesion reutilizada fallando - proximo intento con login fresco");
+            emit stateChanged("Sesion HTTP invalidada - login fresco (sin partida, seguro)");
         }
         if (consecutiveSessionFailures >= 15) {
             fail("CTF connect failed (15 sesiones seguidas): " + QString::fromUtf8(QJsonDocument(conn).toJson()).left(200));
             return;
         }
-        emit stateChanged(QString("CTF connect failed, retrying session in ~5s (%1/15)...")
-                              .arg(consecutiveSessionFailures));
-        QThread::msleep(2000 + reconnectJitterMs() + (qHash(m_deviceId) % 3000));
+        // v97be (pedido del usuario "procede"): backoff EXPONENCIAL del
+        // connect en vez del 5s fijo — la tormenta de connects (15 retries
+        // x 5s x N cuentas) saturaba el matchmaking HTTP de la IP.
+        const int backoffMs = 3000 * (1 << qMin(consecutiveSessionFailures - 1, 4));
+        emit stateChanged(QString("CTF connect failed, retrying in ~%1s (%2/15)...")
+                              .arg(backoffMs / 1000).arg(consecutiveSessionFailures));
+        QThread::msleep(backoffMs + reconnectJitterMs() + (qHash(m_deviceId) % 2000));
         continue;
     }
     emit stateChanged("CTF server: " + server);
 
 // post-connect HTTP del binario (tras el connect i=1/i=2): inventory ingame
 // slot=3 -> news -> play -> gamemode. Sin esto el server no inicia el match.
-// v89 (CAPTURA DEL BINARIO 2026-08-14): el play PRE-SPAWN devuelve el NONCE
-// de 8 chars (el server lo minta aqui, antes del TCP). El JOIN (op5) debe
-// usar ESE nonce cifrado con eb(suffix), NO el spawnToken. El play POST-[20]
-// ya no devuelve nonce (JSON normal) porque el token ya se mintio. El nonce
-// queda en m_lastPlayToken para sendJoinFrame.
+// v97u: flujo UNICO (sin fast reconnect — ver arriba).
 try {
-    apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"ingame", true}, {"slot", 3}}));
-    apiCall(&net, sk, magic, apiJson({{"do", "news"}}));
-    m_lastPlayEchoSent = false; // v92: eco del nonceRt tras el play
-    httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}})); // captura nonce -> m_lastPlayToken
+    // v97bd (captura cap_handshake_completo.log): el binario NO hace play
+    // pre-TCP — su play es SOLO post-[20] (58659ms, tras el SPAWNED 58083).
+    // El play pre-TCP del bot (v97u) rompia el flujo del challenge: el server
+    // respondia tBB con el token "00000062" en vez del challenge de 8 chars
+    // que el binario ecoea para acunar el token "00000008" del JOIN.
+
     apiCall(&net, sk, magic, apiJson({{"do", "gamemode"}, {"index", 1}, {"mode", 3}}));
 } catch (...) {}
 
@@ -3450,7 +3625,10 @@ try {
     // se equipa y se reverifica (hasta 3 intentos). Si no se consigue, error claro
     // y NO se spawnea. El handler del op 20 mantiene su verificacion post-spawn
     // sin doble equip (solo actua si no esta equipada).
-    if (m_gemItem > 0) {
+    // v97ab: en la reconexion la gema sigue equipada (m_gemEquipped del ciclo
+    // anterior) — saltar el check completo (1 HTTP ~1s). Solo se re-verifica
+    // en el primer ciclo o si la gema cambio.
+    if (m_gemItem > 0 && !m_gemEquipped) {
         bool equipped = false;
         QJsonObject lastInvCheck;
         for (int attempt = 0; attempt < 3 && !equipped; ++attempt) {
@@ -3508,19 +3686,15 @@ try {
                 return;
             }
             consecutiveSessionFailures++;
-            // Sesion reutilizada fallando: forzar login fresco (el server pudo
-            // invalidarla; el reinicio del ciclo la renueva).
-            if (reuseSession && consecutiveSessionFailures >= 3) {
-                { QMutexLocker lk(&m_sessionMutex); m_sk.clear(); m_magic.clear(); }
-                emit stateChanged("Sesion reutilizada fallando - proximo intento con login fresco");
-            }
+            // v97ar: NUNCA re-loggear (la sesion HTTP persiste; el login fresco
+            // kickea la cuenta de su partida).
             if (consecutiveSessionFailures >= 15) {
                 fail(QString("Gem %1 could not be equipped in slot 5 (15 sesiones seguidas). Giving up.").arg(m_gemItem));
                 return;
             }
             emit stateChanged(QString("Equip failed (gem %1 exists but not applied), retrying session in ~5s (%2/15)...")
                                   .arg(m_gemItem).arg(consecutiveSessionFailures));
-            QThread::msleep(2000 + reconnectJitterMs() + (qHash(m_deviceId) % 3000));
+            QThread::msleep(1000 + reconnectJitterMs() + (qHash(m_deviceId) % 2000));
             continue;
         }
         emit stateChanged(QString("Gem %1 equipped in slot 5 (pre-connect)").arg(m_gemItem));
@@ -3530,13 +3704,14 @@ try {
     // === TCP connect CON RETRY ===
     // Hasta 3 intentos por servidor. Si los 3 fallan, se cambia de region
     // (nuevo HTTP connect) y se reintenta 3 mas. Maximo 6 intentos totales.
-    // El farm espera el [20] SPAWNED: el matchmaking puede tardar cuando varias
-    // cuentas reconectan a la vez, pero un handshake que no recibe el [20] en
-    // 30s no va a recibirlo en 120s — el server lo asignó a otra partida o la
-    // sesión se invalidó. Deadline 30s = reconexión rápida (el ciclo completo
-    // de reintento tarda ~35s en vez de ~2min, y con 15 intentos la cuenta
-    // vuelve en <10 min en vez de quedarse "muerta" media hora).
-    m_spawnDeadlineMs = 30000;
+    // v97g (ajuste del v97d): 120s era demasiado con servers muertos — un
+    // server que acepta el TCP pero no responde el greeting quemaba 2 min
+    // por intento (Line/Expend: ciclos de 60s+ con "Operación socket
+    // expirada"). 60s cubre el matchmaking normal (~45s: connect 30s +
+    // [20] 15s) y corta el doble de rápido los servers semi-muertos.
+    // v97v: 40s — el [20] post-READY ya corta a los 8s; el deadline solo
+    // cubre el handshake pre-READY (greeting/op52/op53, ~10s normal).
+        m_spawnDeadlineMs = 30000;
     // SIN UDP: el binario envia un datagrama INIT al puerto 3724 en el
     // handshake, pero su payload exacto no se puede replicar con seguridad
     // (el hook muestra len=0) y el datagrama del C++ generaba op 11 DAMAGE
@@ -3615,7 +3790,7 @@ try {
                 host = invHost;
             }
         }
-        for (int attempt = 0; attempt < 3 && !spawned && !m_stop && !aborted(); ++attempt) {
+        for (int attempt = 0; attempt < 2 && !spawned && !m_stop && !aborted(); ++attempt) {
             if (attempt > 0) {
                 emit stateChanged(QString("Retry TCP (attempt %1/3)...").arg(attempt + 1));
                 // Stagger FIJO por cuenta: tras el fin de partida CTF global
@@ -3624,10 +3799,15 @@ try {
                 // se solapaba entre cuentas; un offset derivado del nombre
                 // garantiza franjas separadas por cuenta (determinista).
                 const quint32 h = qHash(m_deviceId) % 9; // 0..8 -> franja amplia
-                // 2026-08-10 (test #39): 1-4.4s seguia dejando 4/10 cuentas
-                // sin farming — el server saturado corta AUTHs cuando varias
-                // cuentas reintentan en la misma ventana. Franja 2-10.6s.
-                QThread::msleep(2000 + int(h) * 1000 + QRandomGenerator::global()->bounded(600));
+                // v97k (reconexion lenta: Cross 1:49): el stagger de 2-10.6s
+                // + la cola del g_spawnMutex hacian esperar ~70s por retry.
+                // El g_spawnMutex YA serializa los handshakes (1 a la vez,
+                // anti-bot); el stagger extra es redundante. Reducido a
+                // 0.5-2.9s: las cuentas reintentan casi de inmediato y el
+                // mutex las ordena.
+                // v97am: cooldown del v97ag ELIMINADO (el usuario pidio dejar
+                // los cooldowns como estaban antes).
+                QThread::msleep(500 + int(h) * 300 + QRandomGenerator::global()->bounded(300));
                 // 2026-08-10 (log del usuario 17:01-17:03): el retry reusaba
                 // el MISMO host — con 5 cuentas cayendo en el mismo server
                 // (s18313 repetido en Andy/Anisa/Deity/DeRene/Gear) los 3
@@ -3642,10 +3822,15 @@ try {
                     QString serverR = connR.value("data").toObject().value("server").toString();
                     QString tokenR = connR.value("data").toObject().value("token").toString();
                     if (!serverR.isEmpty() && !tokenR.isEmpty()) {
-                        // Si el matchmaking devuelve el MISMO server saturado
-                        // (Gear recibio s18388 3 veces seguidas, test #38),
-                        // cambiar de region ANTES del siguiente intento.
-                        if (serverR == server) {
+                        // v97k (bug: Cross tardo 1:49 en reconectar): el
+                        // matchmaking devuelve el MISMO host con puerto 993
+                        // ("s18271:993") y la comparacion contra "s18271:443"
+                        // fallaba por el puerto -> el bot no detectaba que era
+                        // el mismo server muerto y quemaba los 3 intentos.
+                        // Comparar SOLO el host (sin puerto).
+                        const QString hostR = serverR.section(':', 0, 0);
+                        const QString hostCur = server.section(':', 0, 0);
+                        if (hostR == hostCur) {
                             QString oldR;
                             { QMutexLocker lk(&m_sessionMutex); oldR = m_region; }
                             pickRandomRegion();
@@ -3706,6 +3891,7 @@ try {
             if (spawnSession(sock.get(), &net, sk, magic, host, port, token, inviteString, uid, ctToken,
                              3, &err, &state, ircSock.get(), &ircBuf, true)) {
                 spawned = true;
+                m_directReconnectTried = false; // v97ax: sin directo — siempre connect HTTP fresco
                 int totalAttempts = attempt + 1 + regionAttempt * 3;
                 if (totalAttempts > 1)
                     emit stateChanged(QString("SPAWNED after %1 attempt(s)").arg(totalAttempts));
@@ -3725,11 +3911,8 @@ try {
         // completa (login + connect + spawn) con backoff. Solo abandona tras
         // 15 sesiones seguidas sin lograr spawnear (server caido de verdad).
         consecutiveSessionFailures++;
-        // Sesion reutilizada fallando: forzar login fresco (ver el retry del equip)
-        if (reuseSession && consecutiveSessionFailures >= 3) {
-            { QMutexLocker lk(&m_sessionMutex); m_sk.clear(); m_magic.clear(); }
-            emit stateChanged("Sesion reutilizada fallando - proximo intento con login fresco");
-        }
+        // v97ar: NUNCA re-loggear (la sesion HTTP persiste; el login fresco
+        // kickea la cuenta de su partida).
         if (consecutiveSessionFailures >= 15) {
             fail(spawnErr.isEmpty() ? QString("TCP connect failed: %1 (no response after retries)").arg(server) : spawnErr);
             return;
@@ -3774,11 +3957,15 @@ try {
     // branch spawned==false del loop solo corre en el re-AUTH. El armado del spawn
     // inicial va AQUI: el play+JOIN del postSpawnSequence acaba de salir.
     qint64 nextUpdateExp = t0.elapsed() + 1000;
-    qint64 nextMmm = t0.elapsed() + 7000;        // el binario: mmm tag=2 a los ~7s del [20]
+    qint64 nextMmm = t0.elapsed() + 7000;        // el binario: mmm tag=2 a los ~7s
+    // v97ap (CAPTURA cap_afk_5min.log): el binario hace "news" periodico cada
+    // ~90s en partida (107525/199033ms). Unica pieza del patron AFK que el bot
+    // no replicaba.
+    qint64 nextNews = t0.elapsed() + 90000;
     // v94 (pedido del usuario): play + JOIN cada ~2s mientras la cuenta esta
     // spawnada. Si el server la mato silenciosamente, el play la respawnea; si
     // esta viva, mantiene la sesion. El binario hace play+JOIN tras cada muerte.
-    qint64 nextPlaySpam = t0.elapsed() + 2000;
+    qint64 nextPlaySpam = t0.elapsed() + 1000; // v97o: play spam cada 1s
     // lectura HTTP de la XP de la gema con la MISMA cadencia de 60s del
     // updateexp (el server mueve cexp ~6 XP/s: ~+360 por lectura)
     // v83 (test 23:32: el autorefresh NO corria): t0.elapsed() se REINICIA en
@@ -3806,7 +3993,7 @@ try {
     // persistente del bot llegaba a 813 -> el server recibe mmm con tag=813
     // cuando espera ~10 -> LO RECHAZA y corta el TCP en el MISMO segundo
     // (61/82 cortes en el test). Resetear a 2 en cada sesion, como el binario.
-    mmmTagSet(m_deviceId, 2);
+        // v97av: reset del tag ELIMINADO — el binario NO resetea (tags 40->68 continuos); el tag bajo repetido corta las sesiones a ~30s
     int mmmTag = mmmTagGet(m_deviceId);
     qint64 lastDeathTime = 0;
     qint64 lastPingAt = QDateTime::currentMSecsSinceEpoch(); // watchdog de respawn
@@ -4037,8 +4224,8 @@ try {
                         // v73: ts del PONG = reloj LOCAL (el binario usa
                         // time.time()*1000, no el ts del PING del server —
                         // mitosis_client.py make_real_ping_frame).
-                        tcp::sleepHumanJitter(); // v94b: RTT humano (60-180ms)
-                        sendFrame(sock.get(), tcp::makePongFrame(state.seed, double(QDateTime::currentMSecsSinceEpoch())));
+
+                        sendFrame(sock.get(), tcp::makePongFrame(state.seed, v.arr[1].d));
                     } else if (op == 2 && state.mt) {
                         // v74 (referencia mitosis_client.py del amigo, el cliente
                         // m2xc binario-exacto): el binario NO responde al op2 (LAG).
@@ -4069,44 +4256,18 @@ try {
                         if (state.seed == 0 && state.mt)
                             state.seed = state.mt->nextVal() % 99999;
                         emitLog("Desafio seguro recibido, enviando PROOF TPM...");
-                        // challenge_roundtrip HTTP: v95 — body DESCIFRADO
-                        // (decryptChallenge eb(suffix)), como el binario.
+                        // v97n: nonceRt = challenge descifrado con eb(suffix)
+                        // (8 chars), SIN roundtrip HTTP (ver handler del spawn).
                         QString nonceRt;
-                        try {
+                        {
                             const QString chPlain = tcp::decryptChallenge(v.arr[1].s, state.suffix);
-                            const QByteArray body = chPlain.isEmpty() ? v.arr[1].s.toUtf8() : chPlain.toUtf8();
-                            emitLog(QString("roundtrip: challenge %1 (%2 chars body)").arg(chPlain.isEmpty() ? "CRUDO" : "DESCIFRADO").arg(body.size()));
-                            // v95b: body CIFRADO con m2xc (como todos los HTTP)
-                            Bytes encBody = m2xcEncryptFull(Bytes(body.begin(), body.end()), bytesOf(magic), 0, 0);
-                            QString u = kEngine + "?_sid=" + urlEncodeTcp(sk, false) + "&rndx=" + rndxTcp();
-                            QByteArray rt = httpPostTcp(&net, QUrl(u), m2xcFmt(encBody).toUtf8(), &m_stop, 8000);
-                            QString t = QString::fromUtf8(rt).trimmed();
-                            if (t.startsWith("tBB,")) {
-                                QString b64 = t.mid(12);
-                                QString padded = b64;
-                                int pad = (4 - (padded.size() % 4)) % 4;
-                                padded += QString(pad, QLatin1Char('='));
-                                QByteArray blobBytes = QByteArray::fromBase64(padded.toLatin1());
-                                Bytes blob(blobBytes.begin(), blobBytes.end());
-                                if (blob.size() >= 4 && blob[0] == 'M' && blob[1] == '2' && blob[2] == 'X' && blob[3] == 'C') {
-                                    Bytes dec = m2xcDecryptFull(blob, bytesOf(magic));
-                                    t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                                } else {
-                                    Bytes dec = aesCbcCrypt(blob, deriveCustomAesKey(magic, 100), false);
-                                    while (!dec.empty() && dec.back() == 0)
-                                        dec.pop_back();
-                                    t = QString::fromUtf8(reinterpret_cast<const char *>(dec.data()), int(dec.size())).trimmed();
-                                }
-                            }
-                            if (t.size() == 8) {
-                                nonceRt = t;
-                                m_nonceRt = t; // v95: eco del play
-                                emitLog("Challenge roundtrip HTTP OK: " + t);
+                            if (chPlain.size() == 8) {
+                                nonceRt = chPlain;
+                                m_nonceRt = chPlain;
+                                emitLog("nonceRt = challenge descifrado: " + chPlain + " (v97n)");
                             } else {
-                                emitLog("Challenge roundtrip HTTP raro (len=" + QString::number(t.size()) + "): '" + t.left(20) + "'");
+                                emitLog(QString("challenge descifrado raro (len=%1): '%2'").arg(chPlain.size()).arg(chPlain.left(20)));
                             }
-                        } catch (const std::exception &e) {
-                            emitLog("Challenge roundtrip HTTP fallo: " + QString::fromUtf8(e.what()).left(60));
                         }
                         QFile pf(m_pemPath);
                         if (pf.open(QIODevice::ReadOnly)) {
@@ -4123,11 +4284,15 @@ try {
                             }
                         }
                     } else if (op == 28) {
-                        // FIX v6: NO responder al op 28 con el equip frame VACIO
-                        // (config 17:45, la mejor, no tenia este handler). El
-                        // server espera el equip con datos reales (4716-5100B);
-                        // el [10037,[]] vacio del bot daña. Solo log.
-                        emitLog("op 28 (equipment request) - sin reply (vacio dania)");
+                        // v97aj (pedido del usuario: replicar la partida del
+                        // jugador normal): el server pide el equip (op28) y el
+                        // binario responde [10037, [...]] — el bot NO respondia
+                        // y la sesion quedaba marcada como sospechosa. El
+                        // cliente Python del amigo responde [10037, []] y
+                        // funciona; responder igual (el "vacio daña" del v6 era
+                        // un mito — era la config 17:45 que no tenia handler).
+                        emitLog("op 28 (equipment request) - respondiendo [10037,[]] (v97aj)");
+                        sendFrame(sock.get(), tcp::makeEquipmentDataFrame(state.seed));
                     } else if (op == 51) {
                         // El 51 pre-spawn [51,0] es CONFIRM_UDP del server: el binario
                         // NO responde nada (ctf_full.log 6371ms: [51,0] sin OUT hasta el
@@ -4160,15 +4325,14 @@ try {
                             // Orden exacto del binario (captura ctf_full.log):
                             // 53 (6421ms) -> inventory(ingame,slot=3) HTTP (8038ms)
                             // -> READY [10000,[true,1920,1080,1,true]] (8039ms) -> 40 -> 20.
-                            // El binario NO envia CLEAR/10002/10037 en este punto.
-                            try {
-                                apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"ingame", true}, {"slot", 3}}));
-                            } catch (...) {}
-                            QThread::msleep(1500);
+                            // v97bg (fix del respawn [40] sin [20]): el msleep(1500)
+                            // BLOQUEANTE retrasaba el READY y congelaba los PONGs —
+                            // el server manda el [40] y espera el READY para el [20].
+                            // READY INMEDIATO, sin sleep, sin HTTP previo.
                             emit debugLog(QString("TCP >> READY [10000,[true,1920,1080,1,true]] seed=%1 chk=%2").arg(state.seed).arg(state.seed % 63));
                             sendFrame(sock.get(), tcp::makeReadyFrame(state.seed));
                             readySent = true;
-                            emitLog("READY tras inventory(ingame)");
+                            emitLog("READY tras op53 (inmediato, v97bg)");
                         }
                         if (op == 40 && !nativeSent) {
                             // El binario NO responde nada al 40 (resume_key). La
@@ -4176,6 +4340,15 @@ try {
                             // SPAWNED (ctf_full.log: 40=8267 20=8268 play=11922).
                             // Se ejecuta en el handler del op 20.
                             emitLog("Resume key (40) recibido");
+                            // v97al: guardar la resume key para el resume de la
+                            // proxima reconexion.
+                            if (v.arr.size() >= 2) {
+                                if (v.arr[1].type == tcp::AmfValue::Str)
+                                    m_resumeKey = v.arr[1].s;
+                                else if (v.arr[1].type == tcp::AmfValue::Int)
+                                    m_resumeKey = QString::number(v.arr[1].i);
+                                emitLog("resumeKey=" + m_resumeKey.left(8));
+                            }
                         }
                     } else if (op == 20) {
                         lastMatchActivityAt = now; // v34: SPAWNED = partida activa
@@ -4188,7 +4361,7 @@ try {
                             matchEnded = false;
                             emitLog("Match ended (33) - full re-AUTH");
                             try {
-                                apiCall(&net, sk, magic, apiJson({{"do", "news"}}));
+
                                 int ci6;
                                 { QMutexLocker lk(&m_sessionMutex); m_connectIndex += 1; ci6 = m_connectIndex; }
                                 httpApi(&net, sk, magic, apiJson({{"do", "connect"}, {"invite", false}, {"defered", true},
@@ -4336,39 +4509,31 @@ try {
         // kickee 10053"). El MOVE UDP periodico se elimino (ver arriba): la XP
         // del op 24 llega igual estando quieto (match_end.log: +2070 XP sin
         // moves) y el server no exige movimiento para acreditar.
-        // updateexp: SOLO tras play/respawn (~1s, como el binario frida_v3:
-        // 65414 tras play 64457, 79960 tras play 78648). El binario NO repite
-        // updateexp cada 60s: 0 apariciones en 466s de captura. El periodico
-        // de 60s era otro trafico que el server no esperaba del cliente real.
-        // v75: updateexp one-shot ~1s tras cada play/respawn (el binario lo hace:
-        // frida_v3 65414/79960; los handlers arman nextUpdateExp = now + 1000).
-        // El bot lo seteaba pero el consumidor estaba comentado -> nunca se enviaba.
-        if (nextUpdateExp > 0 && now >= nextUpdateExp) {
+        // updateexp: tras play/respawn (~1s) Y PERIODICO cada ~30s.
+        // v97ao (CAPTURA cap_afk_5min.log 2026-08-15): el binario AFK hace
+        // updateexp cada ~30-50s (87108/135817/169927ms) — MATERIALIZA el XP
+        // de la gema en el server. El bot solo lo hacia post-play: el cexp
+        // quedaba "congelado" en partida (las mediciones daban 0) y el server
+        // no veia progreso. Periodico de 30s como el binario.
+        if (now >= nextUpdateExp) {
             try {
-                QJsonObject ue = apiCall(&net, sk, magic, apiJson({{"do", "updateexp"}}));
-                emitLog("updateexp (post-play): " + QString::fromUtf8(QJsonDocument(ue.value("data").toObject()).toJson(QJsonDocument::Compact)).left(120));
+                QJsonObject ue = apiCall(&net, sk, magic, apiJson({{"do", "updateexp"}}), 2000);
+                emitLog("updateexp: " + QString::fromUtf8(QJsonDocument(ue.value("data").toObject()).toJson(QJsonDocument::Compact)).left(120));
             } catch (...) {}
-            nextUpdateExp = 0; // se rearma solo con el proximo play/respawn
+            nextUpdateExp = now + 30000; // v97ao: periodico 30s (antes one-shot)
         }
-        // lectura HTTP exclusiva de la XP de la gema (inventory slot=5) cada
-        // 60s: el op 24 TCP es XP del jugador/partida y NO se usa para las
-        // gemas. El controller acumula con gemXpRead (delta entre lecturas).
-        // FIX 2026-08-11 v27: RESTAURADA la lectura de XP (inventory slot=5
-        // cada 60s). La XP de la gema se acumula en el server y el bot debe
-        // leerla para reportarla; sin esto el farm "funciona" pero nunca se
-        // ve la XP ganada (el op24 EXPERIENCE_GAIN llega al settle, no en
-        // vivo). 1 HTTP/60s no afecta la sesion.
-        // v83: reloj de PARED (currentMSecsSinceEpoch) como el refresh 600s —
-        // t0.elapsed() se reinicia en cada reconexion y el timer de 60s nunca
-        // alcanzaba (el autorefresh corria 1 sola vez por test).
+        // lectura HTTP de la XP de la gema (inventory slot=5) cada 60s.
+        // v97ad (pedido del usuario: "el contador esta bugueado"): el cexp del
+        // inventory se CONGELA mientras la cuenta esta en partida — esta
+        // lectura de 60s contaminaba el delta del controller. La XP solo se
+        // capta en el login inicial (pre-spawn, baseline) y en el login del
+        // refresh (materializado, fuera de partida). Aqui SOLO se loguea.
         if (QDateTime::currentMSecsSinceEpoch() >= nextGemXpRead) {
             try {
-                QJsonObject invResp = apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"slot", 5}}));
+                QJsonObject invResp = apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"slot", 5}}), 2000);
                 qlonglong cexpOut = -1, expOut = -1;
                 if (readGemXp(invResp, &cexpOut, &expOut) && cexpOut >= 0) {
-                    emit debugLog(QString("Gem XP (HTTP): cexp=%1 exp=%2").arg(cexpOut).arg(expOut));
-                    emit gemXpRead(cexpOut, expOut);
-                    emitLog(QString("GEM XP cexp=%1 exp=%2").arg(cexpOut).arg(expOut));
+                    emitLog(QString("GEM XP (log) cexp=%1 exp=%2").arg(cexpOut).arg(expOut));
                 }
             } catch (...) {}
             nextGemXpRead = QDateTime::currentMSecsSinceEpoch() + 60000;
@@ -4397,11 +4562,7 @@ try {
         // en el build de las 23:47, el mejor resultado de XP de toda la noche).
         // Los intentos v84 (add fijo -192895987 y mmm OFF) DEGRADARON el farm
         // (+980 a +1966 vs +7824). Los datos empiricos mandan: UID activo.
-        // v92 (CAPTURA 2026-08-14, cap_partida_v88.log): el binario real manda
-        // add FIJO [-192895987,null/\"\",100,0] SIEMPRE (tags 33-49, cada
-        // ~10.5s). El UID kickea el TCP ~7s post-[20] (v84 lo detecto). El
-        // v84 fue CONTAMINADO por el JOIN roto; con el JOIN corregido se
-        // reproba el FIJO del binario como fuente de verdad.
+        // v97c: UID RESTAURADO (el v65/v85 usaban UID en todos los mmms).
         if (now >= nextMmm && !uid.isEmpty()) {
             try {
                 // v80b: leer el tag SIEMPRE del mapa (mmmTagGet) — la variable
@@ -4409,13 +4570,16 @@ try {
                 // reconexion no la actualizaba -> el tag seguia creciendo a 900+.
                 int mmmTag = mmmTagGet(m_deviceId);
                 const bool usarVacio = (mmmTag % 4 == 0 || mmmTag % 4 == 1);
+                // v97an (CAPTURA cap_handshake_completo.log 2026-08-15): el
+                // binario manda add FIJO [-192895987,null/"",100,0] SIEMPRE.
+                // Revertido el UID del v97d — el FIJO es la fuente de verdad.
                 QJsonObject mmmBody = apiJson({ {"do", "mmm"}, {"begin", false}, {"serching", false},
                                                 {"add", usarVacio
                                                     ? QString("[-192895987,\"\",100,0]")
                                                     : QString("[-192895987,null,100,0]")},
                                                 {"tag", mmmTag},
                                                 {"abandon", false}, {"mode", -1}, {"stop", false} });
-                apiCall(&net, sk, magic, mmmBody);
+                apiCall(&net, sk, magic, mmmBody, 2000);
                 emitLog(QString("mmm tag=%1 add=%2").arg(mmmTag).arg(usarVacio ? "\"\"" : "null"));
                 ++mmmTag;
                 mmmTagSet(m_deviceId, mmmTag);
@@ -4423,20 +4587,20 @@ try {
             nextMmm = now + 10500;
         }
 
-        // v94 (pedido del usuario): PLAY SPAM cada ~2s mientras spawnado —
-        // play HTTP + JOIN op5. Si la cuenta murio silenciosamente el play la
-        // respawnea; si esta viva, mantiene la sesion activa. Es la pieza que
-        // faltaba: sin esto las cuentas muertas quedaban esperando un [20]
-        // que nunca llegaba.
-        if (state.spawned && now >= nextPlaySpam) {
+        // v97ap: news periodico cada ~90s (el binario AFK lo hace).
+        if (now >= nextNews) {
             try {
-                m_lastPlayEchoSent = false;
-                httpApi(&net, sk, magic, apiJson({{"do", "play"}, {"usertoken", QJsonValue()}}));
-                sendJoinFrame(sock.get(), state);
-                nextUpdateExp = now + 1000;
+                apiCall(&net, sk, magic, apiJson({{"do", "news"}}), 2000);
             } catch (...) {}
-            nextPlaySpam = now + 2000;
+            nextNews = now + 90000;
         }
+
+        // v97t (ELIMINADO el play spam del v97o — creaba un loop de respawns
+        // de 22/s: cada play+JOIN -> el server respondia [20] -> el handler
+        // del [20] hacia otro play+JOIN -> infinito). La conexion se mantiene
+        // SOLO con PONGs (como el binario) y el respawn se hace en el handler
+        // del [20] (play+JOIN UNA vez, en la MISMA conexion, con el eco del
+        // nonceRt del v97n).
 
         // MOVE keepalive SOLO UDP (validado en el test #10: drain de PONGs +
         // UDP MOVE dio 20-30s de vida vs 3-7s antes). El TCP MOVE [10022]
@@ -4475,6 +4639,26 @@ try {
                 m_udpIp = resolveHostMutexed(host);
             }
             if (now >= nextMove && !m_udpIp.isEmpty()) {
+                // v97ai (REVERSION del v97ah: el random walk de coords dio 0 XP
+                // en 10.5min — los saltos de teleport no-humanos cortan la
+                // acreditacion). El AFK packet con coords FIJAS (el formato
+                // validado del Python del amigo) es lo que funciona.
+                // v97az (dato del usuario: la cuenta DESAPARECE de la partida
+                // a los ~20-30s SIN morir = kick AFK del server a jugadores
+                // quietos): caminar lento y humano — pasos de 0.3-0.5 u/s con
+                // deriva suave del angulo, oscilando en un radio de ~3.5u
+                // alrededor del punto base. Sin saltos bruscos.
+                static double walkX = 34.0, walkY = -3.084;
+                static double walkAngle = QRandomGenerator::global()->bounded(628) / 100.0;
+                walkAngle += (QRandomGenerator::global()->bounded(80) - 40) / 100.0;
+                const double step = 0.3 + QRandomGenerator::global()->bounded(30) / 100.0;
+                walkX += std::cos(walkAngle) * step;
+                walkY += std::sin(walkAngle) * step;
+                const double dx = walkX - 34.0, dy = walkY - (-3.084);
+                if (std::sqrt(dx * dx + dy * dy) > 3.5)
+                    walkAngle += 3.14159;
+                m_udpX = walkX;
+                m_udpY = walkY;
                 QByteArray pkt = m_udpPrefix;
                 auto pushU32 = [&](quint32 v) {
                     pkt.append(char((v >> 24) & 0xFF)); pkt.append(char((v >> 16) & 0xFF));
@@ -4536,15 +4720,15 @@ try {
         // VIVA, y el play+JOIN forzado era lo que el server detectaba y cortaba
         // (v68 ya lo advertia). 4000ms = 2 intervalos perdidos (muerte casi segura)
         // y aun dentro de la ventana de 6-10s que el server da para el respawn.
-        // v93 (ELIMINADO 2026-08-14, pedido del usuario): el watchdog de "4s sin
-        // PINGs" con play+JOIN FORZADO era trafico espameado en cuentas VIVAS
-        // (log 14:02: 8 disparos en 20s en partidas sanas) — el server detectaba
-        // el play anomalo y cortaba la sesion (v68 ya lo advertia). La muerte
-        // REAL se detecta por el op 20 del server (respawn natural, linea 4152:
-        // play HTTP + NATIVE_PLAY + updateexp, UNA vez por muerte) y el corte
-        // TCP por la reconexion del loop (backoff rapido). NINGUN play fuera
-        // de muerte real o fin de partida (igual que el binario).
-        // (el bloque viejo de play+JOIN forzado se elimino aqui — v93)
+        // v97t (pedido del usuario: "busca otra manera de mantener la conexion
+        // y respawnear inmediatamente"): el play+JOIN forzado AQUI (sin [20])
+        // era lo que cortaba el TCP — el binario SOLO hace play tras el [20]
+        // del respawn (captura: [25][24][21][20] -> play+JOIN 2.4s, MISMA
+        // conexion). El respawn queda SOLO en el handler del [20]. Si el
+        // server corta el TCP sin [20], la reconexion (fast -> normal) lo
+        // levanta; si la partida murio sin [20], el watchdog de actividad
+        // (12s) reconecta.
+        // (bloque del play+JOIN forzado eliminado aqui — v97t)
         // FIX 2026-08-11 v34+v36 (fin de partida SIN corte TCP - dato del test
         // manual del usuario): cuando la partida CTF termina o el jugador
         // muere, el server NO corta el TCP y NO envia op33 (TEAM_GAME_ENDED)
@@ -4562,13 +4746,12 @@ try {
         // de XP. Subir el umbral a 30s: solo se asume fin de partida cuando
         // es casi seguro (30s sin XP ni PINGs es partida muerta), y 1 solo
         // intento antes de reconectar.
-        if (state.spawned && m_autoRespawn && now - lastMatchActivityAt >= 30000) {
-            // v93 (pedido del usuario): NUNCA play+JOIN fuera de muerte real o
-            // fin de partida — el play en partida viva es lo que el server
-            // detecta y corta. 30s sin op24/op35/op20 = partida muerta o el
-            // jugador murio sin op20 -> RECONECTAR directo (nueva sesion
-            // completa, como el binario al terminar la partida).
-            emitLog("WATCHDOG: 30s sin actividad - reconectando (v93, sin play forzado)");
+        if (state.spawned && m_autoRespawn && now - lastMatchActivityAt >= 12000) {
+            // v96 (pedido del usuario): 30s era demasiado lento — una cuenta
+            // muerta pasaba 30s+ sin XP y el farm quedaba rezagado (3000xp vs
+            // 500xp). 12s sin op24/op35/op10/op20 = partida muerta o muerte
+            // silenciosa -> RECONECTAR directo (nueva sesion completa).
+            emitLog("WATCHDOG: 12s sin actividad - reconectando (v96)");
             m_sameSocketPlayAttempts = 0;
             lastMatchActivityAt = now;
             lastPingAt = 0; // fuerza el bloque de reconexion TCP
@@ -4649,13 +4832,20 @@ try {
             }
             if (!m_stop)
                 emit stateChanged("TCP connection lost - reconnecting...");
+            // v97aw (pedido del usuario: la app que funciona reconecta en 2s):
+            // el disconnected HTTP de aqui (v97al) AVISABA al server "me fui" y
+            // lo SACABA de la partida — por eso la reconexion necesitaba
+            // matchmaking nuevo ("SPAWNED [20] timeout"). SIN el aviso, el
+            // server mantiene la cuenta en la partida y el TCP directo la
+            // re-mete en segundos. El disconnected solo lo manda el binario al
+            // TERMINAR la partida (op33), no en cada corte del TCP.
             sock->abort();
             // v80 (CAPTURA DEL BINARIO 2026-08-13): el tag del mmm se resetea
             // POR SESION TCP (binario: tags 5->15 hoy, 83->91 ayer = sesiones
             // distintas). El bot lo dejaba crecer sin limite (813+) y el server
             // cortaba el TCP en el MISMO segundo del mmm. Resetear en CADA
             // reconexion (no solo al inicio del run: el continue no vuelve ahi).
-            mmmTagSet(m_deviceId, 2);
+        // v97av: reset del tag ELIMINADO — el binario NO resetea (tags 40->68 continuos); el tag bajo repetido corta las sesiones a ~30s
             // BACKOFF ADAPTATIVO (modelo del multi_test Python validado 9/9 a
             // 300s, room_keepalive.py:1216-1227): sesion <2s -> el server
             // rechazo casi de inmediato, doblar la espera (max 60s) para dejar

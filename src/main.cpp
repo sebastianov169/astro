@@ -287,13 +287,24 @@ int main(int argc, char *argv[])
     }
 
     if (hasArg(args, QStringLiteral("--headless-run"))) {
-        // Hook de prueba en vivo: marca TODAS las cuentas y las spawnea
-        // (--headless-run --duration N). El spawn() arranca cuando la
-        // seleccion ya esta persistida (3s) y las gemas cacheadas (5s).
-        QTimer::singleShot(3000, &farm, [&farm]() {
+        // Hook de prueba en vivo: marca TODAS las cuentas (o SOLO la de
+        // --account NAME) y las spawnea (--headless-run --duration N). El
+        // spawn() arranca cuando la seleccion ya esta persistida (3s) y las
+        // gemas cacheadas (5s).
+        const QString accountValue = argValue(args, QStringLiteral("--account"));
+        QTimer::singleShot(3000, &farm, [&farm, accountValue]() {
             const auto accs = farm.accounts();
-            for (int i = 0; i < accs.size(); ++i)
-                farm.toggleFarmSelection(i, true);
+            for (int i = 0; i < accs.size(); ++i) {
+                bool match = true;
+                if (!accountValue.isEmpty()) {
+                    const QVariantMap m = accs[i].toMap();
+                    match = m.value(QStringLiteral("name")).toString()
+                                .contains(accountValue, Qt::CaseInsensitive)
+                            || m.value(QStringLiteral("device")).toString()
+                                .contains(accountValue, Qt::CaseInsensitive);
+                }
+                farm.toggleFarmSelection(i, match);
+            }
             QTimer::singleShot(3000, &farm, [&farm]() { farm.spawn(); });
         });
     }
