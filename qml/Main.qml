@@ -2049,6 +2049,11 @@ ApplicationWindow {
                             // activa drag.active en Qt 6.8 -> el swap por clicks
                             // es robusto y simple.
                             onClicked: {
+                                // v97e8: si el modelo esta vacio (el sync no
+                                // corrio), reconstruirlo desde el backend antes
+                                // del swap — el applyPriorityOrder necesita los ids.
+                                if (priorityQmlModel.count === 0)
+                                    root.syncPriority()
                                 if (root.priorityDragStart < 0) {
                                     // primera seleccion
                                     root.priorityDragStart = prioRow.index
@@ -2072,8 +2077,15 @@ ApplicationWindow {
                                     root.priorityDragActive = false
                                     // mueve el item de 'from' a 'to' (desplaza el resto)
                                     priorityQmlModel.move(from, to, 1)
+                                    // v97e7 (bug: el modelo pasado directo a
+                                    // QVariantList no se convertia y el
+                                    // applyPriorityOrder nunca se llamaba):
+                                    // construir la lista de ids explicitamente.
+                                    var orderedIds = []
+                                    for (var oi = 0; oi < priorityQmlModel.count; oi++)
+                                        orderedIds.push(priorityQmlModel.get(oi).id)
                                     // sincroniza el backend con el orden final
-                                    farm.applyPriorityOrder(priorityQmlModel)
+                                    farm.applyPriorityOrder(orderedIds)
                                     root.toast("Priority updated")
                                 }
                             }

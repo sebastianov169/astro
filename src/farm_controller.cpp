@@ -587,8 +587,8 @@ FarmController::FarmController(QObject *parent) : QObject(parent)
         // desde 0 como si presionara RUN"): ciclo COMPLETO cada intervalo —
         // STOP de las sesiones + login nuevo (XP real tras materializar) +
         // respawn. refreshAllAccounts() ya hace exactamente eso (v38).
-        if (!m_refreshingAll && !m_qwsLoading && !m_accounts.isEmpty())
-            refreshAllAccounts();
+        if (!m_refreshingAll && !m_qwsLoading && !m_farmSelection.isEmpty())
+            refreshSelectedFarmAccounts();
     });
     // Coalescing de la UI (ESC-1): las emisiones de alta frecuencia
     // (onFarmXp/onGemXpRead) marcan dirty y este timer agrupa los rebuilds en
@@ -1035,6 +1035,8 @@ void FarmController::setDeviceId(const QString &id)
     if (m_deviceId == id)
         return;
     m_deviceId = id;
+    // v97e2: al cambiar la cuenta activa, cargar el gem priority de ESA cuenta.
+    loadGemPriority();
     emit deviceIdChanged();
 }
 
@@ -2057,15 +2059,27 @@ void FarmController::repairGem(int gemId)
 // El auto-buy del spawn compra primero el color que esta mas arriba.
 void FarmController::loadGemPriority()
 {
-    m_gemPriority.clear();
-    const QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
-    const QStringList raw = s.value(QStringLiteral("gemPriorityColors")).toStringList();
-    for (const QString &str : raw) {
-        bool okNum = false;
-        const int idx = str.toInt(&okNum);
-        if (okNum && idx >= 0 && idx < 20)
-            m_gemPriority.append(idx);
+    // v97e4: el orden por CUENTA persistido como un QVariantMap COMPLETO en
+    // el QSettings ("gemPriorityAll": device -> lista). El mapa en memoria
+    // siempre se reconstruye desde el archivo (sin desincronizaciones).
+    const QString dev = resolveDeviceId();
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    const QVariantMap all = s.value(QStringLiteral("gemPriorityAll")).toMap();
+    appendLog(QStringLiteral("[DEBUG] loadGemPriority dev=%1 claves=%2")
+                  .arg(dev.left(16)).arg(all.keys().size()));
+    m_gemPriorityByDevice.clear();
+    for (auto it = all.constBegin(); it != all.constEnd(); ++it) {
+        QVector<int> list;
+        for (const auto &sv : it.value().toList()) {
+            const int idx = sv.toInt();
+            if (idx >= 0 && idx < 20)
+                list.append(idx);
+        }
+        m_gemPriorityByDevice.insert(it.key(), list);
     }
+    m_gemPriority.clear();
+    if (m_gemPriorityByDevice.contains(dev))
+        m_gemPriority = m_gemPriorityByDevice.value(dev);
     // rellenar las que faltan al final en orden natural
     for (int i = 0; i < 20; ++i)
         if (!m_gemPriority.contains(i))
@@ -2075,11 +2089,26 @@ void FarmController::loadGemPriority()
 
 void FarmController::saveGemPriority()
 {
-    QStringList raw;
+    // v97e4: persistir el QVariantMap COMPLETO (device -> lista) — el orden
+    // de CADA cuenta queda en el archivo, sin depender del mapa en memoria.
+    const QString dev = resolveDeviceId();
+    QStringList orderDbg;
     for (int idx : m_gemPriority)
-        raw.append(QString::number(idx));
+        orderDbg.append(QString::number(idx));
+    appendLog(QStringLiteral("[DEBUG] saveGemPriority dev=%1 orden=%2")
+                  .arg(dev.left(16), orderDbg.join(QLatin1Char(','))));
+    m_gemPriorityByDevice.insert(dev, m_gemPriority);
+    QVariantMap all;
+    for (auto it = m_gemPriorityByDevice.constBegin(); it != m_gemPriorityByDevice.constEnd(); ++it) {
+        QVariantList list;
+        for (int idx : it.value())
+            list.append(idx);
+        all.insert(it.key(), list);
+    }
     QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
-    s.setValue(QStringLiteral("gemPriorityColors"), raw);
+    s.setValue(QStringLiteral("gemPriorityAll"), all);
+    // v97e1: sync inmediato (el cierre abrupto perdia la config).
+    s.sync();
     emit gemPriorityChanged();
 }
 
@@ -2242,24 +2271,37 @@ void FarmController::moveGemPriority(int from, int to)
 void FarmController::applyPriorityOrder(const QVariantList &orderedIds)
 {
     QVector<int> newOrder;
-    newOrder.reserve(orderedIds.size());
-    for (const auto &v : orderedIds) {
-        const int id = v.toMap().value(QStringLiteral("id")).toInt();
-        if (id > 0 && m_gemPriority.contains(id) && !newOrder.contains(id))
+    newOrder.reserve(m_gemPriority.size());
+    for (const QVariant &value : orderedIds) {
+        // QML puede entregar una lista de objetos del modelo o, como hace la
+        // UI actual, una lista de ids simples. Aceptar ambos evita que el
+        // orden llegue vacio al backend.
+        const QVariantMap item = value.toMap();
+        bool ok = false;
+        const int id = item.isEmpty()
+            ? value.toInt(&ok)
+            : item.value(QStringLiteral("id")).toInt(&ok);
+        if (ok && id >= 0 && id < 20 && m_gemPriority.contains(id)
+            && !newOrder.contains(id)) {
             newOrder.append(id);
+        }
     }
-    // cuentas gemas que el modelo no incluyo: mantenerlas al final (por si
-    // priorityGems() filtro alguna sin cuenta)
-    for (int i = 0; i < m_gemPriority.size(); ++i) {
-        const int id = m_gemPriority.at(i);
+
+    // Si el modelo visible no contiene alguna gema, conservarla al final.
+    // Comparar contra el orden anterior antes de asignar el nuevo: la version
+    // previa asignaba primero y por eso siempre retornaba sin guardar.
+    for (const int id : m_gemPriority) {
         if (!newOrder.contains(id))
             newOrder.append(id);
     }
+
     if (newOrder == m_gemPriority)
         return;
+
     m_gemPriority = newOrder;
+    // saveGemPriority actualiza el mapa de la cuenta activa y sincroniza
+    // QSettings antes de devolver el control a QML.
     saveGemPriority();
-    emit gemPriorityChanged();
 }
 
 // 20 tipos de gema del juego (mismo orden que colorNames en gemSpritePath).
@@ -2317,7 +2359,7 @@ QVariantList FarmController::priorityGems() const
 
 void FarmController::spawn()
 {
-    if (m_spawning.load() || farmRunning()) {
+    if (m_spawning.load() || (farmRunning() && !m_refreshRespawning)) {
         m_stateText = QStringLiteral("A farm is already running. Press Stop first.");
         emit stateTextChanged();
         emit toastMessage(m_stateText);
@@ -2877,7 +2919,13 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
     worker->setAutoBuyX2(m_autoBuyX2);
     worker->configure(deviceId, pemPath, gemId);
     // prioridad de gemas (ids de color) para el cambio automatico de gema rota
-    worker->setGemPriorityList(m_gemPriority);
+    // v97e2: el orden POR CUENTA — la lista del device del worker.
+    {
+        QVector<int> prio = m_gemPriority;
+        if (m_gemPriorityByDevice.contains(deviceId))
+            prio = m_gemPriorityByDevice.value(deviceId);
+        worker->setGemPriorityList(prio);
+    }
     worker->setAbortFlag(&m_abortingRefreshAll);
     // Si la sesion del pre-spawn es valida, pasarsela al worker para que
     // haga un "warm start" sin re-login (9 doLogin simultaneos = race).
@@ -3666,26 +3714,61 @@ void FarmController::applyRefreshResult(int index, const QVariantMap &result, bo
 
 void FarmController::refreshAllAccounts()
 {
+    QStringList devices;
+    for (const QVariant &account : m_accounts) {
+        const QString device = account.toMap().value(QStringLiteral("device")).toString();
+        if (!device.isEmpty() && !devices.contains(device))
+            devices.append(device);
+    }
+    refreshAccounts(devices, false);
+}
+
+// El timer solo refresca las cuentas que siguen marcadas Y tienen un farm
+// activo. Tomar este snapshot evita que un cambio de checkbox a mitad del
+// ciclo haga login en una cuenta que el usuario ya desmarco.
+void FarmController::refreshSelectedFarmAccounts()
+{
+    QStringList devices;
+    for (const FarmHandle &farm : m_farms) {
+        if (!farm.worker || !farm.thread || !farm.thread->isRunning())
+            continue;
+        if (!m_farmSelection.contains(farm.deviceId) || devices.contains(farm.deviceId))
+            continue;
+        devices.append(farm.deviceId);
+    }
+    refreshAccounts(devices, true);
+}
+
+void FarmController::refreshAccounts(const QStringList &devices, bool automatic)
+{
     if (m_refreshingAll)
         return;
-    if (m_accounts.isEmpty()) {
-        emit toastMessage(QStringLiteral("No accounts to refresh"));
+    if (devices.isEmpty()) {
+        if (!automatic)
+            emit toastMessage(QStringLiteral("No accounts to refresh"));
         return;
     }
+
+    m_refreshTargetDevices = devices;
+    m_refreshIsAutomatic = automatic;
     m_refreshingAll = true;
     m_refreshAllProgress = 0;
-    m_refreshAllStatus = QStringLiteral("Stopping farms...");
+    m_refreshAllStatus = automatic
+        ? QStringLiteral("Auto-refresh: stopping selected farms...")
+        : QStringLiteral("Stopping farms...");
     emit refreshAllProgressChanged();
     m_abortingRefreshAll.store(false);
 
     // v38 (pedido del usuario: "volver a hacer todo el proceso"): el refresh
-    // SIMPLE = STOP de todas las sesiones de farm + login nuevo de TODAS las
-    // cuentas + re-spawn de las que estaban farmeando. Al terminar la sesion
+    // SIMPLE = STOP de las sesiones objetivo + login nuevo de las cuentas
+    // objetivo + re-spawn de las que estaban farmeando. Al terminar la sesion
     // el server materializa el cexp real (el cexp en partida se congela), asi
     // el login nuevo lee el XP correcto. Sin kick FFA ni settle de worker.
     QStringList respawnDevices;
     for (const auto &fh : m_farms) {
         if (!fh.worker || !fh.thread || !fh.thread->isRunning())
+            continue;
+        if (!m_refreshTargetDevices.contains(fh.deviceId))
             continue;
         respawnDevices.append(fh.deviceId);
         fh.worker->stop();
@@ -3693,8 +3776,9 @@ void FarmController::refreshAllAccounts()
     // si no habia farms, el respawn no aplica: solo se refresca la data
     m_refreshRespawnDevices = respawnDevices;
 
-    appendLog(QStringLiteral("Auto-refresh: stopping %1 farm(s), then fresh login of %2 account(s)")
-                  .arg(respawnDevices.size()).arg(m_accounts.size()));
+    appendLog(QStringLiteral("%1: stopping %2 farm(s), then fresh login of %3 account(s)")
+                  .arg(automatic ? QStringLiteral("Auto-refresh") : QStringLiteral("Refresh"))
+                  .arg(respawnDevices.size()).arg(m_refreshTargetDevices.size()));
     writeLogFile(QStringLiteral("[Refresh] stopping %1 farm(s)").arg(respawnDevices.size()));
 
     // poll: espera asincrona a que todos los threads de farm terminen (el
@@ -3725,7 +3809,14 @@ void FarmController::maybeStartRefreshAllLogin()
         if (!fh.thread || !fh.thread->isRunning())
             m_farms.removeAt(i);
     }
-    if (m_refreshWaitingFarms && !m_farms.isEmpty()) {
+    int runningTargetFarms = 0;
+    for (const FarmHandle &farm : m_farms) {
+        if (m_refreshTargetDevices.contains(farm.deviceId)
+            && farm.thread && farm.thread->isRunning()) {
+            ++runningTargetFarms;
+        }
+    }
+    if (m_refreshWaitingFarms && runningTargetFarms > 0) {
         // v40: timeout — si un worker no termina, no bloquear el refresh para
         // siempre. Los devices cuyo thread sigue vivo se quitan del respawn.
         if (QDateTime::currentMSecsSinceEpoch() < m_refreshWaitDeadline) {
@@ -3733,15 +3824,15 @@ void FarmController::maybeStartRefreshAllLogin()
             return;
         }
         appendLog(QStringLiteral("Refresh: %1 farm(s) no terminaron en 30s, continuando sin ellos")
-                      .arg(m_farms.size()));
+                      .arg(runningTargetFarms));
         writeLogFile(QStringLiteral("[Refresh] %1 farms colgados tras el timeout, login sigue")
-                         .arg(m_farms.size()));
+                         .arg(runningTargetFarms));
     }
     m_refreshWaitingFarms = false;
 
-    appendLog(QStringLiteral("Refresh: login nuevo de %1 cuentas...").arg(m_accounts.size()));
+    appendLog(QStringLiteral("Refresh: login nuevo de %1 cuentas...").arg(m_refreshTargetDevices.size()));
     writeLogFile(QStringLiteral("[Refresh] login nuevo de %1 cuentas, respawn %2")
-                     .arg(m_accounts.size()).arg(m_refreshRespawnDevices.size()));
+                     .arg(m_refreshTargetDevices.size()).arg(m_refreshRespawnDevices.size()));
 
     // Snapshot de devices (GUI thread): TODAS las cuentas, sin saltarse las
     // que farmeaban. Se capturan tambien el orden de colores priorizados
@@ -3769,6 +3860,8 @@ void FarmController::maybeStartRefreshAllLogin()
     QVector<RefreshTarget> targets;
     for (const auto &v : m_accounts) {
         const QVariantMap m = v.toMap();
+        if (!m_refreshTargetDevices.contains(m.value(QStringLiteral("device")).toString()))
+            continue;
         RefreshTarget t;
         t.deviceId = m.value(QStringLiteral("device")).toString();
         t.name = m.value(QStringLiteral("name")).toString();
@@ -3778,6 +3871,8 @@ void FarmController::maybeStartRefreshAllLogin()
     const int total = targets.size();
     if (total == 0) {
         m_refreshingAll = false;
+        m_refreshTargetDevices.clear();
+        m_refreshIsAutomatic = false;
         emit refreshAllProgressChanged();
         emit toastMessage(QStringLiteral("No accounts to refresh"));
         return;
@@ -4106,7 +4201,9 @@ void FarmController::maybeStartRefreshAllLogin()
                     m_refreshingAll = false;
                     sortAccounts();
                     saveAccounts();
-                    m_refreshAllStatus = QStringLiteral("All %1 accounts refreshed").arg(total);
+                    m_refreshAllStatus = m_refreshIsAutomatic
+                        ? QStringLiteral("Auto-refresh: %1 farm account(s) refreshed").arg(total)
+                        : QStringLiteral("All %1 accounts refreshed").arg(total);
                     emit refreshAllProgressChanged();
                     emit toastMessage(m_refreshAllStatus);
                     appendLog(QStringLiteral("Refresh completo: %1 cuentas, re-spawning %2 farm(s)")
@@ -4123,6 +4220,8 @@ void FarmController::maybeStartRefreshAllLogin()
                         m_refreshWaitDeadline = QDateTime::currentMSecsSinceEpoch() + 30000;
                         maybeRespawnAfterRefresh();
                     }
+                    m_refreshTargetDevices.clear();
+                    m_refreshIsAutomatic = false;
                 }
             }, Qt::QueuedConnection);
             // Pausa entre cuentas para no saturar el server
@@ -4132,6 +4231,8 @@ void FarmController::maybeStartRefreshAllLogin()
         QMetaObject::invokeMethod(this, [this, thread]() {
             m_refreshAllThread = nullptr;
             m_refreshingAll = false;
+            m_refreshTargetDevices.clear();
+            m_refreshIsAutomatic = false;
             thread->quit();
         }, Qt::QueuedConnection);
     }, Qt::DirectConnection);
@@ -4149,7 +4250,9 @@ void FarmController::respawnDevices(const QStringList &devices)
     m_farmSelection.clear();
     for (const QString &d : devices)
         m_farmSelection.append(d);
+    m_refreshRespawning = true;
     spawn();
+    m_refreshRespawning = false;
     m_farmSelection = savedSelection;
     emit farmSelectionChanged();
 }
@@ -4167,7 +4270,8 @@ void FarmController::maybeRespawnAfterRefresh()
         return;
     bool anyAlive = false;
     for (const auto &fh : m_farms) {
-        if (fh.thread && fh.thread->isRunning()) {
+        if (m_refreshRespawnDevices.contains(fh.deviceId)
+            && fh.thread && fh.thread->isRunning()) {
             anyAlive = true;
             break;
         }

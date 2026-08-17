@@ -259,6 +259,8 @@ private:
     void saveAccounts();
     void sortAccounts();                       // favoritos primero, luego A-Z
     void applyRefreshResult(int index, const QVariantMap &result, bool emitChange = true);
+    void refreshAccounts(const QStringList &devices, bool automatic);
+    void refreshSelectedFarmAccounts();
     int accountIndexForFiltered(int filteredIndex) const; // indice real desde la lista filtrada
     void applyAccount(int real); // device + nombre + gemas cacheadas de una cuenta (indice real)
     void onFarmXp(FarmWorker *w, double xpGained, double lastXp, int deaths, bool spawned);
@@ -298,6 +300,10 @@ private:
     // El auto-buy del spawn compra primero el color que esta mas arriba.
     // Las 20 gemas son: black(0)..teal(19), misma matriz que gemSpritePath.
     QVector<int> m_gemPriority;
+    // v97e2 (bug reportado: el gem priority era GLOBAL — se aplicaba a todas
+    // las cuentas): el orden por CUENTA. m_gemPriority es la vista del
+    // deviceId activo; el mapa guarda el orden de cada cuenta.
+    QHash<QString, QVector<int>> m_gemPriorityByDevice;
     // 2026-08-10: auto-buy de la TIENDA por color (boton "Auto buy" en la
     // seccion de prioridad). QSet de indices 0-19 con compra automatica.
     // La tienda rota 19:00 y 01:00 hora Colombia (UTC-5, sin DST) = 00:00 y
@@ -355,6 +361,9 @@ private:
     bool m_refreshWaitingFarms = false;      // v38: esperando el STOP de los farms
     qint64 m_refreshWaitDeadline = 0;        // v40: timeout de 15s de la espera
     QStringList m_refreshRespawnDevices;     // v38: devices a re-spawnear al terminar
+    QStringList m_refreshTargetDevices;      // snapshot de cuentas de este refresh
+    bool m_refreshIsAutomatic = false;
+    bool m_refreshRespawning = false;
     QString m_accountSearch;
     QVariantList m_farmSelection; // devices seleccionados para farmear (max 10)
     QTimer *m_autoRefreshTimer = nullptr; // auto-refresh de cuentas (intervalo en ms)
