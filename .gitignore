@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.exe
+*.dll
+
+# Logs con session keys / datos sensibles del juego
+*.log
+astro_crash.txt
+
+# Basura de edicion temporal (archivos _part*/_sections*/_temp*)
+_part*.txt
+_sections*.txt
+_search_results.txt
+_temp_qml.txt
+
+# PROBES CON CREDENCIALES DE CUENTAS REALES: NUNCA subir
+# (contienen deviceIds + session keys sk= de cuentas del juego)
+live_xp_probe*.py
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Claves privadas (PEM de atestacion) - NUNCA subir
+*.pem
