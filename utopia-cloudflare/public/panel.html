@@ -1,0 +1,1082 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Utopia</title>
+<style>
+:root{
+  --canvas:#040810; --surface:#08131f; --surface2:#0d1d2b; --surface3:#142c40;
+  --border:#20506a; --borderSoft:#17384e; --text:#f0fbff; --muted:#8baebb;
+  --faint:#52788a; --teal:#48f1da; --purple:#aa8cff; --gold:#f3c85b; --danger:#dd526c;
+  color-scheme:dark;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{background:var(--canvas);color:var(--text);font-family:'Segoe UI',sans-serif;font-size:13px}
+button{font-family:inherit;cursor:pointer}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:var(--borderSoft);border-radius:3px}
+::-webkit-scrollbar-track{background:transparent}
+.app{display:flex;height:100vh}
+
+/* ============ SIDEBAR ============ */
+.side{width:236px;min-width:236px;background:var(--surface);border-right:1px solid var(--borderSoft);display:flex;flex-direction:column;padding:18px;position:relative;z-index:2;overflow:hidden}
+.side::before{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(170,140,255,.025) 0%,rgba(72,241,218,.025) 48%,rgba(170,140,255,.02) 100%);pointer-events:none}
+.brand{display:flex;align-items:baseline;gap:8px;position:relative}
+.brand .mi{color:var(--gold);font-size:20px;font-weight:bold}
+.brand .ut{font-size:18px;font-weight:900;letter-spacing:2.2px}
+.cartel{color:var(--purple);font-size:8px;letter-spacing:1.2px;margin-top:4px;position:relative}
+.side hr{border:none;border-top:1px solid var(--border);opacity:.75;margin:10px 0;position:relative}
+.private{background:rgba(182,7,21,.06);border:1px solid var(--borderSoft);border-radius:6px;padding:12px;margin-top:26px;position:relative;overflow:hidden}
+.private::before{content:'';position:absolute;inset:0;background:rgba(10,21,31,.46);pointer-events:none}
+.private .lbl{color:var(--gold);font-size:9px;font-weight:900;letter-spacing:1.3px;position:relative}
+.private .nm{font-size:12px;font-weight:900;margin-top:4px;position:relative}
+.private .sb{color:var(--text);font-size:10px;margin-top:2px;opacity:.7;position:relative}
+.nav{margin-top:26px;display:flex;flex-direction:column;gap:2px;position:relative}
+.navit{display:flex;align-items:center;gap:10px;padding:12px;border-radius:4px;cursor:pointer;color:var(--muted);font-size:13px;border:1px solid transparent}
+.navit .ic{width:20px;text-align:center;font-size:12px;color:var(--muted)}
+.navit.on{background:#123342;color:var(--text);font-weight:700;border-color:var(--teal)}
+.navit.on .ic{color:var(--gold)}
+.navit .dot{margin-left:auto;width:4px;height:4px;border-radius:2px;background:var(--teal);display:none}
+.navit.on .dot{display:block}
+.spacer{flex:1}
+.sbox{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:12px;margin-bottom:14px;position:relative}
+.sbox .r{display:flex;justify-content:space-between;align-items:center}
+.sbox .l{color:var(--muted);font-size:9px}
+.sbox .v{font-size:11px;font-weight:900;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sbox .v.on{color:var(--teal)}
+.pill{font-size:9px;font-weight:900;padding:2px 8px;border-radius:10px;background:rgba(72,241,218,.12);color:var(--teal);white-space:nowrap}
+.pill.off{background:rgba(221,82,108,.12);color:var(--danger)}
+.sbox .row2{display:flex;align-items:center;margin-top:6px;gap:4px}
+.sbox .dotg{width:6px;height:6px;border-radius:3px;background:var(--gold);display:inline-block}
+.foot{color:var(--faint);font-size:9px;letter-spacing:.7px;position:relative;margin-top:16px}
+
+/* ============ MAIN ============ */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;overflow:hidden}
+.main::before{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(72,241,218,.018) 0%,rgba(170,140,255,.018) 52%,rgba(72,241,218,.012) 100%);pointer-events:none;z-index:0}
+.hdr{background:var(--surface);border-bottom:1px solid var(--borderSoft);padding:16px 26px;display:flex;align-items:center;gap:14px;position:relative;z-index:1}
+.hdr::after{content:'';position:absolute;left:0;bottom:0;width:120px;height:2px;background:var(--teal);opacity:.85}
+.hdr .t{font-size:20px;font-weight:900;letter-spacing:.8px}
+.hdr .s{color:var(--muted);font-size:11px;margin-top:2px}
+.hdr .nd{margin-left:auto;color:var(--faint);font-size:9px;letter-spacing:1px}
+.coins{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:8px 14px;display:flex;flex-direction:column;align-items:center}
+.coins .cl{color:var(--muted);font-size:9px}
+.coins .cv{color:var(--gold);font-size:13px;font-weight:900}
+.stats{display:flex;padding:16px 26px 0;position:relative;z-index:1}
+.stat{flex:1;padding:0 18px;border-right:1px solid var(--borderSoft)}
+.stat:last-child{border-right:none}
+.stat .sl{color:var(--muted);font-size:9px}
+.stat .sv{font-size:20px;font-weight:900;margin-top:4px}
+.stat .sv.te{color:var(--teal)}.stat .sv.pu{color:var(--purple)}.stat .sv.go{color:var(--gold)}.stat .sv.da{color:var(--danger)}
+.content{flex:1;padding:16px;display:flex;gap:10px;min-height:0;position:relative;z-index:1}
+
+/* ============ PANELS ============ */
+.pnl{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:14px;display:flex;flex-direction:column;min-height:0;min-width:0}
+.pnl h3{font-size:17px;font-weight:900;display:flex;align-items:center;gap:8px}
+.pnl h3 .sp{color:var(--purple);font-size:9px;font-weight:900;background:rgba(170,140,255,.12);padding:2px 8px;border-radius:10px}
+.cap{color:var(--purple);font-size:9px;letter-spacing:.5px;margin-top:2px}
+.cap2{color:var(--muted);font-size:9px;margin-top:2px}
+.btn{background:var(--surface3);color:var(--teal);border:1px solid var(--border);border-radius:4px;padding:8px 16px;font-size:12px;font-weight:900;cursor:pointer}
+.btn:hover{background:#174355}
+.btn.go{color:var(--gold)}
+.btn.sm{padding:4px 10px;font-size:10px}
+.btn.full{width:100%}
+.gh{background:transparent;color:var(--teal);border:1px solid var(--borderSoft);border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}
+.gh:hover{border-color:var(--teal)}
+
+/* ============ LABORATORY ============ */
+.plans{width:190px;min-width:170px;flex-shrink:0}
+.pr{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:10px;margin-bottom:6px;cursor:pointer}
+.pr.on{background:#1a3035;border-color:var(--teal)}
+.pr .r1{display:flex;align-items:center;gap:6px}
+.pr .nm{font-size:13px;font-weight:900;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pr .ab{color:var(--teal);font-size:10px;font-weight:900}
+.pr .dt{width:7px;height:7px;border-radius:4px;flex-shrink:0}
+.pr .r2{display:flex;align-items:center;margin-top:3px}
+.pr .ct{color:var(--muted);font-size:9px;flex:1}
+.pr .rd{font-size:10px;font-weight:900}
+.pr .rd.ok{color:var(--teal)}
+.pmain{flex:1;display:flex;flex-direction:column;min-width:0}
+.pt{font-size:17px;font-weight:900;display:flex;align-items:center;gap:8px}
+.tgls{display:flex;gap:10px;margin:10px 0;align-items:center}
+.tgl{display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:13px;padding:5px 12px;cursor:pointer;font-size:9px;font-weight:900;color:var(--muted);background:var(--surface2)}
+.tgl .bl{width:12px;height:12px;border-radius:6px;background:var(--muted)}
+.tgl.on{background:#173139;border-color:var(--teal);color:var(--teal)}
+.tgl.on .bl{background:var(--teal)}
+.slots{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:1;min-height:0;overflow-y:auto}
+.slot{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:10px;display:flex;flex-direction:column}
+.slot .h{display:flex;justify-content:space-between;align-items:center}
+.slot .sn{color:var(--gold);font-size:9px;font-weight:900;letter-spacing:.5px}
+.slot .arm{color:var(--teal);font-size:8px;font-weight:900}
+.slot .im{height:80px;background:#081722;border:1px solid var(--borderSoft);border-radius:6px;margin:6px 0;display:flex;align-items:center;justify-content:center}
+.slot .im img{max-width:60px;max-height:60px;object-fit:contain}
+.slot .pn{font-size:10px;font-weight:900;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.slot select{width:100%;background:var(--canvas);color:var(--text);border:1px solid var(--borderSoft);border-radius:4px;padding:6px;font-size:10px;font-family:inherit}
+select option{background:var(--surface2);color:var(--text)}
+.slotpick{display:flex;align-items:center;gap:6px;background:var(--canvas);border:1px solid var(--borderSoft);border-radius:4px;padding:3px 5px}
+.slotpick img{width:24px;height:24px;object-fit:contain;flex-shrink:0}
+.slotpick select{border:0;padding:3px 0;background:transparent;min-width:0;flex:1}
+.slot .cp{color:var(--faint);font-size:8px;margin-top:4px}
+.act{display:flex;align-items:center;gap:10px;margin-top:10px}
+.act .ct2{color:var(--teal);font-size:10px;flex:1}
+.lv{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:10px;margin-top:10px}
+.lv .lh{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.lv .lh .ll{color:var(--gold);font-size:9px;font-weight:900}
+.lv .lh .ls{color:var(--muted);font-size:9px}
+.lr{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:3px;margin-bottom:2px;font-size:9px;font-weight:900}
+.lr.c{background:#0a1f16;border:1px solid var(--teal)}
+.lr.l{background:#1a1206;border:1px solid #3a2a10;color:var(--muted)}
+.lr.r{background:#0a151a;border:1px solid var(--borderSoft)}
+.lr .ln{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ============ ASSIGN ============ */
+.asgn{width:320px;min-width:250px}
+.asgn .ah{font-size:18px;font-weight:900;display:flex;align-items:center;gap:8px}
+.asgn .ah .ct{color:var(--teal);font-size:9px;font-weight:900;background:rgba(72,241,218,.12);padding:2px 8px;border-radius:10px}
+.al{flex:1;overflow-y:auto;margin-top:8px;min-height:0}
+.ar{display:flex;align-items:center;gap:8px;padding:8px;border-radius:3px;margin-bottom:4px;cursor:pointer;border:1px solid var(--borderSoft);background:var(--surface2)}
+.ar.on{background:#173139;border-color:var(--teal)}
+.ck{width:22px;height:22px;border-radius:3px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:900;color:#071015;flex-shrink:0}
+.ar.on .ck{background:var(--teal)}
+.ai{flex:1;min-width:0}
+.ai .nm{font-size:14px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ai .pl{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ar.on .pl{color:var(--teal)}
+.mlt{background:var(--canvas);color:var(--text);border:1px solid var(--borderSoft);border-radius:5px;padding:2px;font-size:9px;font-family:inherit;flex-shrink:0}
+.lbx{font-size:8px;font-weight:900;color:var(--teal);background:#173139;border:1px solid var(--teal);border-radius:10px;padding:2px 8px;flex-shrink:0}
+.asgn .ft{color:var(--faint);font-size:9px;margin-top:6px}
+.asgn .ftg{color:var(--gold)}
+.openbtn{margin-top:8px;width:100%}
+
+/* ============ INVENTORY ============ */
+.inv{flex:1;display:flex;flex-direction:row;gap:10px;min-height:0}
+.lp{flex:1;display:flex;flex-direction:column;min-height:0}
+.lp .h3{font-size:21px;font-weight:900;display:flex;align-items:center;gap:10px}
+.ir{display:flex;align-items:center;gap:9px;padding:9px;border-radius:3px;margin-bottom:6px;background:var(--surface2);border:1px solid var(--borderSoft);cursor:pointer}
+.ir .nm{font-size:12px;font-weight:900;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ir .sb{font-size:10px;color:var(--muted)}
+.ir .co{color:var(--gold);font-size:12px;font-weight:900}
+.ir .x{width:18px;height:18px;border-radius:3px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;color:#071015;flex-shrink:0}
+.ir.on .x{background:var(--teal)}
+.inv .alp{width:330px;min-width:300px;flex:0 0 330px}
+.asr{display:flex;align-items:center;gap:6px;padding:4px 8px;border-radius:3px;font-size:11px;font-weight:900;margin-bottom:1px}
+.asr .sl{color:var(--gold);font-weight:900;width:22px}
+.asr .pr{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.asr .tm{color:var(--gold);font-size:10px;font-weight:900;white-space:nowrap}
+.asr .ct{font-size:9px;font-weight:900}
+.asr.cr{background:rgba(10,31,22,.5)}
+.asr.lk{background:rgba(26,18,6,.8);color:var(--muted)}
+.asr.rd{background:rgba(10,21,26,.5)}
+
+/* ============ CRAFT HISTORY ============ */
+.ch{flex:1;overflow-y:auto}
+.chc{background:var(--surface2);border:1px solid var(--borderSoft);border-radius:6px;padding:12px;margin-bottom:8px}
+.chc .cch{font-size:11px;font-weight:900;color:var(--gold);margin-bottom:4px}
+.chc .anm{font-size:16px;font-weight:900;margin-bottom:2px}
+.chc .lc{font-size:10px;color:var(--muted);margin-bottom:4px}
+.chc .pw{display:flex;gap:12px;flex-wrap:wrap}
+.chc .pi{display:flex;align-items:center;gap:4px;font-size:12px}
+.chc .pi img{width:22px;height:22px;object-fit:contain}
+.chc .qi{font-weight:900}
+.chc .pnm{font-size:10px;color:var(--muted)}
+
+/* ============ SHOP ============ */
+.sp{flex:1;display:flex;flex-direction:row;gap:14px;min-height:0}
+.sp .lp2{width:370px;min-width:330px;flex:0 0 370px;display:flex;flex-direction:column;min-height:0}
+.sp > .alp{flex:1;width:auto;min-width:0}
+.si{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #16283c}
+.si .ic{width:30px;height:30px;border-radius:6px;background:var(--canvas);border:1px solid var(--borderSoft);display:flex;align-items:center;justify-content:center}
+.si .ic img{width:24px;height:24px;object-fit:contain}
+.si .nm{flex:1;font-size:11px;font-weight:900}
+.si .pr{color:var(--gold);font-size:11px;font-weight:900}
+.si .buy{background:var(--gold);color:var(--canvas);border:none;border-radius:4px;padding:6px 14px;font-size:10px;font-weight:900;cursor:pointer}
+.si .buy:hover{opacity:.85}
+
+/* ============ LOG ============ */
+.lb{background:var(--surface);border:1px solid var(--borderSoft);border-radius:4px;padding:10px 12px;display:flex;align-items:center;gap:8px;font-size:11px;position:relative;z-index:1}
+.lb .ll{color:var(--gold);font-weight:900}
+.lb .lt{font-family:Consolas,monospace;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+
+/* ============ MODAL ============ */
+.modal{position:fixed;inset:0;background:rgba(4,8,16,.85);display:none;align-items:center;justify-content:center;z-index:50}
+.modal .box{background:var(--surface3);border:1px solid var(--teal);border-radius:8px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden}
+.modal .mh{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--surface)}
+.modal .mh .t{font-size:14px;font-weight:900;color:var(--gold)}
+.modal .mh .x{margin-left:auto;cursor:pointer;color:var(--muted);font-weight:900;padding:4px 10px}
+.modal .mh .x:hover{color:var(--danger)}
+.modal .mb{flex:1;overflow-y:auto;padding:12px}
+.buybox{width:500px;max-height:none}
+.buybody{padding:16px;display:flex;flex-direction:column;gap:12px}
+.buyinfo{color:var(--text);font-size:11px;font-weight:900}
+.buyqty{display:flex;align-items:center;gap:8px}
+.buyqty button{width:36px;height:32px;background:var(--surface2);color:var(--teal);border:1px solid var(--border);border-radius:4px;font-size:18px;font-weight:900}
+.buyqty button:hover{background:#174355}
+.buyqty input{flex:1;height:32px;background:var(--canvas);color:var(--text);border:1px solid var(--borderSoft);border-radius:4px;text-align:center;font:900 14px inherit}
+.buytotal{color:var(--teal);font-size:11px;font-weight:900}
+.buyactions{display:flex;justify-content:flex-end;gap:8px}
+.mr{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #16283c;font-size:12px}
+.mr .ok{color:var(--teal);font-weight:900;min-width:70px}
+.mr .no{color:var(--danger);font-weight:900;min-width:70px}
+.mr .who{font-weight:900;min-width:90px}
+.mr .rw{color:var(--muted);flex:1;font-size:11px}
+.chestReward{display:inline-flex;align-items:center;gap:5px;background:#081722;border:1px solid var(--borderSoft);border-radius:4px;padding:4px 6px;margin:2px;font-size:10px}
+.chestReward img{width:24px;height:24px;object-fit:contain}
+
+/* ============ TOAST ============ */
+.toast{position:fixed;top:16px;right:16px;background:var(--surface3);border:1px solid var(--teal);border-radius:8px;padding:10px 16px;font-size:13px;display:none;z-index:99;max-width:70vw}
+
+/* ============ MOBILE ============ */
+@media (max-width:820px){
+  html,body{overflow:auto;height:auto}
+  .app{flex-direction:column;height:auto;min-height:100vh}
+  .side{width:100%;min-width:0;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 12px;border-right:none;border-bottom:1px solid var(--borderSoft)}
+  .side .brand{display:none}
+  .side .private,.side .sbox,.side .foot,.side hr,.side .spacer{display:none}
+  .side .cartel{display:none}
+  .side .nav{flex-direction:row;margin-top:0;width:100%;gap:6px;flex-wrap:wrap}
+  .navit{flex:1;justify-content:center;padding:9px 4px;font-size:11px;min-width:0}
+  .navit .ic{display:none}
+  .navit .dot{display:none}
+  .main{overflow:visible;height:auto}
+  .hdr{flex-wrap:wrap;padding:12px 14px;gap:8px}
+  .hdr .t{font-size:16px}
+  .hdr .nd{display:none}
+  .hdr .coins{margin-left:0}
+  .stats{flex-wrap:wrap;padding:12px 14px 0}
+  .stat{padding:0 10px 10px;flex:1 1 40%;min-width:120px;border-right:none}
+  .content{flex-direction:column;padding:10px;gap:10px;overflow:visible}
+  .pnl{min-height:auto}
+  .plans{width:100%;min-width:0;max-height:none}
+  .asgn{width:100%;min-width:0}
+  .inv{flex-direction:column}
+  .inv .alp{width:100%;min-width:0;flex:none}
+  .sp{flex-direction:column}
+  .sp .lp2{width:100%;min-width:0;flex:none}
+  .sp > .alp{width:100%}
+  .slots{grid-template-columns:1fr}
+  .modal .box{width:96vw;max-width:96vw}
+  .buybox{width:96vw;max-width:96vw}
+  .lb .lt{white-space:normal;word-break:break-all}
+  .al,#shL,.ch{max-height:50vh}
+  .inv .lp{min-height:0}
+  #slGrid{max-height:60vh}
+  .toast{max-width:92vw}
+  .lr .ln{white-space:normal}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- SIDEBAR -->
+  <div class="side">
+    <div class="brand"><span class="mi">MITOSIS</span><span class="ut">UTOPIA</span></div>
+    <div class="cartel">POTION CARTEL // LAB 09</div>
+    <hr>
+    <div class="private">
+      <div class="lbl">PRIVATE MIX</div>
+      <div class="nm">UTOPIA AFTER HOURS</div>
+      <div class="sb">Brew clean. Move quiet.</div>
+    </div>
+    <div class="nav">
+      <div class="navit on" data-sec="0" onclick="setSection(0)"><span class="ic">+</span>Laboratory<span class="dot"></span></div>
+      <div class="navit" data-sec="1" onclick="setSection(1)"><span class="ic">V</span>Inventory<span class="dot"></span></div>
+      <div class="navit" data-sec="2" onclick="setSection(2)"><span class="ic">H</span>Craft History<span class="dot"></span></div>
+      <div class="navit" data-sec="3" onclick="setSection(3)"><span class="ic">S</span>Shop<span class="dot"></span></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="sbox">
+      <div class="r"><span class="l">LAB STATUS</span><span class="pill" id="labPill">SYNCED</span></div>
+      <div class="v on" id="brewCnt">cron activo // 1/min</div>
+      <div class="row2"><span class="dotg"></span><span class="l" style="margin-left:4px">Plans synced</span><span class="l" style="margin-left:auto">v1.2.0</span></div>
+    </div>
+    <div class="sbox">
+      <div class="r"><span class="l">ACCOUNT // HTTP LOGIN</span><span class="pill" id="loginPill">ONLINE</span></div>
+      <div class="v on">utopia-bot</div>
+      <div class="r"><span class="l" id="lastT">last: -</span></div>
+    </div>
+    <div class="foot">UTOPIA LABS // 2026</div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="hdr">
+      <div>
+        <div class="t" id="secT">Laboratory Plans</div>
+        <div class="s" id="secS">Assign six-slot potion plans to selected accounts</div>
+      </div>
+      <div class="nd">NODE 09 // SECURE</div>
+      <span class="pill" id="onlinePill">ONLINE</span>
+      <div class="coins"><span class="cl">COINS</span><span class="cv" id="coinsVal">-</span></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="sl">IN STOCK</div><div class="sv te" id="stIn">-</div></div>
+      <div class="stat"><div class="sl">ACTIVE BREWS</div><div class="sv pu" id="stBr">-</div></div>
+      <div class="stat"><div class="sl">RECIPES</div><div class="sv go" id="stRecipes">54</div></div>
+      <div class="stat"><div class="sl">BLACKLISTED</div><div class="sv da">0</div></div>
+    </div>
+
+    <div class="content" id="content">
+
+      <!-- LABORATORY -->
+      <div class="pnl plans" id="sec0" style="display:flex">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:4px">
+          <h3>Plans</h3>
+          <div style="display:flex;gap:3px">
+            <button class="gh" title="New plan" onclick="createPlan()">+</button>
+            <button class="gh" title="Rename plan" onclick="renamePlan()">R</button>
+            <button class="gh" title="Delete plan" onclick="deletePlan()">D</button>
+          </div>
+        </div>
+        <div class="cap">SELECT A PLAN TO EDIT</div>
+        <div style="flex:1;overflow-y:auto;margin-top:8px" id="plansL"></div>
+        <div style="color:var(--gold);font-size:9px;margin-top:8px"><span id="planCt">0</span> plans in scope</div>
+      </div>
+
+      <div class="pnl pmain" id="sec0b" style="display:flex">
+        <div class="pt"><span id="planN">Plan</span><span class="sp">6 SLOTS</span></div>
+        <div class="cap">Choose the potion loadout every assigned account will run.</div>
+        <div class="tgls">
+          <span style="color:var(--teal);font-size:10px;flex:1" id="stkMsg">All ingredients in stock</span>
+          <div class="tgl" id="tgAB" onclick="togglePlan('autobuy')"><span class="bl"></span>AUTOBUY</div>
+          <div class="tgl" id="tgLP" onclick="togglePlan('loop')"><span class="bl"></span>LOOP</div>
+        </div>
+        <div class="slots" id="slGrid"></div>
+        <div class="act">
+          <span style="color:var(--teal);font-size:10px;flex:1" id="asgMsg">0 accounts will receive this loadout</span>
+          <button class="btn" onclick="doCycle()">CRAFT</button>
+          <button class="btn go" onclick="refreshLabs()">REFRESH LAB</button>
+        </div>
+        <div class="lv">
+          <div class="lh"><span class="ll">LIVE LABORATORY</span><span class="ls" id="lvSt">-</span></div>
+          <div id="lvRows"></div>
+        </div>
+      </div>
+
+      <div class="pnl asgn" id="sec0c" style="display:flex">
+        <div class="ah">Assign accounts <span class="ct" id="asgCt">0/9</span></div>
+        <div class="cap">Click accounts to add or remove them from <span id="asgPn">plan</span></div>
+        <div class="al" id="asgL"></div>
+        <div class="ft">CHEST ROUTING READY // USE THE ASSIGNED PLAN</div>
+        <button class="btn openbtn" onclick="openChests()">OPEN CHEST // ALL <span id="allN">0</span> ACC</button>
+        <div class="ftg" id="accFt">0 accounts loaded // plan routing active</div>
+      </div>
+
+      <!-- INVENTORY -->
+      <div class="pnl inv" id="sec1" style="display:none">
+        <div class="lp">
+          <div class="h3">
+            Accounts
+            <span class="pill" id="qwCt">0 QW</span>
+            <button class="btn sm" style="margin-left:auto" onclick="toast('Anade cuentas desde la app de escritorio')">ANADIR QW</button>
+          </div>
+          <div class="cap2">QW accounts scanned from disk with coins and lab slots</div>
+          <div style="flex:1;overflow-y:auto;margin-top:8px" id="invL"></div>
+        </div>
+        <div class="pnl alp">
+          <div class="h3" id="alTitle">Account Labs</div>
+          <button class="btn sm" style="margin-top:10px" onclick="scanLabs()">SCAN LABS</button>
+          <div style="flex:1;overflow-y:auto;margin-top:8px" id="alLabs"></div>
+        </div>
+      </div>
+
+      <!-- CRAFT HISTORY -->
+      <div class="pnl ch" id="sec2" style="display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <h3>Craft History</h3>
+          <span class="pill" id="chAcc">0 ACC</span>
+        </div>
+        <div class="cap2">Per-account potion production history (cloud log)</div>
+        <div style="margin-top:10px" id="chL"></div>
+      </div>
+
+      <!-- SHOP -->
+      <div class="pnl sp" id="sec3" style="display:none">
+        <div class="lp2">
+          <div style="display:flex;align-items:center;gap:10px"><h3>Shop</h3><span class="pill">BUY MODE</span></div>
+          <div class="cap2">Buy potions on selected accounts (deducts coins)</div>
+          <div style="flex:1;overflow-y:auto;margin-top:10px" id="shL"></div>
+        </div>
+        <div class="pnl alp">
+          <div class="h3">ACCOUNTS (CLICK TO SELECT)</div>
+          <div style="flex:1;overflow-y:auto;margin-top:8px" id="shAcc"></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="padding:0 16px 10px">
+      <div class="lb"><span class="ll">LOG:</span><span class="lt" id="logL">No activity yet</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal" id="chestModal">
+  <div class="box">
+    <div class="mh"><span class="t">CHEST REWARDS</span><span class="x" onclick="closeChest()">x</span></div>
+    <div class="mb" id="chestBody"></div>
+  </div>
+</div>
+<div class="modal" id="buyModal">
+  <div class="box buybox">
+    <div class="mh"><span class="t" id="buyTitle">BUY</span><span class="x" onclick="closeBuy()">x</span></div>
+    <div class="buybody">
+      <div class="buyinfo" id="buyPackInfo"></div>
+      <div class="buyqty">
+        <button type="button" onclick="changeBuyPacks(-1)">−</button>
+        <input id="buyPacks" type="number" min="1" max="40" value="1" oninput="syncBuyPacks(this.value)">
+        <button type="button" onclick="changeBuyPacks(1)">+</button>
+      </div>
+      <div class="buytotal" id="buyTotal"></div>
+      <div class="buyactions">
+        <button class="btn" type="button" onclick="closeBuy()">CANCEL</button>
+        <button class="btn go" type="button" onclick="confirmBuy()">BUY</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// ============ DATOS ============
+const SEC_T = ["Laboratory Plans", "Inventory", "Craft History", "Shop"];
+const SEC_S = [
+  "Assign six-slot potion plans to selected accounts",
+  "Your secured Utopia stash",
+  "Per-account potion production history",
+  "Buy potions and manage accounts"
+];
+const POTIONS = [
+  "Mythical Speed Potion","Gravity Speed Potion","Legendary Speed Potion","Legendary Gravity Potion",
+  "Super Glue Potion","Superior Portal Glue","Speed Shot","Speed Anticellular Shield",
+  "Powerful Chainsaw","Portal Shield Armor","Legendary Blink","Superior Portal Gun",
+  "Anticellular Armor","Superior Blink","Bubble Gun","Antiviral Portal Gun",
+  "Superior Immunity Shield","Superior Gravity Blink"
+];
+const POTE = [
+  "mythical-speed-potion.png","speed-and-gravity-potion.png","legendary-speed-potion.png","legendary-gravity-potion.png",
+  "super-glue-potion.png","powerful-portal-glue.png","speed-shot.png","speed-anticellular-shield.png",
+  "powerful-chainsaw.png","portal-shield-armor.png","legendary-blink.png","superior-portal-gun.png",
+  "anticellular-armor.png","superior-blink.png","bubble-gun.png","antiviral-portal-gun.png",
+  "superior-immunity-shield.png","superior-gravity-blink.png"
+];
+const SHOP = [
+  {n:"Tournament Ticket",p:200,img:"tournament-ticket.png",id:510},
+  {n:"Double Gem XP",p:1200,img:"double-gem-xp.png",id:8590},
+  {n:"Self Destroying Device",p:600,img:"self-destroying-device.png",id:2147},
+  {n:"Triple Coins",p:600,img:"triple-coins.png",id:2017},
+  {n:"Double XP",p:600,img:"double-xp.png",id:2016},
+  {n:"Virus Replication Vial",p:600,img:"virus-replication-vial.png",id:2015},
+  {n:"Improved Mass Gainer",p:600,img:"improved-mass-gainer.png",id:2014},
+  {n:"Adrenaline Shot",p:600,img:"adrenaline-shot.png",id:2013},
+  {n:"Close Split Capsule",p:600,img:"close-split-capsule.png",id:2012},
+  {n:"Nutrient Radar",p:600,img:"nutrient-radar.png",id:2011},
+  {n:"Improved Mitosis",p:600,img:"improved-mitosis.png",id:2010},
+  {n:"Ghostly Spyglass",p:600,img:"ghostly-spyglass.png",id:2009},
+  {n:"Treasure Map",p:600,img:"treasure-map.png",id:2008},
+  {n:"Powerful Portal Glue",p:1000,img:"powerful-portal-glue.png",id:1654},
+  {n:"Extreme Rejoin Speed",p:600,img:"extreme-rejoin-speed.png",id:1646},
+  {n:"Superior Rejoin Speed",p:400,img:"superior-rejoin-speed.png",id:1645},
+  {n:"Greater Rejoin Speed",p:300,img:"greater-rejoin-speed.png",id:1644},
+  {n:"Bubble Gun",p:600,img:"bubble-gun.png",id:1494},
+  {n:"Anti Resilience Potion",p:400,img:"anti-resilience-potion.png",id:1150},
+  {n:"Anabolic Feed Potion",p:300,img:"anabolic-feed-potion.png",id:684},
+  {n:"Squeeze-o-mator",p:250,img:"squeeze-o-mator.png",id:668},
+  {n:"Red Virus Seed",p:600,img:"red-virus-seed.png",id:460},
+  {n:"Powerful Glue Launcher",p:400,img:"powerful-glue-launcher.png",id:457},
+  {n:"Mega Split",p:300,img:"mega-split.png",id:331},
+  {n:"Extreme Power Split",p:300,img:"extreme-power-split.png",id:329},
+  {n:"Superior Power Split",p:200,img:"superior-power-split.png",id:328},
+  {n:"Greater Power Split",p:150,img:"greater-power-split.png",id:327},
+  {n:"Rudimental Chainsaw",p:200,img:"rudimental-chainsaw.png",id:322},
+  {n:"Steady Chainsaw",p:250,img:"steady-chainsaw.png",id:321},
+  {n:"Powerful Chainsaw",p:500,img:"powerful-chainsaw.png",id:320},
+  {n:"Perfect Timewarp Machine",p:500,img:"perfect-timewarp-machine.png",id:277},
+  {n:"Precise Timewarp Machine",p:350,img:"precise-timewarp-machine.png",id:276},
+  {n:"Rough Timewarp Machine",p:250,img:"rough-timewarp-machine.png",id:275},
+  {n:"Superior Portal Gun",p:600,img:"superior-portal-gun.png",id:274},
+  {n:"Portal Gun",p:400,img:"portal-gun.png",id:272},
+  {n:"Minor Portal Gun",p:300,img:"minor-portal-gun.png",id:271},
+  {n:"Thor's Golden Hammer",p:500,img:"thors-golden-hammer.png",id:213},
+  {n:"Insane Dwarf Beer",p:500,img:"insane-dwarf-beer.png",id:210},
+  {n:"Powerful Nets Launcher",p:300,img:"powerful-nets-launcher.png",id:158},
+  {n:"Superior Petrifying Shoot",p:600,img:"superior-petrifying-shoot.png",id:156},
+  {n:"Superior Anticellular Shield",p:400,img:"superior-anticellular-shield.png",id:148},
+  {n:"Anticellular Shield",p:200,img:"anticellular-shield.png",id:147},
+  {n:"Superior Antiviral Shield",p:300,img:"superior-antiviral-shield.png",id:145},
+  {n:"Antiviral Shield",p:200,img:"antiviral-shield.png",id:144},
+  {n:"Mega Punch Device",p:450,img:"mega-punch-device.png",id:108},
+  {n:"Punch Device",p:200,img:"punch-device.png",id:107},
+  {n:"Superior Blink",p:600,img:"superior-blink.png",id:104},
+  {n:"Blink",p:300,img:"blink.png",id:103},
+  {n:"Superior Gravity Potion",p:200,img:"superior-gravity-potion.png",id:101},
+  {n:"Gravity Potion",p:120,img:"gravity-potion.png",id:100},
+  {n:"Super Glue Potion",p:360,img:"super-glue-potion.png",id:98},
+  {n:"Mythical Speed Potion",p:300,img:"mythical-speed-potion.png",id:97},
+  {n:"Major Speed Potion",p:150,img:"major-speed-potion.png",id:96},
+  {n:"Light Speed Potion",p:100,img:"light-speed-potion.png",id:95}
+];
+const SHOP_PACKS = {
+  510:1,8590:1,2147:20,2017:20,2016:20,2015:20,2014:20,2013:20,2012:20,2011:20,2010:20,2009:20,2008:20,
+  1654:3,1646:3,1645:3,1644:3,1494:20,1150:4,684:10,668:3,460:3,457:5,331:3,329:3,328:3,327:3,
+  322:5,321:5,320:5,277:1,276:1,275:1,274:5,272:4,271:3,213:5,210:5,158:5,156:3,148:5,147:4,
+  145:5,144:4,108:4,107:4,104:5,103:4,101:5,100:5,98:3,97:3,96:3,95:3
+};
+SHOP.forEach(item => { item.pack = SHOP_PACKS[item.id] || 1; });
+
+// ============ ESTADO ============
+let state = { accounts: [], plans: [], last: null, log: [] };
+let activePlan = 0;
+let selInv = 0;
+let selShop = 0;
+let autoScanStarted = false;
+const slotClock = Object.create(null);
+let buyState = null;
+
+// ============ UTILIDADES ============
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.display = "none"; }, 3000);
+}
+function potionImg(name) {
+  const clean = String(name || "").replace(/^\d+x\s*/, "").trim();
+  const i = POTIONS.indexOf(clean);
+  return i >= 0 ? "/sprites/" + POTE[i] : "";
+}
+const LAB_QTY = {
+  "Mythical Speed Potion": 3, "Superior Portal Glue": 3, "Speed Shot": 3,
+  "Speed Anticellular Shield": 3, "Gravity Speed Potion": 3,
+  "Powerful Chainsaw": 5, "Portal Shield Armor": 3,
+  "Legendary Speed Potion": 2, "Legendary Gravity Potion": 2,
+  "Legendary Blink": 2, "Super Glue Potion": 3,
+  "Superior Portal Gun": 3, "Anticellular Armor": 3,
+  "Superior Blink": 3, "Bubble Gun": 5,
+  "Antiviral Portal Gun": 3, "Superior Immunity Shield": 3,
+  "Superior Gravity Blink": 3
+};
+function cleanPotionName(name) { return String(name || "").replace(/^\d+x\s*/, "").trim(); }
+function basePotionQty(name) { return LAB_QTY[cleanPotionName(name)] || 0; }
+function normalizeHistoryEntry(entry) {
+  const item = entry && typeof entry === "object" ? { ...entry } : {};
+  item.name = cleanPotionName(item.name || "REWARD");
+  item.count = Math.max(0, Number(item.count || 0));
+  return item;
+}
+function accountMultiplier(account) {
+  const n = Number(account?.labMultiplier || 1);
+  return n >= 3 ? 3 : (n >= 2 ? 2 : 1);
+}
+function slotClockStart(account) {
+  const serverTime = Date.parse(account?.slotsScannedAt || "");
+  if (Number.isFinite(serverTime) && serverTime > 0) return serverTime;
+  const key = String(account?.deviceId || account?.name || "unknown");
+  if (!slotClock[key]) slotClock[key] = Date.now();
+  return slotClock[key];
+}
+function slotRemainingSeconds(slot, account) {
+  const initial = Math.max(0, Number(slot?.time || 0));
+  if (!initial) return 0;
+  const elapsed = Math.max(0, Math.floor((Date.now() - slotClockStart(account)) / 1000));
+  return Math.max(0, initial - elapsed);
+}
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds || 0));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return h + "h " + String(m).padStart(2, "0") + "m " + String(s).padStart(2, "0") + "s";
+}
+function effectiveSlotName(slot, account) {
+  const raw = cleanPotionName(slot?.name || "");
+  if (!raw || slot?.status === "locked" || slot?.craft === "locked") return raw;
+  const base = Number(String(slot?.name || "").match(/^(\d+)x\s*/)?.[1] || basePotionQty(raw) || 1);
+  const serverQty = Number(slot?.qty || 0);
+  const qty = Math.max(serverQty, base * accountMultiplier(account));
+  return qty + "x " + raw;
+}
+function rewardName(reward) {
+  if (!reward) return "REWARD";
+  const title = String(reward.title || reward.displayName || "").trim();
+  if (/^coins?$/i.test(title) || /^(coins?|coin)$/i.test(String(reward.type || ""))) return "COINS";
+  if (title && !/^tile[_-]?\d+$/i.test(title)) return title.replace(/%20/g, " ");
+  const sprite = String(reward.sprite || title).replace(/\.(png|jpg|jpeg)$/i, "").toLowerCase();
+  const bySprite = SHOP.find(item => item.img.replace(/\.[^.]+$/, "").toLowerCase() === sprite);
+  if (bySprite) return bySprite.n;
+  const tile = sprite.match(/^tile[_-]?(\d+)$/i);
+  if (tile) {
+    const byId = SHOP.find(item => item.id === Number(tile[1]));
+    if (byId) return byId.n;
+  }
+  return String(reward.type || "REWARD");
+}
+function rewardImg(reward) {
+  const name = rewardName(reward);
+  const item = SHOP.find(x => x.n.toLowerCase() === name.toLowerCase());
+  if (item) return "/sprites/" + item.img;
+  return potionImg(name);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  return r.json();
+}
+// ============ NAVEGACION ============
+function setSection(i) {
+  document.querySelectorAll(".navit").forEach((n, j) => n.classList.toggle("on", j === i));
+  $("secT").textContent = SEC_T[i];
+  $("secS").textContent = SEC_S[i];
+  const map = { 0: ["sec0", "sec0b", "sec0c"], 1: ["sec1"], 2: ["sec2"], 3: ["sec3"] };
+  for (const id of Object.values(map).flat()) {
+    const el = $(id);
+    if (el) el.style.display = "none";
+  }
+  for (const id of map[i]) {
+    const el = $(id);
+    if (el) el.style.display = "flex";
+  }
+}
+
+// ============ REFRESH GLOBAL ============
+let refreshBusy = false;
+async function refresh() {
+  if (refreshBusy) return;
+  refreshBusy = true;
+  try {
+    state = await api("/api/state");
+  } catch (e) {
+    toast("API error");
+    refreshBusy = false;
+    return;
+  }
+  refreshBusy = false;
+  if (selInv >= state.accounts.length) selInv = 0;
+  if (selShop >= state.accounts.length) selShop = 0;
+  renderPlans();
+  renderPlanDetail();
+  renderAssign();
+  renderInventory();
+  renderAccountLab();
+  renderHistory();
+  renderShop();
+
+  const acc = state.accounts[selInv];
+  $("coinsVal").textContent = acc && acc.coins != null ? Number(acc.coins).toLocaleString() : "-";
+  $("lastT").textContent = "last: " + (state.last ? state.last.replace("T", " ").slice(5, 19) : "-");
+  const logArr = state.log || [];
+  $("logL").textContent = logArr.length ? logArr[logArr.length - 1] : "No activity yet";
+  $("onlinePill").textContent = state.last ? "ONLINE" : "WAITING";
+  $("onlinePill").className = "pill" + (state.last ? "" : " off");
+  // Estas cifras siguen la tarjeta de estado del cliente de PC:
+  // stock = ingredientes del catálogo y brews = planes con LOOP activos.
+  $("stIn").textContent = "24";
+  $("stBr").textContent = state.plans.filter(p => p.loop).length || "-";
+  $("stRecipes").textContent = SHOP.length;
+  $("chAcc").textContent = state.accounts.length + " ACC";
+}
+
+// ============ PLANS ============
+function renderPlans() {
+  const el = $("plansL");
+  el.innerHTML = state.plans.map((p, i) => {
+    const cnt = state.accounts.filter(a => a.plan === p.name).length;
+    return '<div class="pr' + (i === activePlan ? " on" : "") + '" onclick="selectPlan(' + i + ')">' +
+      '<div class="r1"><span class="nm">' + esc(p.name) + '</span>' +
+      (p.autobuy ? '<span class="ab">AUTOBUY</span>' : "") +
+      '<span class="dt" style="background:' + ["#e5b64e","#48f1da","#aa8cff","#f3c85b"][i % 4] + '"></span></div>' +
+      '<div class="r2"><span class="ct">' + cnt + " assigned</span>" +
+      '<span class="rd' + (cnt > 0 ? " ok" : "") + '">' + (cnt > 0 ? "READY" : cnt + " MISSING") + '</span></div></div>';
+  }).join("") || '<div style="color:var(--faint);font-size:11px">No plans</div>';
+  $("planCt").textContent = state.plans.length;
+}
+function selectPlan(i) {
+  activePlan = i;
+  refresh();
+}
+
+// ============ PLAN DETAIL ============
+function renderPlanDetail() {
+  const p = state.plans[activePlan];
+  if (!p) return;
+  $("planN").textContent = "Plan // " + p.name;
+  $("asgPn").textContent = p.name;
+  $("tgAB").classList.toggle("on", !!p.autobuy);
+  $("tgLP").classList.toggle("on", !!p.loop);
+  const slots = p.slots || [];
+  const cnt = state.accounts.filter(a => a.plan === p.name).length;
+  $("asgMsg").textContent = cnt + " accounts will receive this loadout";
+  $("slGrid").innerHTML = slots.map((s, i) => {
+    const img = potionImg(s);
+    return '<div class="slot"><div class="h"><span class="sn">SLOT ' + String(i + 1).padStart(2, "0") +
+      '</span><span class="arm">ARMED</span></div><div class="im">' +
+      (img ? '<img src="' + img + '" onerror="this.remove()">' : "") +
+      '</div><div class="pn">' + esc(s || "") + '</div>' +
+      '<div class="slotpick">' + (img ? '<img src="' + img + '" onerror="this.remove()">' : '<span style="width:24px"></span>') +
+      '<select onchange="setSlot(' + i + ',this.value)">' +
+      '<option value=""' + (!s ? " selected" : "") + '>-- VACIO --</option>' +
+      POTIONS.map(pn => '<option' + (pn === s ? " selected" : "") + '>' + esc(pn) + '</option>').join("") +
+      '</select></div><div class="cp">PLAN-BOUND POTION</div></div>';
+  }).join("");
+  $("lvSt").textContent = state.last ? "SYNCED" : "OFFLINE";
+  $("lvSt").style.color = state.last ? "var(--teal)" : "var(--muted)";
+  $("lvRows").innerHTML = '<div style="color:var(--faint);font-size:10px">Cloud cron procesa 1 cuenta/min. Revisa el log del bot.</div>';
+}
+function createPlan() {
+  const name = prompt("Plan name:", "New Plan");
+  if (!name) return;
+  api("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "create", name }) })
+    .then(d => d.ok ? (toast("Plan created"), refresh()) : toast(d.error || "Could not create plan"));
+}
+function renamePlan() {
+  const p = state.plans[activePlan];
+  if (!p) return;
+  const name = prompt("New plan name:", p.name);
+  if (!name || name === p.name) return;
+  api("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "rename", index: activePlan, name }) })
+    .then(d => d.ok ? (toast("Plan renamed"), refresh()) : toast(d.error || "Could not rename plan"));
+}
+function deletePlan() {
+  const p = state.plans[activePlan];
+  if (!p || !confirm("Delete plan " + p.name + "?")) return;
+  api("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delete", index: activePlan }) })
+    .then(d => { if (!d.ok) return toast(d.error || "Could not delete plan"); activePlan = Math.max(0, activePlan - 1); toast("Plan deleted"); refresh(); });
+}
+function setSlot(i, val) {
+  api("/api/setplan", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ index: activePlan, slot: i, potion: val })
+  }).then(() => { toast("Slot actualizado"); refresh(); });
+}
+function togglePlan(which) {
+  const p = state.plans[activePlan];
+  api("/api/setplan", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ index: activePlan, key: which, value: !p[which] })
+  }).then(() => { toast(which.toUpperCase() + (p[which] ? " OFF" : " ON")); refresh(); });
+}
+
+// ============ ASSIGN ============
+function renderAssign() {
+  const el = $("asgL");
+  const p = state.plans[activePlan];
+  if (!p) return;
+  el.innerHTML = state.accounts.map(a => {
+    const on = a.plan === p.name;
+    const lp = state.plans.find(x => x.name === a.plan);
+    const mult = a.labMultiplier || 1;
+    return '<div class="ar' + (on ? " on" : "") + '" onclick="toggleAssign(\'' + esc(a.deviceId) + '\')">' +
+      '<div class="ck">' + (on ? "V" : "") + '</div>' +
+      '<div class="ai"><div class="nm">' + esc(a.name) + '</div><div class="pl">' + (a.plan || "Unassigned") + '</div></div>' +
+      '<select class="mlt" onclick="event.stopPropagation()" onchange="setMult(\'' + esc(a.deviceId) + '\',this.value)">' +
+      '<option' + (mult === 1 ? " selected" : "") + '>x1 LAB</option>' +
+      '<option' + (mult === 2 ? " selected" : "") + '>x2 LAB</option>' +
+      '<option' + (mult === 3 ? " selected" : "") + '>x3 LAB</option></select>' +
+      (lp && lp.loop ? '<span class="lbx">LOOP</span>' : "") + '</div>';
+  }).join("") || '<div style="color:var(--faint);font-size:11px">No accounts</div>';
+  $("asgCt").textContent = state.accounts.filter(a => a.plan === p.name).length + "/" + state.accounts.length;
+  $("allN").textContent = state.accounts.length;
+  $("accFt").textContent = state.accounts.length + " accounts loaded // plan routing active";
+}
+function toggleAssign(did) {
+  const p = state.plans[activePlan];
+  const a = state.accounts.find(x => x.deviceId === did);
+  // desasigna si la cuenta no pertenece al plan activo (evita re-asignarla
+  // accidentalmente al plan activo cuando el plan mostrado es otro)
+  const target = (a.plan === p.name) ? "Unassigned" : p.name;
+  api("/api/setplan", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId: did, plan: target })
+  }).then(() => { toast("Action -> " + target); refresh(); });
+}
+function setMult(did, v) {
+  api("/api/setmultiplier", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId: did, multiplier: parseInt(v[1]) })
+  }).then(() => { toast("Multiplier " + v); refresh(); });
+}
+// ============ INVENTORY ============
+function renderInventory() {
+  const el = $("invL");
+  el.innerHTML = state.accounts.map((a, i) => {
+    const coins = a.coins != null ? Number(a.coins).toLocaleString() + " C" : "--";
+    const li = (a.labSlots != null) ? (a.labSlots + " lab slots // " + (a.lockedSlots || 0) + " locked") : "OFFLINE";
+    return '<div class="ir' + (i === selInv ? " on" : "") + '" onclick="selInv=' + i + ';refresh()">' +
+      '<div class="x">' + (i === selInv ? "V" : "") + '</div>' +
+      '<div style="flex:1;min-width:0"><div class="nm">' + esc(a.name) + '</div><div class="sb">' + esc(li) + '</div></div>' +
+      '<div class="co">' + coins + '</div></div>';
+  }).join("") || '<div style="color:var(--faint);font-size:11px">No accounts</div>';
+  $("qwCt").textContent = state.accounts.length + " QW";
+}
+
+// ============ ACCOUNT LABS ============
+function renderAccountLab() {
+  const el = $("alLabs");
+  $("alTitle").textContent = "Account Labs";
+  if (!state.accounts.length) { el.innerHTML = '<div style="color:var(--faint);font-size:11px">No accounts</div>'; return; }
+  el.innerHTML = state.accounts.map(a => {
+    const mult = accountMultiplier(a);
+    const slots = Array.isArray(a.slots) ? a.slots : [];
+    const scannedTs = a.slotsScannedAt ? Date.parse(a.slotsScannedAt) : 0;
+    const isFresh = scannedTs > 0 && (Date.now() - scannedTs) < 10 * 60 * 1000;
+    const detectedLocked = slots.filter(s => String(s?.status || s?.craft || "").toLowerCase() === "locked").length;
+    const openSlots = a.labSlots != null ? Number(a.labSlots) : Math.max(0, slots.length - detectedLocked);
+    const lockedSlots = a.lockedSlots != null ? Number(a.lockedSlots) : detectedLocked;
+    let h = '<div class="lv" style="margin-top:0;margin-bottom:8px">' +
+      '<div class="lh"><span class="ll">' + esc(a.name || "?") + '</span>' +
+      '<span style="display:flex;align-items:center;gap:6px"><span class="ls">' + openSlots + ' SLOTS // ' + lockedSlots + ' LOCKED</span>' +
+      '<span class="pill" style="color:' + (mult > 1 ? 'var(--gold)' : 'var(--teal)') + '">x' + mult + ' LAB</span>' +
+      '<span class="ls" style="color:' + (isFresh ? 'var(--teal)' : 'var(--danger)') + '">' + (isFresh ? "ONLINE" : "SIN SCAN") + '</span></span></div>';
+    if (slots.length) {
+      slots.forEach(s => {
+        const stt = String(s.craft || s.status || "").toLowerCase();
+        const nm = s.name || "";
+        const locked = stt === "locked";
+        const crafting = stt === "crafting";
+        const remaining = crafting ? slotRemainingSeconds(s, a) : 0;
+        const activeCraft = crafting && remaining > 0;
+        const cls = locked ? "lk" : (activeCraft ? "cr" : "rd");
+        const img = (crafting || (nm && !locked)) ? potionImg(nm) : "";
+        const display = activeCraft ? effectiveSlotName(s, a) : (locked ? "LOCKED " + (s.price || 0) + " C" : "READY");
+        h += '<div class="asr ' + cls + '"><span class="sl">S' + s.index + '</span>' +
+          (img ? '<img src="' + img + '" style="width:20px;height:20px;object-fit:contain" onerror="this.remove()">' : '<span style="width:20px"></span>') +
+          '<span class="pr">' + esc(display) + '</span>' +
+          (activeCraft ? '<span class="tm">' + formatDuration(remaining) + '</span>' : '<span class="ct">' + (locked ? "L" : "READY") + '</span>') + '</div>';
+      });
+    } else {
+      h += '<div style="padding:8px 0;color:var(--faint);font-size:10px">' +
+        (a.labSlots != null ? (a.labSlots + " lab slots // " + (a.lockedSlots || 0) + " locked") : "Pulsa SCAN LABS para ver el laboratorio") + '</div>';
+    }
+    return h + '</div>';
+  }).join("");
+}
+async function scanLabs() {
+  toast("Escaneando labs 0/" + state.accounts.length + "...");
+  let completed = 0;
+  for (let i = 0; i < state.accounts.length; i++) {
+    const a = state.accounts[i];
+    let ok = false;
+    // reintento: si el cron del minuto coincide, la 1a peticion puede fallar
+    for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+      try {
+        const d = await api("/api/lab?did=" + encodeURIComponent(a.deviceId));
+        if (d.ok) {
+          a.slots = d.slots;
+          a.name = d.name;
+          a.ok = true;
+          a.slotsScannedAt = d.scannedAt || new Date().toISOString();
+          if (d.coins != null) a.coins = d.coins;
+          ok = true;
+        }
+      } catch (e) {}
+      if (!ok && attempt === 0) await new Promise(r => setTimeout(r, 1200));
+    }
+    if (!ok) a.ok = false;
+    completed++;
+    toast("Escaneando labs " + completed + "/" + state.accounts.length + "...");
+    await new Promise(r => setTimeout(r, 900));
+  }
+  toast("Scan completo");
+  refresh();
+}
+
+// ============ CRAFT HISTORY ============
+function renderHistory() {
+  const el = $("chL");
+  el.innerHTML = state.accounts.map(a => {
+    const ch = (a.craftHistory || []).map(normalizeHistoryEntry);
+    let em = "";
+    if (ch.length) ch.forEach(h => {
+      const img = potionImg(h.name);
+      em += '<span class="pi">' + (img ? '<img src="' + img + '" onerror="this.remove()">' : "") +
+        '<span class="qi">' + Number(h.count || 0) + "x</span><span class=\"pnm\">" + esc(cleanPotionName(h.name)) + '</span></span>';
+    });
+    const total = ch.reduce((s, h) => s + Number(h.count || 0), 0);
+    return '<div class="chc"><div style="display:flex;align-items:center;gap:12px">' +
+      '<div style="width:42px;height:42px;background:var(--surface);border:1px solid var(--borderSoft);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:900;color:var(--teal)">QW</div>' +
+      '<div><div class="cch">' + total + ' POTIONS CRAFTED</div>' +
+      '<div class="anm">' + esc(a.name) + '</div>' +
+      (a.lastCraftAt ? '<div class="lc">LAST CRAFT // ' + a.lastCraftAt.replace("T", " ").slice(0, 16) + '</div>' : '<div class="lc">NO CRAFTS RECORDED YET</div>') +
+      '<div class="pw">' + em + '</div></div></div></div>';
+  }).join("") || '<div style="color:var(--faint);font-size:11px;padding:10px">No activity</div>';
+}
+
+// ============ SHOP ============
+function renderShop() {
+  $("shL").innerHTML = SHOP.map(i => '<div class="si">' +
+    '<div class="ic"><img src="/sprites/' + i.img + '" onerror="this.remove()"></div>' +
+    '<span class="nm">' + esc(i.n) + '</span>' +
+    '<span class="pr">' + i.p + ' C</span>' +
+    '<button class="buy" onclick="buyItem(' + i.id + ')">BUY</button></div>').join("");
+  $("shAcc").innerHTML = state.accounts.map((a, i) => {
+    const c = a.coins != null ? Number(a.coins).toLocaleString() + " C" : "--";
+    return '<div class="ir' + (i === selShop ? " on" : "") + '" onclick="selShop=' + i + ';renderShop()">' +
+      '<div class="x">' + (i === selShop ? "V" : "") + '</div>' +
+      '<div style="flex:1;min-width:0"><div class="nm">' + esc(a.name) + '</div></div>' +
+      '<div class="co">' + c + '</div></div>';
+  }).join("");
+}
+function buyItem(itemId) {
+  const item = SHOP.find(x => x.id === Number(itemId));
+  const a = state.accounts[selShop];
+  if (!a) { toast("Selecciona una cuenta"); return; }
+  if (!item) { toast("Item no encontrado"); return; }
+  buyState = { item, account: a, packs: 1 };
+  $("buyTitle").textContent = "BUY " + item.n;
+  $("buyModal").style.display = "flex";
+  updateBuyDialog();
+}
+function updateBuyDialog() {
+  if (!buyState) return;
+  const item = buyState.item;
+  const packs = buyState.packs;
+  $("buyPacks").value = packs;
+  $("buyPackInfo").textContent = "Each pack = " + item.pack + "x " + item.n + " // " + item.p.toLocaleString() + " C per pack";
+  $("buyTotal").textContent = "TOTAL: " + (packs * item.pack) + "x " + item.n + " // " + (packs * item.p).toLocaleString() + " C";
+}
+function syncBuyPacks(value) {
+  if (!buyState) return;
+  buyState.packs = Math.min(40, Math.max(1, parseInt(value, 10) || 1));
+  updateBuyDialog();
+}
+function changeBuyPacks(delta) {
+  if (!buyState) return;
+  buyState.packs = Math.min(40, Math.max(1, buyState.packs + delta));
+  updateBuyDialog();
+}
+function confirmBuy() {
+  if (!buyState) return;
+  const item = buyState.item;
+  const a = buyState.account;
+  const packs = Math.min(40, Math.max(1, Number(buyState.packs) || 1));
+  closeBuy();
+  toast("Comprando " + packs + " paquete(s) de " + item.n + " en " + a.name + "...");
+  api("/api/buy", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId: a.deviceId, itemId: item.id, packs })
+  }).then(d => {
+    if (d.ok) {
+      toast("Comprados " + (d.bought || packs) + "/" + packs + " paquetes de " + item.n + " en " + d.name + " (balance: " + Number(d.coins).toLocaleString() + " C)");
+      refresh();
+    } else {
+      toast("Fallo: " + (d.error || "error"));
+    }
+  }).catch(() => toast("error de red"));
+}
+function closeBuy() {
+  $("buyModal").style.display = "none";
+  buyState = null;
+}
+
+// ============ ACCIONES ============
+async function doCycle() {
+  const p = state.plans[activePlan];
+  if (!p) { toast("Selecciona un plan"); return; }
+  const assigned = state.accounts.filter(a => a.plan === p.name).length;
+  if (!assigned) { toast("Ninguna cuenta asignada a " + p.name); return; }
+  toast("Crafting " + p.name + " en " + assigned + " cuentas...");
+  const results = [];
+  // el DO procesa 1 cuenta por llamada; encadenar hasta completar todas (done:true)
+  for (let i = 0; i < assigned; i++) {
+    try {
+      const d = await api("/api/craft", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: p.name })
+      });
+      (d.results || []).forEach(r => {
+        results.push(r.name + ": " + ((r.log || []).filter(l => l.includes("PICK") || l.includes("CRAFT") || l.includes("AUTOBUY")).join(" | ") || (r.error || "sin trabajo")));
+      });
+      if (d.done) break;
+      await new Promise(r => setTimeout(r, 2000));
+    } catch (e) {
+      toast("Error de red en CRAFT");
+      break;
+    }
+  }
+  toast("Craft terminado: " + results.join("; ").slice(0, 200));
+  refresh();
+}
+// REFRESH LAB: escanea el laboratorio real de las cuentas del plan activo
+async function refreshLabs() {
+  const p = state.plans[activePlan];
+  if (!p) { toast("Selecciona un plan"); return; }
+  const targets = state.accounts.filter(a => a.plan === p.name);
+  if (!targets.length) { toast("Ninguna cuenta asignada a " + p.name); return; }
+  toast("Refrescando lab de " + targets.length + " cuentas...");
+  let done = 0;
+  for (const a of targets) {
+    try {
+      const d = await api("/api/lab?did=" + encodeURIComponent(a.deviceId));
+      if (d.ok) {
+        a.slots = d.slots;
+        a.name = d.name;
+        if (d.coins != null) a.coins = d.coins;
+      }
+    } catch (e) {}
+    done++;
+    toast("Lab " + done + "/" + targets.length + " actualizado");
+    await new Promise(r => setTimeout(r, 700));
+  }
+  toast("Lab actualizado");
+  refresh();
+}
+async function openChests() {
+  const n = state.accounts.length;
+  if (!n) { toast("Sin cuentas"); return; }
+  toast("Abriendo cofres de " + n + " cuentas...");
+  const modal = $("chestModal");
+  const body = $("chestBody");
+  modal.style.display = "flex";
+  body.innerHTML = '<div style="color:var(--teal);font-size:12px">Abriendo cofres...</div>';
+  const out = [];
+  // el server abre 1 cofre por llamada; encadenar hasta done:true
+  for (let i = 0; i <= n; i++) {
+    try {
+      const d = await api("/api/openall");
+      (d.results || []).forEach(x => out.push(x));
+      body.innerHTML = renderChestResults(out);
+      toast("Cofres: " + out.length + "/" + n + " procesados");
+      if (d.done) break;
+      await new Promise(r => setTimeout(r, 150));
+    } catch (e) {
+      out.push({ name: "?", ok: false, error: "error de conexión", rewards: [] });
+      break;
+    }
+  }
+  body.innerHTML = renderChestResults(out);
+  toast("Cofres terminados");
+  refresh();
+}
+function renderChestResults(results) {
+  if (!results.length) return '<div style="color:var(--gold);font-size:12px;font-weight:900;padding:12px">NO HAY COFRES DISPONIBLES</div>';
+  return results.map(x => {
+    const rewards = (x.rewards || []).map(r => '<span class="chestReward">' +
+      (rewardImg(r) ? '<img src="' + rewardImg(r) + '" onerror="this.remove()">' : '') +
+      '<span>' + esc(rewardName(r)) + ' x' + Number(r.amount || 1) + '</span></span>').join("");
+    const noChest = !x.ok && /no chest|chest available|no chest appeared/i.test(String(x.error || ""));
+    return '<div class="mr" style="align-items:flex-start"><span class="' + (x.ok ? "ok" : "no") + '">' + (x.ok ? "ABIERTO" : (noChest ? "SIN CHEST" : "ERROR")) + '</span>' +
+      '<span class="who">' + esc(x.name || "?") + '</span><span class="rw">' +
+      (x.ok ? (rewards || 'Sin recompensas') : (noChest ? 'NO HAY COFRES DISPONIBLES' : esc(x.error || "Error desconocido"))) +
+      (x.coins != null ? '<br><span style="color:var(--gold);font-weight:900">BALANCE: ' + Number(x.coins).toLocaleString() + ' C</span>' : '') +
+      '</span></div>';
+  }).join("");
+}
+function closeChest() {
+  $("chestModal").style.display = "none";
+}
+
+// ============ INIT ============
+setSection(0);
+refresh();
+// refresh cada 60s (antes 20s): reduce los reads del KV (free tier 100k/dia)
+// y el countdown de los slots ya se actualiza localmente cada 1s.
+setInterval(refresh, 60000);
+setInterval(() => { if (state.accounts.length) renderAccountLab(); }, 1000);
+</script>
+</body>
+</html>

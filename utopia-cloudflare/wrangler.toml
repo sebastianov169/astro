@@ -1,0 +1,27 @@
+# wrangler.toml - Cloudflare Workers
+name = "utopia-bot"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Assets estaticos (sprites de pociones)
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Durable Object: bot 24/7 con estado persistente
+[[durable_objects.bindings]]
+name = "UTOPIA_BOT"
+class_name = "UtopiaBotDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UtopiaBotDO"]
+
+# Cron: cada minuto ejecuta el ciclo completo
+[triggers]
+crons = ["* * * * *"]
+
+# KV para estado (cuentas, planes, pem, log)
+[[kv_namespaces]]
+binding = "UTOPIA_KV"
+id = "a47b3b6c3b8a4bd69689179f2f7e3daa"
