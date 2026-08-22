@@ -498,8 +498,9 @@ Bytes m2xcTcpEnc(const Bytes &data, std::uint32_t seed, std::uint32_t ts)
     std::uint32_t uVar10 = (seed - 0x59 + std::uint32_t(iVar15)) & 0xFF;
     std::uint32_t uVar20 = (std::uint32_t(iVar15) * 0x45d9f3bu ^ so ^ seed ^ 0x6d2b79f5u) & M;
     std::uint32_t uVar21 = 0;
+    if (data.size() > 1000000) return Bytes();
     Bytes out;
-    out.reserve(data.size());
+    try { out.reserve(data.size()); } catch (...) { return Bytes(); }
     for (int i = 0; i < iVar15; ++i) {
         uVar10 &= 0xFF;
         uVar20 = (std::uint32_t(i) + uVar10 + uVar20) & M;
@@ -519,12 +520,13 @@ Bytes m2xcTcpEnc(const Bytes &data, std::uint32_t seed, std::uint32_t ts)
 Bytes m2xcTcpDec(const Bytes &data, std::uint32_t seed, std::uint32_t ts)
 {
     std::int32_t iVar15 = std::int32_t(data.size());
+    if (data.size() > 1000000) return Bytes();
     std::uint32_t so = (ts - 100) & M;
     std::uint32_t uVar10 = (seed - 0x59 + std::uint32_t(iVar15)) & 0xFF;
     std::uint32_t uVar20 = (std::uint32_t(iVar15) * 0x45d9f3bu ^ so ^ seed ^ 0x6d2b79f5u) & M;
     std::uint32_t uVar21 = 0;
     Bytes out;
-    out.reserve(data.size());
+    try { out.reserve(data.size()); } catch (...) { return Bytes(); }
     for (int i = 0; i < iVar15; ++i) {
         uVar10 &= 0xFF;
         uVar20 = (std::uint32_t(i) + uVar10 + uVar20) & M;
@@ -599,7 +601,12 @@ Bytes interleaveInv(const Bytes &data, int half, int parity)
         qWarning("tcp::interleaveInv: n%%4==2 (%zu) frame corrupto - copia sin interleave", data.size());
         return data;
     }
-    std::vector<std::uint8_t> orig(data.size(), 0);
+    if (data.size() > 1000000) {
+        qWarning("tcp::interleaveInv: size %zu too large - descartando", data.size());
+        return Bytes();
+    }
+    std::vector<std::uint8_t> orig;
+    try { orig.assign(data.size(), 0); } catch (...) { return Bytes(); }
     for (int i = 0; i < half; ++i) {
         bool swap = ((i & 1) != parity);
         int pa, pb;
@@ -1174,28 +1181,6 @@ void FarmWorker::configure(const QString &deviceId, const QString &pemPath, int 
 void FarmWorker::stop()
 {
     m_stop = true;
-    // 2026-08-10 (bug reportado por el usuario: "al darle stop se cierra la
-    // app"): abort() se llamaba DESDE EL HILO DE LA UI (stopFarm -> stop)
-    // pero el QTcpSocket vive en el hilo del worker. abort() cross-thread
-    // toca los QSocketNotifiers internos -> "QSocketNotifier: cannot be
-    // enabled or disabled from another thread" + AV 0xC0000005 en
-    // Qt6Network.dll (astro_crash.txt, familia de crashes al parar).
-    // Fix: cerrar el DESCRIPTOR del socket a nivel de OS. shutdown() hace
-    // que el waitForReadyRead pendiente del worker retorne al instante
-    // (EOF/error) y es SEGURO desde otro hilo (no toca el objeto Qt).
-    // v43 (crash refresh 00:49, rax=110): usar SOLO el fd publicado por el
-    // worker bajo el mutex — leer m_activeSock->socketDescriptor() desde el
-    // GUI thread era una llamada virtual cross-thread sobre un objeto que el
-    // worker puede estar destruyendo (reconnect) = UB (vtable NULL).
-    QMutexLocker lk(&m_socketMutex);
-    const qintptr fd = m_activeFd;
-    if (fd != -1) {
-#ifdef Q_OS_WIN
-        ::shutdown(SOCKET(fd), SD_BOTH);
-#else
-        ::shutdown(int(fd), SHUT_RDWR);
-#endif
-    }
 }
 
 bool FarmWorker::recvFrame(QTcpSocket *sock, int timeoutMs, int *length, int *flag, Bytes *payload)
@@ -1236,7 +1221,15 @@ bool FarmWorker::recvFrame(QTcpSocket *sock, int timeoutMs, int *length, int *fl
         return false;
     }
     payload->clear();
-    payload->reserve(*length);
+    try {
+        payload->reserve(*length);
+    } catch (const std::exception &e) {
+        qWarning("recvFrame: reserve %d failed: %s - descartando", *length, e.what());
+        return false;
+    } catch (...) {
+        qWarning("recvFrame: reserve %d failed unknown", *length);
+        return false;
+    }
     while (int(payload->size()) < *length) {
         if (sock->bytesAvailable() > 0) {
             QByteArray chunk = sock->read(*length - int(payload->size()));
@@ -2495,6 +2488,10 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
         // v97v/v97ac: 6s — el [20] del binario llega ~1s tras el READY, pero
         // el matchmaking a veces tarda 5-8s (el 4s del v97ab cortaba intentos
         // validos y bajo el farm a +4314 vs +7150 del v97aa).
+        // v97ee revertido (el usuario identifico el bug real: al parar el app las
+        // cuentas quedan en partida vivas y al dar RUN el [20] no llega porque
+        // la cuenta ya estaba spawneada antes de abrir el app — no era el
+        // matchmaking). Restaurar el timeout de 6s del CTF publico.
         const qint64 spawnTimeoutMs = m_useRoom ? 90000 : 6000;
         if (readySent && readyT0.isValid() && readyT0.elapsed() > spawnTimeoutMs) {
             if (err) *err = "SPAWNED [20] timeout (matchmaking lento)";
@@ -2971,21 +2968,29 @@ void FarmWorker::refreshXp()
         emit stateChanged("Refresh (read-only): farm activo - solo lecturas HTTP, sin tocar la sesion TCP");
         qlonglong cexpRO = -1, expRO = -1;
         int lvlRO = 0;
+        // v97ed (bug: el +XP no aparecia / no coincidia con la barra en cuentas
+        // con farm): el delta se emitia FIJO en 0 y la baseline se pisaba con el
+        // cexp actual. Semantica del usuario: primer refresh = CEXP actual - CEXP
+        // al RUN; los siguientes = desde el refresh anterior.
+        qlonglong deltaRO = 0;
         try {
             QJsonObject invRO = httpApi(&net, sk, magic, apiJson({{"do", "inventory"}, {"slot", 5}}));
             if (readGemXp(invRO, &cexpRO, &expRO) && (cexpRO >= 0 || expRO >= 0)) {
-                { QMutexLocker lk(&m_sessionMutex); m_gemExpInicial = expRO; m_gemCexpInicial = cexpRO; }
+                QMutexLocker lk(&m_sessionMutex);
+                if (m_gemCexpInicial >= 0 && cexpRO >= m_gemCexpInicial)
+                    deltaRO = cexpRO - m_gemCexpInicial;
+                m_gemExpInicial = expRO; m_gemCexpInicial = cexpRO;
             }
         } catch (...) {}
         try {
             QJsonObject ueRO = httpApi(&net, sk, magic, apiJson({{"do", "updateexp"}}));
             lvlRO = ueRO.value("data").toObject().value("lvl").toInt();
         } catch (...) {}
-        emit debugLog(QString("Refresh read-only: cexp=%1 exp=%2 lvl=%3 (sin kick, farm intacto)")
-                          .arg(cexpRO).arg(expRO).arg(lvlRO));
-        emit stateChanged(QString("Refresh: XP %1/%2 (read-only, farm intacto)")
-                              .arg(cexpRO >= 0 ? cexpRO : 0).arg(expRO >= 0 ? expRO : 0));
-        emit xpRefreshDone(true, cexpRO, expRO, 0, lvlRO, QString());
+        emit debugLog(QString("Refresh read-only: cexp=%1 exp=%2 delta=%3 lvl=%4 (sin kick, farm intacto)")
+                          .arg(cexpRO).arg(expRO).arg(deltaRO).arg(lvlRO));
+        emit stateChanged(QString("Refresh: XP %1/%2 (+%3, read-only, farm intacto)")
+                              .arg(cexpRO >= 0 ? cexpRO : 0).arg(expRO >= 0 ? expRO : 0).arg(deltaRO));
+        emit xpRefreshDone(true, cexpRO, expRO, deltaRO, lvlRO, QString());
         return;
     }
     // uid + chattoken del pre-flow (loginifneeded/chattoken), como el run: el spawn
@@ -3279,7 +3284,7 @@ void FarmWorker::refreshXp()
             const QString ctfHost = ctfServer.section(':', 0, 0);
             const int ctfPort = ctfServer.contains(':') ? ctfServer.section(':', 1, 1).toInt() : 443;
             bool ctfSpawned = false;
-            for (int attempt = 0; attempt < 2 && !ctfSpawned && !aborted(); ++attempt) {
+            for (int attempt = 0; attempt < 1 && !ctfSpawned && !aborted(); ++attempt) {
                 emit stateChanged(QString("Refresh: final CTF spawn (attempt %1/2)...").arg(attempt + 1));
                 QTcpSocket sock;
                 sock.connectToHost(resolveHostMutexed(ctfHost), ctfPort);
@@ -3320,6 +3325,11 @@ void FarmWorker::refreshXp()
 
 void FarmWorker::run()
 {
+    // v97eg (crash 2026-08-18 22:18: 0x40000015 en libstdc++-6.dll = excepcion
+    // C++ escapando del hilo -> std::terminate mataba TODO el app): envolver el
+    // cuerpo del run() para que un throw (frame/crypto/HTTP) termine el worker
+    // SOLO (finishedOk false con la causa) y no el proceso completo.
+    try {
     // Bucle de sesiones: cada iteracion es un intento de sesion con objetos
     // nuevos (sock/net/state/ircSock...). El goto original re-inicializaba esos
     // objetos SIN destruirlos (fuga de sockets/FDs por reconexion); con continue
@@ -3381,7 +3391,7 @@ void FarmWorker::run()
     // 6.10.3 (AV 0x1CE857/0x1C8A4E en los logins de los farms). Si la sesion
     // reutilizada falla (server la invalido), los retry paths de abajo la
     // limpian y el siguiente intento hace login fresco.
-    const bool reuseSession = !m_sk.isEmpty() && !m_magic.isEmpty();
+    const bool reuseSession = false; // PG2 fresh login (v97es: normal invalida magic, OG no)
     if (reuseSession) {
         sk = m_sk;
         magic = m_magic;
@@ -3465,8 +3475,8 @@ void FarmWorker::run()
                 fail("Sesion invalida (15 intentos seguidos): loginifneeded vacio");
                 return;
             }
-            emit stateChanged(QString("Sesion invalida (loginifneeded vacio), login fresco en ~5s (%1/15)...").arg(consecutiveSessionFailures));
-            QThread::msleep(1000 + reconnectJitterMs() + (qHash(m_deviceId) % 2000));
+            emit stateChanged(QString("Sesion invalida (loginifneeded vacio), login fresco en ~1s (%1/15)...").arg(consecutiveSessionFailures));
+            QThread::msleep(1000);
             continue;
         }
         // el nombre real de la cuenta sale del loginifneeded: data.username,
@@ -3631,11 +3641,22 @@ try {
     if (m_gemItem > 0 && !m_gemEquipped) {
         bool equipped = false;
         QJsonObject lastInvCheck;
+        bool hadValidResponse = false; // v97eb: al menos un inventory HTTP VALIDO
         for (int attempt = 0; attempt < 3 && !equipped; ++attempt) {
             try {
                 emit debugLog(QString("EQUIP check (attempt %1/3): inventory slot=5").arg(attempt + 1));
                 QJsonObject invCheck = apiCall(&net, sk, magic, apiJson({{"do", "inventory"}, {"slot", 5}}));
                 lastInvCheck = invCheck;
+                // v97eb (bug: "gema no esta en el inventory" con la gema presente):
+                // una respuesta VACIA (HTTP timeout/error -> httpPostTcp devuelve {})
+                // NO es "inventory vacio" — es un fallo transitorio de red. Reintentar
+                // sin contarlo como inventario verificado.
+                if (invCheck.isEmpty() || !invCheck.contains(QStringLiteral("data"))) {
+                    emit debugLog(QString("EQUIP check: inventory HTTP fallido (respuesta vacia), reintentando (attempt %1/3)").arg(attempt + 1));
+                    QThread::msleep(1200);
+                    continue;
+                }
+                hadValidResponse = true;
                 int current = gemCurrent(invCheck);
                 // guardar la exp total de la gema la primera vez (base del delta del refresh)
                 if (m_gemExpInicial < 0) {
@@ -3677,11 +3698,18 @@ try {
             // de farmear — si la gema guardada no esta en slot 5, el farm debe
             // parar (NO usar la gema actual, que puede ser una LVL25 prohibida).
             bool gemExists = false;
-            const QJsonArray items = lastInvCheck.value("data").toObject().value("items").toArray();
-            for (const auto &iv : items) {
-                if (iv.toObject().value("id").toInt() == m_gemItem) { gemExists = true; break; }
+            // v97eb: solo concluir "la gema no esta" si tuvimos AL MENOS una
+            // respuesta VALIDA del inventory; si todas fueron vacias (HTTP
+            // caido/transitorio) tratar como fallo de red, no de gema.
+            if (hadValidResponse) {
+                const QJsonArray items = lastInvCheck.value("data").toObject().value("items").toArray();
+                for (const auto &iv : items) {
+                    if (iv.toObject().value("id").toInt() == m_gemItem) { gemExists = true; break; }
+                }
+            } else {
+                emit debugLog("EQUIP check: NINGUNA respuesta valida del inventory (3 intentos) - tratando como fallo de red transitorio");
             }
-            if (!gemExists) {
+            if (!gemExists && hadValidResponse) {
                 fail(QString("Gem %1 is not in the inventory (slot 5). Not spawning.").arg(m_gemItem));
                 return;
             }
@@ -3790,7 +3818,7 @@ try {
                 host = invHost;
             }
         }
-        for (int attempt = 0; attempt < 2 && !spawned && !m_stop && !aborted(); ++attempt) {
+        for (int attempt = 0; attempt < 1 && !spawned && !m_stop && !aborted(); ++attempt) {
             if (attempt > 0) {
                 emit stateChanged(QString("Retry TCP (attempt %1/3)...").arg(attempt + 1));
                 // Stagger FIJO por cuenta: tras el fin de partida CTF global
@@ -3917,15 +3945,27 @@ try {
             fail(spawnErr.isEmpty() ? QString("TCP connect failed: %1 (no response after retries)").arg(server) : spawnErr);
             return;
         }
-        emit stateChanged(QString("Spawn failed, retrying session in ~5s (%1/15)...")
-                              .arg(consecutiveSessionFailures));
+        // v97ep (diagnostico 2026-08-20: Olise/Action atrapados 13 min en
+        // retries de spawn contra s18388:993 saturado): backoff PROGRESIVO en
+        // vez del 4-7s fijo — 1-5 fallos ~5s, 6-10 ~15s, 11+ ~60s. Asi el
+        // martilleo del matchmaking no mantiene saturado al server y la cuenta
+        // espera a que se recupere en vez de quemar el intervalo de farmeo.
+        int spawnRetryMs;
+        if (consecutiveSessionFailures <= 5)
+            spawnRetryMs = 4000 + QRandomGenerator::global()->bounded(3000);
+        else if (consecutiveSessionFailures <= 10)
+            spawnRetryMs = 12000 + QRandomGenerator::global()->bounded(6000);
+        else
+            spawnRetryMs = 60000;
+        emit stateChanged(QString("Spawn failed, retrying session in ~%1s (%2/15)...")
+                              .arg(spawnRetryMs / 1000).arg(consecutiveSessionFailures));
         // jitter + franja por cuenta (2026-08-10, test #39): el 4-7s fijo
         // hacia que las 10 cuentas reintentaran la sesion en la misma ventana;
         // el offset del device las separa 0-11s como el backoff de reconexion.
         {
             QMutexLocker lk(&m_sessionMutex);
             const int stg = (qHash(m_deviceId) % 12) * 1000;
-            QThread::msleep(4000 + QRandomGenerator::global()->bounded(3000) + stg);
+            QThread::msleep(spawnRetryMs + stg);
         }
         continue;
     }
@@ -4914,6 +4954,25 @@ try {
 
     if (reconnect)
         continue; // nueva sesion: objetos frescos, region/sesion conservadas
+    // v97ef (pedido del usuario: "el STOP debe desconectar las cuentas como
+    // hace el autorefresh para materializar el xp"): si el farm estaba en
+    // partida, sacar la cuenta con el MISMO kick HTTP del refresh
+    // (connect i+1 gm=0 + gamemode mode=0). Sin esto, al parar el app la
+    // cuenta quedaba VIVA en partida y al darle RUN el [20] nunca llegaba
+    // (la cuenta ya estaba spawneada -> "conectando infinitamente").
+    if (!sk.isEmpty() && !magic.isEmpty()) {
+        try {
+            int ciKick;
+            { QMutexLocker lk(&m_sessionMutex); m_connectIndex += 1; ciKick = m_connectIndex; }
+            httpApi(&net, sk, magic, apiJson({{"do", "connect"}, {"invite", false}, {"defered", true},
+                                                {"i", ciKick}, {"gm", 0}, {"retrying", false}, {"locale", "es_CO"}}));
+            httpApi(&net, sk, magic, apiJson({{"do", "gamemode"}, {"index", 1}, {"mode", 0}}));
+            emit stateChanged(QString("STOP: cuenta sacada de la partida (kick FFA i=%1)").arg(ciKick));
+            emit debugLog(QString("STOP kick: connect gm=0 + gamemode mode=0 (i=%1)").arg(ciKick));
+        } catch (...) {
+            emit debugLog("STOP kick HTTP fallo (se ignora, el socket ya se cierra)");
+        }
+    }
     sock->disconnectFromHost();
     {
         QMutexLocker lk(&m_socketMutex);
@@ -4927,6 +4986,16 @@ try {
     return;
     }
     emit finishedOk(false, "stopped");
+    } catch (const std::exception &e) {
+        const QString why = QString::fromUtf8(e.what());
+        emit debugLog(QString("Worker run() exception (se termina este worker): %1").arg(why));
+        emit stateChanged("Worker crash (recuperado): " + why.left(120));
+        emit finishedOk(false, "worker exception: " + why.left(120));
+    } catch (...) {
+        emit debugLog("Worker run() exception desconocida (se termina este worker)");
+        emit stateChanged("Worker crash (recuperado): excepcion desconocida");
+        emit finishedOk(false, "worker exception");
+    }
 }
 
 

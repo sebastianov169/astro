@@ -252,6 +252,7 @@ private:
     // del spawn la usan: TODAS las vistas coinciden con el inventario.
     void applyAccountCache(const QVariantMap &am);
     QString resolveDeviceId() const;
+    QVector<int> gemPriorityForDevice(const QString &deviceId) const;
     QString shortDevice(const QString &d) const;
     void rebuildActiveSessions();
     void rebuildAggregate(); // suma XP/muertes/spawned de TODOS los farms
