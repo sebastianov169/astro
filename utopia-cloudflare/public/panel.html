@@ -582,6 +582,11 @@ function slotClockStart(account) {
   return slotClock[key];
 }
 function slotRemainingSeconds(slot, account) {
+  // v97ev: usar endAt absoluto (guardado por updateLabSummary) si existe;
+  // slot.time ya viene decreciendo del server, no descontar dos veces
+  if (slot?.endAt && Number(slot.endAt) > 0) {
+    return Math.max(0, Math.floor((Number(slot.endAt) - Date.now()) / 1000));
+  }
   const initial = Math.max(0, Number(slot?.time || 0));
   if (!initial) return 0;
   const elapsed = Math.max(0, Math.floor((Date.now() - slotClockStart(account)) / 1000));
@@ -649,7 +654,7 @@ async function refresh() {
   if (refreshBusy) return;
   refreshBusy = true;
   try {
-    state = await api("/api/state");
+    state = await api("/api/state?t=" + Date.now(), {cache: "no-store"});
   } catch (e) {
     toast("API error");
     refreshBusy = false;
@@ -839,6 +844,7 @@ function renderAccountLab() {
         const locked = stt === "locked";
         const crafting = stt === "crafting";
         const remaining = crafting ? slotRemainingSeconds(s, a) : 0;
+        // como PC: contador en 0 -> mostrar READY; con endAt real nunca da falso 0
         const activeCraft = crafting && remaining > 0;
         const cls = locked ? "lk" : (activeCraft ? "cr" : "rd");
         const img = (crafting || (nm && !locked)) ? potionImg(nm) : "";
@@ -1073,9 +1079,10 @@ function closeChest() {
 // ============ INIT ============
 setSection(0);
 refresh();
-// refresh cada 60s (antes 20s): reduce los reads del KV (free tier 100k/dia)
-// y el countdown de los slots ya se actualiza localmente cada 1s.
-setInterval(refresh, 60000);
+// refresh cada 5 min (antes 60s): reduce aun mas los reads del KV (free tier
+// 100k/dia; Cloudflare aviso 50% del limite). El countdown de los slots ya se
+// actualiza localmente cada 1s y el boton Manual refresca bajo demanda.
+setInterval(refresh, 30000);
 setInterval(() => { if (state.accounts.length) renderAccountLab(); }, 1000);
 </script>
 </body>
