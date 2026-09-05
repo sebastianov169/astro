@@ -614,9 +614,19 @@ FarmController::FarmController(QObject *parent) : QObject(parent)
         // arranca). El switch del usuario queda en m_autoRefreshWanted.
         if (arEnabled && (farmRunning() || !m_farms.isEmpty()))
             m_autoRefreshTimer->start();
+        // v97ez: region forzada persistida (dashboard: server caido, ej. central_america)
+        const QString savedRegion = s.value(QStringLiteral("farmRegion"), QString()).toString();
+        if (!savedRegion.isEmpty())
+            FarmWorker::setGlobalRegion(savedRegion);
     }
     // prioridad de gemas persistida (QSettings, misma org)
     loadGemPriority();
+    // v97fa: autobuy por gema (toggle on/off en el priority)
+    loadGemAutobuy();
+    {
+        const QSettings s2(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+        m_gemAutobuyEnabled = s2.value(QStringLiteral("gemAutobuyEnabled"), true).toBool();
+    }
     // Seleccion de cuentas persistida (casillas del workflow)
     loadFarmSelection();
     // 2026-08-10: auto-buy de la tienda por color (boton "Auto buy" en la
@@ -1043,6 +1053,21 @@ void FarmController::setAutoBuyX2(bool on)
             m_farms.at(i).worker->setAutoBuyX2(on);
     }
     emit autoBuyX2Changed();
+}
+
+// v97fa: master switch del gem autobuy (evita logins cada 10 min cuando ya
+// terminaron de farmear). Persistido en QSettings.
+void FarmController::setGemAutobuyEnabled(bool on)
+{
+    if (m_gemAutobuyEnabled == on)
+        return;
+    m_gemAutobuyEnabled = on;
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    s.setValue(QStringLiteral("gemAutobuyEnabled"), on);
+    s.sync();
+    appendLog(on ? QStringLiteral("Gem autobuy: ACTIVADO")
+                 : QStringLiteral("Gem autobuy: DESACTIVADO (sin logins de autobuy)"));
+    emit gemAutobuyEnabledChanged();
 }
 
 void FarmController::setDeviceId(const QString &id)
@@ -2152,6 +2177,58 @@ bool FarmController::isAutoBuyColor(int colorIdx) const
     return m_autoBuyColors.contains(colorIdx);
 }
 
+// v97fa: autobuy por gema dentro del priority (toggle on/off por fila).
+// device -> set de indices de color 0-19, persistido como QVariantMap en
+// QSettings ("gemAutobuyAll"). En cada autorefresh: si la gema falta en
+// inventario (rota por limite de XP) y esta en el shop con saldo, se compra
+// ANTES del re-equip por prioridad.
+void FarmController::loadGemAutobuy()
+{
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    const QVariantMap all = s.value(QStringLiteral("gemAutobuyAll")).toMap();
+    m_gemAutobuy.clear();
+    for (auto it = all.constBegin(); it != all.constEnd(); ++it) {
+        QSet<int> set;
+        for (const auto &sv : it.value().toList()) {
+            const int idx = sv.toInt();
+            if (idx >= 0 && idx < 20)
+                set.insert(idx);
+        }
+        if (!set.isEmpty())
+            m_gemAutobuy.insert(it.key(), set);
+    }
+    emit gemAutobuyChanged();
+}
+
+void FarmController::setGemAutobuy(const QString &device, int colorIdx, bool on)
+{
+    if (device.isEmpty() || colorIdx < 0 || colorIdx >= 20)
+        return;
+    if (on)
+        m_gemAutobuy[device].insert(colorIdx);
+    else {
+        m_gemAutobuy[device].remove(colorIdx);
+        if (m_gemAutobuy[device].isEmpty())
+            m_gemAutobuy.remove(device);
+    }
+    QVariantMap all;
+    for (auto it = m_gemAutobuy.constBegin(); it != m_gemAutobuy.constEnd(); ++it) {
+        QVariantList list;
+        for (int idx : it.value())
+            list.append(idx);
+        all.insert(it.key(), list);
+    }
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    s.setValue(QStringLiteral("gemAutobuyAll"), all);
+    s.sync();
+    emit gemAutobuyChanged();
+}
+
+bool FarmController::isGemAutobuy(const QString &device, int colorIdx) const
+{
+    return m_gemAutobuy.value(device).contains(colorIdx);
+}
+
 // Proximo reinicio de la tienda en HORA LOCAL del usuario: Colombia es UTC-5
 // sin DST, asi que 19:00/01:00 COT = 00:00/06:00 UTC. La compra va 1 min
 // despues. Devuelve texto legible para el QML (e.g. "02:01" hora local).
@@ -2437,6 +2514,9 @@ void FarmController::spawn()
         // cantidad de mids por IP. Volver a PEM unica por device (verificado).
         const QString pemPath = fakeTpmPathForDevice(deviceId);
         const QVector<int> devicePriority = gemPriorityForDevice(deviceId);
+        // v97fa: snapshot thread-safe del autobuy por gema (master switch + set).
+        // El login thread compra las faltantes antes de elegir gema de spawn.
+        const QSet<int> deviceAutobuy = m_gemAutobuyEnabled ? m_gemAutobuy.value(deviceId) : QSet<int>();
         QThread *thread = new QThread(this);
         // rastrea el thread de login: shutdown()/dtor lo esperan antes de salir
         m_spawnThreads.append(thread);
@@ -2444,7 +2524,7 @@ void FarmController::spawn()
         // nace en el hilo del worker (afinidad correcta). DirectConnection: el
         // started se emite EN el hilo nuevo, asi el lambda corre ahi (un receiver
         // QThread con AutoConnection correria en el hilo creador de la GUI).
-        connect(thread, &QThread::started, thread, [this, thread, deviceId, pemPath, k, localId, devicePriority, preps, done, total]() {
+        connect(thread, &QThread::started, thread, [this, thread, deviceId, pemPath, k, localId, devicePriority, deviceAutobuy, preps, done, total]() {
             // slot propio de este hilo (indice k): sin carrera con los demas
             SpawnPrep &prep = (*preps)[k];
             prep.deviceId = deviceId;
@@ -2682,6 +2762,64 @@ void FarmController::spawn()
                     writeLogFile(QStringLiteral("[DBG] spawnLogin %1 sin gema (auto-buy DESACTIVADO)")
                                      .arg(logName(deviceId, prep.realName)));
                 }
+                // v97fa: GEM AUTOBUY en RUN — si una gema con autobuy falta en
+                // inventario (limite de XP) y esta en el shop con saldo, se
+                // compra aqui para que el spawn (prioridad, abajo) la use.
+                if (!deviceAutobuy.isEmpty() && !prep.gems.isEmpty()) {
+                    // v97fa: login() deja lastCoins en 0 — cargar el balance
+                    // con fetchAccountName antes de chequear precios.
+                    local.fetchAccountName();
+                    // v97fa: las lvl 25 NO cuentan como owned (no farmeables) —
+                    // si solo tiene el color en lvl 25 igual hay que comprarla.
+                    QSet<int> ownedColors;
+                    for (const GemInfo &g : prep.gems) {
+                        if (g.itemLevel >= 25)
+                            continue;
+                        ownedColors.insert(gemColorIndexByName(g.name));
+                    }
+                    const QVector<StoreItem> shopItems = local.fetchStore(10);
+                    bool boughtAny = false;
+                    qlonglong coinsLeft = local.lastCoins(); // v97fa: saldo acumulado entre compras
+                    for (int ci : devicePriority) {
+                        if (!deviceAutobuy.contains(ci) || ownedColors.contains(ci))
+                            continue;
+                        for (const StoreItem &it : shopItems) {
+                            if (gemColorIndexByName(it.name) != ci)
+                                continue;
+                            if (it.owned || !it.purchasable)
+                                continue;
+                            if (it.price > 0 && coinsLeft < it.price) {
+                                writeLogFile(QStringLiteral("[RUN] %1 autobuy sin saldo para %2 (%3 coins)")
+                                                 .arg(logName(deviceId, prep.realName)).arg(it.name).arg(it.price));
+                                break;
+                            }
+                            const QJsonObject bresp = local.apiCall(
+                                QStringLiteral("{\"do\":\"buy\",\"item\":%1}").arg(it.id));
+                            const bool okBuy = bresp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                            writeLogFile(QStringLiteral("[RUN] %1 autobuy %2 %3: %4")
+                                             .arg(logName(deviceId, prep.realName)).arg(it.name)
+                                             .arg(okBuy ? QStringLiteral("COMPRADA") : QStringLiteral("fallo"))
+                                             .arg(bresp.value(QStringLiteral("message")).toString().left(40)));
+                            QMetaObject::invokeMethod(this, [this, deviceId, it, okBuy]() {
+                                appendLog(QStringLiteral("[RUN] %1 autobuy: %2 %3")
+                                              .arg(logName(deviceId, QString())).arg(it.name)
+                                              .arg(okBuy ? QStringLiteral("comprada") : QStringLiteral("fallo")));
+                            }, Qt::QueuedConnection);
+                            if (okBuy) {
+                                ownedColors.insert(ci);
+                                coinsLeft -= it.price;
+                                boughtAny = true;
+                            }
+                            break;
+                        }
+                    }
+                    // re-leer inventario para que el spawn vea la gema comprada
+                    if (boughtAny) {
+                        QThread::msleep(700);
+                        prep.gems = local.fetchInventory(5);
+                        prep.equippedId = local.lastCurrentItem();
+                    }
+                }
                 prep.equippedId = local.lastCurrentItem(); // data.current real
                 prep.realName = local.fetchAccountName();  // loginifneeded
                 prep.coins = local.lastCoins();
@@ -2894,12 +3032,19 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
                                    int tpmGroup)
 {
     // v97ek: dedup leak 28 farms — si ya hay un farm vivo para este device, no duplicar
+    // v97ew: zombie = worker detenido por el refresh (m_stop) o worker ya nulo
+    // (QPointer muerto) con thread vivo en un backoff largo. Ambos se limpian
+    // y se respawnea: sin esto, Cross quedaba skipeado autorefresh tras autorefresh.
     for (int i = m_farms.size() - 1; i >= 0; --i) {
         if (m_farms.at(i).deviceId == deviceId) {
-            if (m_farms.at(i).thread && m_farms.at(i).thread->isRunning()) {
+            FarmWorker *w = m_farms.at(i).worker.data();
+            const bool zombie = !w || w->isStopped();
+            if (m_farms.at(i).thread && m_farms.at(i).thread->isRunning() && !zombie) {
                 appendLog(QStringLiteral("Spawn skip %1: ya existe farm vivo (%2 handles)").arg(accountName).arg(m_farms.size()));
                 return;
             }
+            if (m_farms.at(i).thread)
+                m_farms.at(i).thread->requestInterruption();
             m_farms.removeAt(i);
         }
     }
@@ -3758,6 +3903,26 @@ void FarmController::refreshSelectedFarmAccounts()
             continue;
         devices.append(farm.deviceId);
     }
+    // v97fa: cuentas con autobuy pero SIN farm corriendo (gema rota por limite
+    // de XP -> sin farm -> el auto-refresh las excluiria y el autobuy nunca
+    // dispararia: deadlock sin gemas -> sin farm -> sin refresh -> sin buy).
+    // Se incluyen para login+buy+equip (+respawn si se compro algo).
+    // Master switch apagado = no se incluyen (evita logins cada 10 min).
+    for (const auto &v : m_farmSelection) {
+        const QString dev = v.toString();
+        if (dev.isEmpty() || devices.contains(dev))
+            continue;
+        bool alive = false;
+        for (const FarmHandle &farm : m_farms) {
+            if (farm.deviceId == dev && farm.worker && farm.thread && farm.thread->isRunning()) {
+                alive = true;
+                break;
+            }
+        }
+        if (alive || !m_gemAutobuyEnabled || m_gemAutobuy.value(dev).isEmpty())
+            continue;
+        devices.append(dev);
+    }
     refreshAccounts(devices, true);
 }
 
@@ -3887,6 +4052,7 @@ void FarmController::maybeStartRefreshAllLogin()
         QString name;
         QVector<int> priority;
         QVariantList cachedGems;
+        QSet<int> autobuy; // v97fa: snapshot thread-safe del toggle por gema
     };
     QVector<RefreshTarget> targets;
     for (const auto &v : m_accounts) {
@@ -3898,6 +4064,7 @@ void FarmController::maybeStartRefreshAllLogin()
         t.name = m.value(QStringLiteral("name")).toString();
         t.priority = gemPriorityForDevice(t.deviceId);
         t.cachedGems = m.value(QStringLiteral("gems")).toList();
+        t.autobuy = m_gemAutobuy.value(t.deviceId);
         targets.append(t);
     }
     const int total = targets.size();
@@ -3912,7 +4079,8 @@ void FarmController::maybeStartRefreshAllLogin()
 
     QThread *thread = new QThread(this);
     m_refreshAllThread = thread;
-    connect(thread, &QThread::started, thread, [this, thread, targets, total]() {
+    const bool abOn = m_gemAutobuyEnabled; // v97fa: snapshot thread-safe del master switch
+    connect(thread, &QThread::started, thread, [this, thread, targets, total, abOn]() {
         for (int k = 0; k < total; ++k) {
             if (m_abortingRefreshAll.load())
                 break;
@@ -3928,6 +4096,8 @@ void FarmController::maybeStartRefreshAllLogin()
                 int equippedId = -1;     // v41: data.current del inventario (la EQUIPADA real)
                 QString repairLog;   // v39: resultado del auto-repair
                 QString reequipLog;  // v39: resultado del re-equip por prioridad
+                QString autobuyLog;  // v97fa: resultado del gem autobuy (compras del refresh)
+                bool autobuyBought = false; // v97fa: se compro >=1 gema -> re-spawnear aunque no tenia farm
                 int x2State = -1;    // v44: x2 detectado/comrado en el refresh
                 QString x2Reason;
             } out;
@@ -3943,6 +4113,57 @@ void FarmController::maybeStartRefreshAllLogin()
                     out.ok = true;
                     out.name = local.fetchAccountName();
                     out.coins = local.lastCoins();
+                    // v97fa: GEM AUTOBUY por gema (toggle en el priority). Si una
+                    // gema con autobuy FALTA en inventario (rota por limite de
+                    // XP -> desaparece) y esta en el shop con saldo, comprarla
+                    // ANTES del fetchInventory para que el re-equip la vea.
+                    const QSet<int> abSet = abOn ? targets.at(k).autobuy : QSet<int>();
+                    if (!abSet.isEmpty()) {
+                        const QVector<GemInfo> inv0 = local.fetchInventory(5);
+                    if (!inv0.isEmpty()) {
+                        // v97fa: las lvl 25 NO cuentan como owned (no farmeables).
+                        QSet<int> ownedColors;
+                        for (const GemInfo &g : inv0) {
+                            if (g.itemLevel >= 25)
+                                continue;
+                            ownedColors.insert(gemColorIndexByName(g.name));
+                        }
+                            const QVector<StoreItem> shop = local.fetchStore(10);
+                            const QVector<int> &prio = targets.at(k).priority;
+                            qlonglong coinsLeft = local.lastCoins(); // v97fa: saldo acumulado entre compras
+                            for (int ci : prio) {
+                                if (!abSet.contains(ci) || ownedColors.contains(ci))
+                                    continue;
+                                for (const StoreItem &it : shop) {
+                                    if (gemColorIndexByName(it.name) != ci)
+                                        continue;
+                                    if (it.owned || !it.purchasable)
+                                        continue;
+                                    if (it.price > 0 && coinsLeft < it.price) {
+                                        out.autobuyLog += QStringLiteral("sin saldo para %1 (%2 coins); ")
+                                                              .arg(it.name).arg(it.price);
+                                        break;
+                                    }
+                                    const QJsonObject resp = local.apiCall(
+                                        QStringLiteral("{\"do\":\"buy\",\"item\":%1}").arg(it.id));
+                                    const bool okBuy = resp.value(QStringLiteral("result")).toString() == QLatin1String("ok");
+                                    if (okBuy) {
+                                        ownedColors.insert(ci);
+                                        coinsLeft -= it.price;
+                                        out.autobuyBought = true;
+                                        out.autobuyLog += QStringLiteral("comprada %1; ").arg(it.name);
+                                    } else {
+                                        out.autobuyLog += QStringLiteral("buy %1 fallo: %2; ")
+                                                              .arg(it.name)
+                                                              .arg(resp.value(QStringLiteral("message")).toString().left(40));
+                                    }
+                                    break;
+                                }
+                            }
+                            if (!out.autobuyLog.isEmpty())
+                                out.autobuyLog.chop(2);
+                        }
+                    }
                     out.gems = local.fetchInventory(5);
                     out.equippedId = local.lastCurrentItem();
                     if (out.gems.isEmpty()) {
@@ -4190,6 +4411,22 @@ void FarmController::maybeStartRefreshAllLogin()
                                                    ? shortDevice(deviceId)
                                                    : am.value(QStringLiteral("name")).toString(),
                                                o.reequipLog));
+                        if (!o.autobuyLog.isEmpty())
+                            appendLog(QStringLiteral("[Refresh] %1: autobuy: %2")
+                                          .arg(am.value(QStringLiteral("name")).toString().isEmpty()
+                                                   ? shortDevice(deviceId)
+                                                   : am.value(QStringLiteral("name")).toString(),
+                                               o.autobuyLog));
+                        // v97fa: si se compro >=1 gema y la cuenta no tenia farm
+                        // (era autobuy-only), agregarla al respawn para que farmee
+                        // con la gema nueva. Sin compra no se toca (respeta stops).
+                        if (o.autobuyBought && !m_refreshRespawnDevices.contains(deviceId)) {
+                            m_refreshRespawnDevices.append(deviceId);
+                            appendLog(QStringLiteral("[Refresh] %1: autobuy -> re-spawneando con gema nueva")
+                                          .arg(am.value(QStringLiteral("name")).toString().isEmpty()
+                                                   ? shortDevice(deviceId)
+                                                   : am.value(QStringLiteral("name")).toString()));
+                        }
                     }
                     m_accounts[i] = am;
                     break;
@@ -4434,6 +4671,34 @@ void FarmController::configureAutoRefresh(bool enabled, int intervalSeconds)
     s.setValue(QStringLiteral("autoRefreshEnabled"), enabled);
     s.setValue(QStringLiteral("autoRefreshInterval"), secs);
     emit autoRefreshChanged();
+}
+
+// ===================== FARM REGION (v97ez) =====================
+
+void FarmController::setFarmRegion(const QString &region)
+{
+    QString r = region.trimmed().toLower();
+    if (r == QStringLiteral("auto") || r == QStringLiteral("default"))
+        r.clear();
+    // validar contra las regiones conocidas (evitar typos que dejan todo sin server)
+    static const QStringList valid = {QStringLiteral("central_america"), QStringLiteral("south_america"),
+                                      QStringLiteral("europe"), QStringLiteral("australia")};
+    if (!r.isEmpty() && !valid.contains(r)) {
+        emit toastMessage(QStringLiteral("Region invalida: %1 (uso auto)").arg(region));
+        r.clear();
+    }
+    FarmWorker::setGlobalRegion(r);
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    s.setValue(QStringLiteral("farmRegion"), r);
+    appendLog(r.isEmpty() ? QStringLiteral("Region del farm: auto (central_america default)")
+                          : QStringLiteral("Region del farm forzada: %1").arg(r));
+    emit toastMessage(r.isEmpty() ? QStringLiteral("Region: auto (default)")
+                                  : QStringLiteral("Region forzada: %1").arg(r));
+}
+
+QString FarmController::farmRegion() const
+{
+    return FarmWorker::globalRegion();
 }
 
 // ===================== THEME =====================

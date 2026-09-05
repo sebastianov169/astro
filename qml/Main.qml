@@ -126,6 +126,11 @@ ApplicationWindow {
         return 0
     }
 
+    // Region del farm forzada en el dashboard (v97ez)
+    function farmRegion() {
+        return farm.farmRegion()
+    }
+
     // Indice de la cuenta activa (device === farm.deviceId) para el selector.
     // Devuelve -1 si la cuenta activa no esta en farm.accounts.
     function activeAccountIndex() {
@@ -239,6 +244,7 @@ ApplicationWindow {
         function onToastMessage(msg) { root.toast(msg) }
         function onGemsChanged() { root.syncGems() }
         function onGemPriorityChanged() { root.syncPriority() }
+        function onGemAutobuyChanged() { root.syncPriority() }
         function onQwsLoadingChanged() {
             if (!farm.qwsLoading && root.qwsOpen)
                 root.qwsOpen = false
@@ -858,6 +864,29 @@ ApplicationWindow {
                         }
                         Item { Layout.fillWidth: true }
                         RowLayout { spacing: 10
+                            SmallCaption { text: "REGION"; Layout.preferredWidth: 44 }
+                            Repeater {
+                                model: ["auto", "central_america", "south_america", "europe", "australia"]
+                                Rectangle {
+                                    width: 22; height: 22; radius: 11
+                                    color: root.farmRegion() === modelData ? colors.mint : colors.surface3
+                                    border.color: root.farmRegion() === modelData ? colors.text : colors.borderSoft
+                                    border.width: 2
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                    ToolTip.visible: regionDotHover.hovered
+                                    ToolTip.text: modelData
+                                    ToolTip.delay: 300
+                                    MouseArea {
+                                        id: regionDotHover
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: { farm.setFarmRegion(modelData); root.toast("Region: " + modelData) }
+                                    }
+                                }
+                            }
+                            LabelText { text: root.farmRegion() === "" ? "auto (central_america)" : root.farmRegion(); font.pixelSize: 10; color: colors.muted }
+                        }
+                        RowLayout { spacing: 10
                             SmallCaption { text: "THEME"; Layout.preferredWidth: 38 }
                             Repeater {
                                 model: ["midnight", "ocean", "neon", "forest", "sunset", "dark"]
@@ -920,6 +949,36 @@ ApplicationWindow {
                                 // se emitia tras el start -> STOP muerto.
                                 enabled: farm.farmRunning || farm.spawning || farm.activeSessions.length > 0
                                 onClicked: { farm.stopFarm(); root.toast("Farm stopped") }
+                            }
+                            // v97fa: master switch del gem autobuy (general, dashboard).
+                            // OFF = el RUN y los autorefresh no hacen logins de autobuy.
+                            Button {
+                                id: gemAbMaster
+                                text: farm.gemAutobuyEnabled ? "AUTOBUY ON" : "AUTOBUY OFF"
+                                Layout.preferredWidth: 110
+                                Layout.preferredHeight: 34
+                                font.pixelSize: 10
+                                font.weight: Font.DemiBold
+                                checkable: true
+                                checked: farm.gemAutobuyEnabled
+                                ToolTip.visible: gemAbMasterHover.hovered
+                                ToolTip.text: farm.gemAutobuyEnabled ? "Autobuy activo: RUN y autorefresh compran gemas faltantes" : "Autobuy apagado: sin compras ni logins extra"
+                                ToolTip.delay: 400
+                                HoverHandler { id: gemAbMasterHover }
+                                background: Rectangle {
+                                    radius: 4
+                                    color: gemAbMaster.checked ? colors.green : colors.surface3
+                                    border.color: gemAbMaster.checked ? colors.green : colors.faint
+                                    border.width: 1
+                                }
+                                contentItem: Text {
+                                    text: gemAbMaster.text
+                                    color: gemAbMaster.checked ? "#0a0f0a" : colors.text
+                                    font: gemAbMaster.font
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                onClicked: { farm.setGemAutobuyEnabled(gemAbMaster.checked); root.toast(gemAbMaster.checked ? "Gem autobuy ON" : "Gem autobuy OFF") }
                             }
                         }
                     }
@@ -1983,19 +2042,18 @@ ApplicationWindow {
                             LabelText { text: (prioRow.index + 1).toString().padStart(2, "0"); color: colors.faint; font.pixelSize: 11; Layout.preferredWidth: 34 }
                             GemSprite { sprite: modelData.sprite; iconSize: 32 }
                             LabelText { text: modelData.name; font.pixelSize: 13; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                            // 2026-08-10: boton "Auto buy" por color — marca el
-                            // color para comprarlo en la tienda 1 min despues de
-                            // cada rotacion (19:00/01:00 hora Colombia = 00:00/
-                            // 06:00 UTC, compra a las 00:01/06:01 UTC).
+                            // v97fa: toggle autobuy POR GEMA (on/off) para la cuenta
+                            // activa. En cada autorefresh: si la gema falta en
+                            // inventario (limite de XP) y esta en el shop, se compra.
                             Button {
                                 id: autoBuyBtn
-                                text: farm.isAutoBuyColor(modelData.id) ? "AUTO BUY ON" : "AUTO BUY"
+                                text: farm.isGemAutobuy(farm.deviceId, modelData.id) ? "AUTO BUY ON" : "AUTO BUY"
                                 Layout.preferredWidth: 88
                                 Layout.preferredHeight: 24
                                 font.pixelSize: 9
                                 font.weight: Font.DemiBold
                                 checkable: true
-                                checked: farm.isAutoBuyColor(modelData.id)
+                                checked: farm.isGemAutobuy(farm.deviceId, modelData.id)
                                 background: Rectangle {
                                     radius: 4
                                     color: autoBuyBtn.checked ? colors.green : colors.surface3
@@ -2013,7 +2071,7 @@ ApplicationWindow {
                                     // checkable:true ya invierte checked al
                                     // click; pasar el estado NUEVO directo (el
                                     // viejo invertia 2 veces -> estado al reves)
-                                    farm.toggleAutoBuyColor(modelData.id, autoBuyBtn.checked)
+                                    farm.setGemAutobuy(farm.deviceId, modelData.id, autoBuyBtn.checked)
                                 }
                             }
                             RowLayout { Layout.preferredWidth: 64; spacing: 4; z: 2

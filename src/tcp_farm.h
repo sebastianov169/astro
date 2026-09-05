@@ -134,6 +134,11 @@ public:
     explicit FarmWorker(QObject *parent = nullptr);
     ~FarmWorker() override;
 
+    // v97ez: region forzada desde el dashboard (server caido, ej. central_america):
+    // override global para TODAS las cuentas. Vacio = comportamiento default.
+    static void setGlobalRegion(const QString &region);
+    static QString globalRegion();
+
     void configure(const QString &deviceId, const QString &pemPath, int gemItem);
     // Lista de prioridad de gemas (ids de color 0-19, orden de farmeo): si la
     // gema actual esta rota (durability 0 y sin repair), el worker cambia a la
@@ -233,6 +238,9 @@ public:
     // reconectando a la vez.
     void setSpawnDeadlineMs(int ms) { m_spawnDeadlineMs = ms; }
     void stop();
+    // v97ew: el dedup del spawn necesita saber si el worker fue detenido por el
+    // refresh (thread vivo en backoff de 60s pero con m_stop=true = zombie)
+    bool isStopped() const { return m_stop.load(); }
 
 public slots:
     void run();

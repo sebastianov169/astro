@@ -30,6 +30,7 @@ class FarmController : public QObject
     Q_PROPERTY(bool debugEnabled READ debugEnabled WRITE setDebugEnabled NOTIFY debugEnabledChanged)
     Q_PROPERTY(bool autoRepair READ autoRepair WRITE setAutoRepair NOTIFY autoRepairChanged)
     Q_PROPERTY(bool autoBuyX2 READ autoBuyX2 WRITE setAutoBuyX2 NOTIFY autoBuyX2Changed)
+    Q_PROPERTY(bool gemAutobuyEnabled READ gemAutobuyEnabled WRITE setGemAutobuyEnabled NOTIFY gemAutobuyEnabledChanged)
     Q_PROPERTY(bool fetching READ fetching NOTIFY busyChanged)
     Q_PROPERTY(QString deviceId READ deviceId WRITE setDeviceId NOTIFY deviceIdChanged)
     Q_PROPERTY(QString accountText READ accountText NOTIFY accountTextChanged)
@@ -89,6 +90,7 @@ public:
     bool debugEnabled() const { return m_debugEnabled; }
     bool autoRepair() const { return m_autoRepair; }
     bool autoBuyX2() const { return m_autoBuyX2; }
+    bool gemAutobuyEnabled() const { return m_gemAutobuyEnabled; }
     bool fetching() const { return m_fetching; }
     QString deviceId() const { return m_deviceId; }
     QString accountText() const { return m_accountText; }
@@ -131,6 +133,7 @@ public slots:
     void setDebugEnabled(bool on);
     void setAutoRepair(bool on);
     void setAutoBuyX2(bool on);
+    void setGemAutobuyEnabled(bool on); // v97fa: master switch del gem autobuy
     void setDeviceId(const QString &id);
     void fetchGems();                 // login + inventory (thread propio)
     void fetchAllGems();              // login HTTP + inventory de TODAS las cuentas guardadas (thread propio)
@@ -164,7 +167,10 @@ public slots:
     void respawnDevices(const QStringList &devices);          // re-spawn tras el refresh
     void maybeRespawnAfterRefresh();                          // v43: poll del respawn post-login
     Q_INVOKABLE void configureAutoRefresh(bool enabled, int intervalSeconds); // timer auto-refresh (intervalo >= 10s)
-    // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
+    // v97ez: region forzada desde el dashboard (server caido, ej. central_america).
+    // "auto" = comportamiento default. Persistida en QSettings y aplicada a TODOS los farms.
+    Q_INVOKABLE void setFarmRegion(const QString &region);
+    Q_INVOKABLE QString farmRegion() const;    // 2026-08-10 (pedido del usuario: "detecta el x2 de las gemas para TODAS
     // las cuentas guardadas"): login secuencial de cada cuenta (aunque no
     // farmee) + lectura del inventario de consumibles (slots 3 y 4) +
     // deteccion del "Double Gem XP" (id=8590) con durability>0. El resultado
@@ -198,6 +204,9 @@ public slots:
     // (00:01/06:01 UTC) las gemas del color marcado que esten a la venta.
     Q_INVOKABLE void toggleAutoBuyColor(int colorIdx, bool on); // boton "Auto buy" por color (persistido)
     Q_INVOKABLE bool isAutoBuyColor(int colorIdx) const;        // estado del boton para el QML
+    Q_INVOKABLE void setGemAutobuy(const QString &device, int colorIdx, bool on); // toggle autobuy por gema (priority)
+    Q_INVOKABLE bool isGemAutobuy(const QString &device, int colorIdx) const;     // estado del toggle para el QML
+    void loadGemAutobuy(); // QSettings -> m_gemAutobuy (arranque)
     Q_INVOKABLE QString nextStoreBuyTime() const;               // proximo reinicio de tienda en hora local
 
 signals:
@@ -209,6 +218,7 @@ signals:
     void debugEnabledChanged();
     void autoRepairChanged();
     void autoBuyX2Changed();
+    void gemAutobuyEnabledChanged(); // v97fa: master switch del gem autobuy
     void busyChanged();
     void deviceIdChanged();
     void accountTextChanged();
@@ -230,6 +240,7 @@ signals:
     void shopChanged();
     void gemPriorityChanged();
     void autoBuyColorsChanged();   // 2026-08-10: boton Auto buy por color (tienda 19:00/01:00 COT)
+    void gemAutobuyChanged();      // v97fa: toggle autobuy por gema (priority)
 
 private slots:
     void onFarmDebug(const QString &text);
@@ -311,6 +322,12 @@ private:
     // 06:00 UTC; la compra se dispara 1 min despues (00:01/06:01 UTC) para
     // que funcione desde cualquier zona horaria.
     QSet<int> m_autoBuyColors;
+    // v97fa: autobuy de GEMAS por gema dentro del priority (toggle on/off por
+    // fila). device -> set de indices de color 0-19 con compra automatica.
+    // En cada autorefresh: si la gema falta en inventario (limite de XP) y
+    // esta en el shop con saldo, se compra ANTES del re-equip por prioridad.
+    QHash<QString, QSet<int>> m_gemAutobuy;
+    bool m_gemAutobuyEnabled = true; // v97fa: master switch (off = sin logins de autobuy)
     QTimer *m_storeBuyTimer = nullptr;      // tick cada 30s: dispara la compra
     QString m_lastStoreBuySlot;             // "yyyy-MM-dd HH" UTC ya comprado
     qlonglong m_gemXpInitial = -1;

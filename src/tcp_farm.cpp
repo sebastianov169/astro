@@ -1786,6 +1786,19 @@ void FarmWorker::pickRandomRegion()
     { QMutexLocker lk2(&m_sessionMutex); m_region = s_globalRegion; }
 }
 
+// v97ez: override de region desde el dashboard (server caido, ej. central_america)
+void FarmWorker::setGlobalRegion(const QString &region)
+{
+    QMutexLocker lk(&s_globalRegionMutex);
+    s_globalRegion = region.trimmed();
+}
+
+QString FarmWorker::globalRegion()
+{
+    QMutexLocker lk(&s_globalRegionMutex);
+    return s_globalRegion;
+}
+
 void FarmWorker::restoreCtfMode(QNetworkAccessManager *net, const QString &sk, const QString &magic, const QString &avoidRegion)
 {
     // vuelve a dejar la cuenta en CTF (lobby via HTTP, sin TCP). Al volver se
