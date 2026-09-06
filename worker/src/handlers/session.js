@@ -71,6 +71,23 @@ export async function createSession(request, env) {
   if (lic.hwid_hash && lic.hwid_hash !== hwid) return errorResponse('HWID mismatch', 403);
   if (lic.expires_at && new Date(lic.expires_at) < new Date()) return errorResponse('License expired', 403);
 
+  // R2 version info (fail-open, nunca romper la sesion por esto)
+  let respVersion;
+  let respAstroSha256;
+  try {
+    if (env.STORAGE) {
+      const obj = await env.STORAGE.get('version.json');
+      if (obj) {
+        const txt = await obj.text();
+        const data = JSON.parse(txt);
+        if (data && typeof data.version === 'string' && typeof data.astro_sha256 === 'string') {
+          respVersion = data.version;
+          respAstroSha256 = data.astro_sha256;
+        }
+      }
+    }
+  } catch {}
+
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min
   try {
     await env.DB.prepare("INSERT INTO session_tokens(token, license_key, hwid, expires_at) VALUES(?,?,?,?)")
@@ -80,7 +97,12 @@ export async function createSession(request, env) {
     if (msg.includes('UNIQUE') || msg.includes('PRIMARYKEY')) return errorResponse('Token already exists', 409);
     return errorResponse('Failed to create session', 500);
   }
-  return jsonResponse({ success: true, expires_at: expiresAt });
+  const resp = { success: true, expires_at: expiresAt };
+  if (respVersion && respAstroSha256) {
+    resp.version = respVersion;
+    resp.astro_sha256 = respAstroSha256;
+  }
+  return jsonResponse(resp);
 }
 
 export async function validateSession(request, env) {
