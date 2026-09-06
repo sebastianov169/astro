@@ -192,6 +192,12 @@ set(ANTIDBG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../antidbg")
 if(NOT EXISTS "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
     set(ANTIDBG_DIR "C:/Users/ren/Desktop/og mito/antidbg")
 endif()
+# ASTRO_NO_ANTIDBG=ON fuerza compilar sin el .lib externo (Hikari/1429: el .lib
+# trae /GL de otro compiler y rompe el link LNK1257). Resto del esquema intacto.
+if(DEFINED ASTRO_NO_ANTIDBG AND ASTRO_NO_ANTIDBG)
+    set(ANTIDBG_DIR "C:/nonexistent-antidbg-disabled")
+    add_compile_definitions(ASTRO_NO_ANTIDBG=1)
+endif()
 if(EXISTS "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
     add_library(antidebug STATIC IMPORTED)
     set_target_properties(antidebug PROPERTIES IMPORTED_LOCATION "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
@@ -238,7 +244,6 @@ if(WIN32)
     if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         set(HIKARI_FLAGS "-mllvm;-enable-cffobf;-mllvm;-enable-bcfobf;-mllvm;-enable-subobf;-mllvm;-enable-splitobf")
         foreach(_src
-            src/main_secured.cpp
             src/main.cpp
             src/login.cpp
             src/security/logging/hardware_info.cpp
@@ -265,17 +270,19 @@ if(WIN32)
             src/security/crypto/ed25519/fe.cpp
             src/security/crypto/ed25519/ge.cpp
             src/security/crypto/ed25519/sc.cpp
-            src/security/crypto/ed25519/add_scalar.cpp
-            src/farm_controller.cpp)
+            src/security/crypto/ed25519/add_scalar.cpp)
             if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
                 set_source_files_properties("${_src}" PROPERTIES COMPILE_OPTIONS "${HIKARI_FLAGS}")
             endif()
         endforeach()
-        # tcp_farm.cpp is too large for full Hikari - use light passes only
+        # TU grandes (farm_controller/main_secured/tcp_farm): clang15-Hikari los
+        # tumba con pases full (ICE). Precedente tcp_farm: solo cff, resto intacto.
         set(HIKARI_TCP "-mllvm;-enable-cffobf")
-        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tcp_farm.cpp")
-            set_source_files_properties(src/tcp_farm.cpp PROPERTIES COMPILE_OPTIONS "${HIKARI_TCP}")
-        endif()
+        foreach(_big src/tcp_farm.cpp src/farm_controller.cpp src/main_secured.cpp)
+            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_big}")
+                set_source_files_properties(${_big} PROPERTIES COMPILE_OPTIONS "${HIKARI_TCP}")
+            endif()
+        endforeach()
         set(HIKARI_LIGHT "-mllvm;-enable-cffobf;-mllvm;-enable-subobf")
         foreach(_src2 src/crypto.cpp)
             if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src2}")

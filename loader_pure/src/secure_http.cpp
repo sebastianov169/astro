@@ -245,11 +245,11 @@ bool SecureHttpClient::detect_proxy() {
     // Check system proxy settings
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         DWORD proxy_enable = 0;
         DWORD size = sizeof(proxy_enable);
-        RegQueryValueExW(hKey, "ProxyEnable", nullptr, nullptr,
+        RegQueryValueExW(hKey, L"ProxyEnable", nullptr, nullptr,
                         (LPBYTE)&proxy_enable, &size);
         // RegCloseHandle is in advapi32 - use direct call
         typedef LSTATUS (WINAPI *RegCloseFn)(HKEY);
