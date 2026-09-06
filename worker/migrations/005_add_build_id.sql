@@ -1,0 +1,1 @@
+ALTER TABLE licenses ADD COLUMN build_id TEXT DEFAULT '';

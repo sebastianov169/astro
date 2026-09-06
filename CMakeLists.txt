@@ -9,10 +9,18 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Quick QuickControls2 Network)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Quick QuickControls2 Network Widgets)
+qt_standard_project_setup()
 
-qt_add_executable(Astro
-    src/main.cpp
+# Ed25519 (orlp public-domain) for license attestation verification
+file(GLOB ED25519_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/security/crypto/ed25519/*.cpp")
+
+# Port hardening-v92: v92 intacto (farm/crypto/login/tcp + Main.qml 3 paginas).
+# src/main.cpp se preserva en disco pero el entry es src/main_secured.cpp
+# para evitar main() duplicado. Sin Utopia.
+add_executable(Astro
+    ${ED25519_SOURCES}
+    src/main_secured.cpp
     src/farm_controller.h
     src/farm_controller.cpp
     src/crypto.h
@@ -21,6 +29,44 @@ qt_add_executable(Astro
     src/login.cpp
     src/tcp_farm.h
     src/tcp_farm.cpp
+    src/security/license/license_structure.h
+    src/security/license/tpm_reader.h
+    src/security/license/tpm_reader.cpp
+    src/security/license/license_manager.h
+    src/security/license/license_manager.cpp
+    src/security/winhttp_client.h
+    src/security/winhttp_client.cpp
+    src/security/protection/anti_debug.h
+    src/security/protection/anti_debug.cpp
+    src/security/protection/anti_vm.h
+    src/security/protection/anti_vm.cpp
+    src/security/protection/anti_sandbox.h
+    src/security/protection/anti_sandbox.cpp
+    src/security/protection/anti_frida.h
+    src/security/protection/anti_frida.cpp
+    src/security/protection/anti_dll.h
+    src/security/protection/anti_dll.cpp
+    src/security/protection/anti_dump.h
+    src/security/protection/anti_dump.cpp
+    src/security/protection/anti_patch.h
+    src/security/protection/anti_patch.cpp
+    src/security/protection/anti_iat.h
+    src/security/protection/anti_iat.cpp
+    src/security/protection/anti_analysis.h
+    src/security/protection/anti_analysis.cpp
+    src/security/loader/backend_api.h
+    src/security/loader/encrypted_channel.h
+    src/security/loader/encrypted_channel.cpp
+    src/security/loader/secure_loader.h
+    src/security/loader/secure_loader.cpp
+    src/security/loader/autokill.h
+    src/security/loader/autokill.cpp
+    src/security/license/session_guard.h
+    src/security/license/session_guard.cpp
+    src/security/crypto/string_encrypt.h
+    src/security/crypto/string_encrypt.cpp
+    src/security/crypto/obfuscation.h
+    src/security/crypto/m3xc.h
 )
 
 qt_add_qml_module(Astro
@@ -140,17 +186,103 @@ set_target_properties(Astro PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
+# AntiDBG (NotRequiem, MIT): opcional. En v92-clean no se exige el .lib para configurar.
+# Si existe se enlaza, si no el build sigue con el resto del esquema.
+set(ANTIDBG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../antidbg")
+if(NOT EXISTS "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
+    set(ANTIDBG_DIR "C:/Users/ren/Desktop/og mito/antidbg")
+endif()
+if(EXISTS "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
+    add_library(antidebug STATIC IMPORTED)
+    set_target_properties(antidebug PROPERTIES IMPORTED_LOCATION "${ANTIDBG_DIR}/build_md/Release/antidebug.lib")
+    target_include_directories(Astro PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${ANTIDBG_DIR}/antidebug
+    )
+    target_link_libraries(Astro PRIVATE antidebug)
+else()
+    target_include_directories(Astro PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    message(STATUS "antidebug.lib no encontrado, se compila sin AntiDBG externo")
+endif()
+
 target_link_libraries(Astro PRIVATE
     Qt6::Quick
     Qt6::QuickControls2
     Qt6::Network
+    Qt6::Widgets
     bcrypt
     crypt32
     ncrypt
+    ntdll
+    psapi
+    ws2_32
+    iphlpapi
+    ole32
+    oleaut32
+    wlanapi
 )
 
 if(WIN32)
     target_compile_definitions(Astro PRIVATE NOMINMAX UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+    # Ofuscacion total: renombrado de simbolos (funciones, variables, atributos) en todo el build
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(Astro PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/security/obfuscation_map.h")
+    else()
+        # clang-cl (Hikari): -FI con path separado evita el quoting roto de Ninja
+        target_compile_options(Astro PRIVATE "/FI" "${CMAKE_CURRENT_SOURCE_DIR}/src/security/obfuscation_map.h")
+    endif()
+
+    # ---- Hikari LLVM: ofuscacion por-archivo (solo codigo propio; moc/Qt sin tocar) ----
+    if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        set(HIKARI_FLAGS "-mllvm;-enable-cffobf;-mllvm;-enable-bcfobf;-mllvm;-enable-subobf;-mllvm;-enable-splitobf")
+        foreach(_src
+            src/main_secured.cpp
+            src/main.cpp
+            src/login.cpp
+            src/security/logging/hardware_info.cpp
+            src/security/logging/secure_logger.cpp
+            src/security/license/license_manager.cpp
+            src/security/license/tpm_reader.cpp
+            src/security/winhttp_client.cpp
+            src/security/protection/anti_debug.cpp
+            src/security/protection/anti_vm.cpp
+            src/security/protection/anti_sandbox.cpp
+            src/security/protection/anti_frida.cpp
+            src/security/protection/anti_patch.cpp
+            src/security/protection/anti_iat.cpp
+            src/security/protection/anti_dump.cpp
+            src/security/protection/anti_dll.cpp
+            src/security/protection/anti_analysis.cpp
+            src/security/loader/secure_loader.cpp
+            src/security/loader/autokill.cpp
+            src/security/loader/encrypted_channel.cpp
+            src/security/license/session_guard.cpp
+            src/security/crypto/string_encrypt.cpp
+            src/security/crypto/ed25519/sha512.cpp
+            src/security/crypto/ed25519/verify.cpp
+            src/security/crypto/ed25519/fe.cpp
+            src/security/crypto/ed25519/ge.cpp
+            src/security/crypto/ed25519/sc.cpp
+            src/security/crypto/ed25519/add_scalar.cpp
+            src/farm_controller.cpp)
+            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
+                set_source_files_properties("${_src}" PROPERTIES COMPILE_OPTIONS "${HIKARI_FLAGS}")
+            endif()
+        endforeach()
+        # tcp_farm.cpp is too large for full Hikari - use light passes only
+        set(HIKARI_TCP "-mllvm;-enable-cffobf")
+        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tcp_farm.cpp")
+            set_source_files_properties(src/tcp_farm.cpp PROPERTIES COMPILE_OPTIONS "${HIKARI_TCP}")
+        endif()
+        set(HIKARI_LIGHT "-mllvm;-enable-cffobf;-mllvm;-enable-subobf")
+        foreach(_src2 src/crypto.cpp)
+            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src2}")
+                set_source_files_properties("${_src2}" PROPERTIES COMPILE_OPTIONS "${HIKARI_LIGHT}")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 include(GNUInstallDirs)
@@ -159,9 +291,21 @@ install(TARGETS Astro
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-# copia la clave privada RSA del backend junto al ejecutable
-add_custom_command(TARGET Astro POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/embedded_rsa_private_14.pem"
-        "$<TARGET_FILE_DIR:Astro>/embedded_rsa_private_14.pem"
+# SECURITY: private RSA key is NO LONGER shipped with the client.
+# The previous copy_if_different exposed the server private key in astro_package.zip.
+# If you need local development, symlink manually and never include in release.
+# add_custom_command(TARGET Astro POST_BUILD ... embedded_rsa_private_14.pem) REMOVED
+
+# ---- Release hardening & obfuscation (2026-08-21) ----
+target_compile_options(Astro PRIVATE
+    $<$<CONFIG:Release>:/GL>
+    $<$<CONFIG:Release>:/GS>
+    $<$<CONFIG:Release>:/sdl>
+    $<$<CONFIG:Release>:/guard:cf>
+    $<$<CONFIG:Release>:/Gy>
+)
+target_link_options(Astro PRIVATE
+    $<$<CONFIG:Release>:/INCREMENTAL:NO>
+    $<$<CONFIG:Release>:/OPT:REF,ICF>
+    $<$<CONFIG:Release>:/GUARD:CF>
 )

@@ -28,3 +28,4 @@ __pycache__/
 
 # Claves privadas (PEM de atestacion) - NUNCA subir
 *.pem
+.aider*

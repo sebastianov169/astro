@@ -1,0 +1,25 @@
+name = "astro-license"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "production"
+# ADMIN_KEY y ENCRYPTION_KEY se setean como secrets via `wrangler secret put` - nunca en repo
+# Use: wrangler secret put ADMIN_KEY / ENCRYPTION_KEY
+
+[[d1_databases]]
+binding = "DB"
+database_name = "astro-licenses"
+database_id = "dbadee81-75a5-4bd1-a3f5-37c117e2bcb9"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "8fd0f5d79c474888980e5d55bed001c1"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "astro-backend"
+
+[triggers]
+crons = ["*/5 * * * *"]

@@ -836,7 +836,7 @@ ApplicationWindow {
                                     radius: 9
                                 }
                             }
-                            LabelText { text: "v1.0 · by Ren"; color: colors.faint; font.pixelSize: 10 }
+                            LabelText { text: "Astro V1.1 by Ren & Drex"; color: colors.faint; font.pixelSize: 10 }
                         }
                     }
                 }

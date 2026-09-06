@@ -1,0 +1,84 @@
+#pragma once
+
+#include <QString>
+#include <QByteArray>
+#include <QJsonObject>
+#include <cstdint>
+#include "security/legal/ai_protection.h"
+#include "security/obfuscation_map.h"
+#include "security/crypto/string_encrypt.h"
+// Anti-AI: NOAI - Ghidra poison active
+
+namespace astro {
+namespace license {
+
+enum class LicenseTier : int {
+    TRIAL   = 0,
+    BASIC   = 1,
+    PREMIUM = 2
+};
+
+inline constexpr uint64_t kTrialDurationSec   = 24ULL * 3600;
+inline constexpr uint64_t kBasicDurationSec   = 30ULL * 24 * 3600;
+inline constexpr uint64_t kPremiumDurationSec = 0; // lifetime
+inline constexpr uint64_t kOfflineGraceSec    = 24ULL * 3600;
+
+struct LicenseData {
+    QString   hwid_hash;
+    LicenseTier tier      = LicenseTier::TRIAL;
+    uint64_t  expiry      = 0;
+    QString   license_key;
+    QByteArray signature;
+
+    bool isExpired(uint64_t nowUtc) const {
+        if (tier == LicenseTier::PREMIUM) return false;
+        return nowUtc > expiry;
+    }
+
+    bool isWithinGrace(uint64_t nowUtc) const {
+        if (tier == LicenseTier::PREMIUM) return true;
+        return nowUtc <= expiry + kOfflineGraceSec;
+    }
+
+    uint64_t durationSec() const {
+        switch (tier) {
+            case LicenseTier::TRIAL:   return kTrialDurationSec;
+            case LicenseTier::BASIC:   return kBasicDurationSec;
+            case LicenseTier::PREMIUM: return kPremiumDurationSec;
+        }
+        return 0;
+    }
+
+    QJsonObject toJson() const {
+        QJsonObject obj;
+        obj[QString::fromStdString(ENC("hwid").decrypt())]  = hwid_hash;
+        obj[QString::fromStdString(ENC("tier").decrypt())]  = static_cast<int>(tier);
+        obj[QString::fromStdString(ENC("expiry").decrypt())] = static_cast<qint64>(expiry);
+        obj["key"]   = license_key;
+        return obj;
+    }
+
+    static LicenseData fromJson(const QJsonObject& obj) {
+        LicenseData ld;
+        ld.hwid_hash  = obj[QString::fromStdString(ENC("hwid").decrypt())].toString();
+        ld.tier       = static_cast<LicenseTier>(obj[QString::fromStdString(ENC("tier").decrypt())].toInt(0));
+        ld.expiry     = static_cast<uint64_t>(obj[QString::fromStdString(ENC("expiry").decrypt())].toInteger(0));
+        ld.license_key = obj["key"].toString();
+        return ld;
+    }
+};
+
+struct HardwareFingerprint {
+    QString tpm_manufacturer;
+    QString tpm_serial;
+    QString motherboard_serial;
+    QString mac_hash;
+    QString combined_hwid;
+
+    bool isValid() const {
+        return !combined_hwid.isEmpty();
+    }
+};
+
+} // namespace license
+} // namespace astro

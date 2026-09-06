@@ -27,9 +27,14 @@ if not exist "%CMAKE%" (
 )
 
 rem Configuracion inicial si no existe (repo recien clonado)
+rem Opt-in Hikari: set ASTRO_USE_HIKARI=1 para clang-cl con Hikari, por defecto MSVC intacto
 if not exist "build\CMakeCache.txt" (
     echo [..] Primera vez: configurando con cmake...
-    call "%CMAKE%" -S . -B build -G "Visual Studio 18 2026" -A x64
+    if "%ASTRO_USE_HIKARI%"=="1" (
+        call "%CMAKE%" -S . -B build -G "Visual Studio 18 2026" -A x64 -T ClangCL -DASTRO_USE_HIKARI=ON
+    ) else (
+        call "%CMAKE%" -S . -B build -G "Visual Studio 18 2026" -A x64
+    )
     if errorlevel 1 (
         echo.
         echo [ERROR] La configuracion de cmake fallo.

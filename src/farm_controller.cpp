@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDateTime>
+#include <QTimeZone>
 #include <QTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -2237,7 +2238,7 @@ QString FarmController::nextStoreBuyTime() const
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     // slots UTC: 00:01 y 06:01 (reinicio + 1 min)
     for (int h : {0, 6}) {
-        QDateTime slot(nowUtc.date(), QTime(h, 1), Qt::UTC);
+        QDateTime slot(nowUtc.date(), QTime(h, 1), QTimeZone::utc());
         if (slot <= nowUtc)
             slot = slot.addDays(1);
         const QDateTime local = slot.toLocalTime();
