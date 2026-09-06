@@ -4432,11 +4432,17 @@ void FarmController::maybeStartRefreshAllLogin()
                     break;
                 }
                 emit refreshAllProgressChanged();
-                emit accountsChanged();
+                // v97fb: NO emitir accountsChanged por cuenta (9 rebuilds
+                // completos de la lista con imagenes durante el refresh =
+                // UI trabada). La barra de progreso si se actualiza; la lista
+                // se coalesce via scheduleUiFlush (300ms) y pinta al final.
+                scheduleUiFlush();
                 if (progress == total) {
                     m_refreshingAll = false;
                     sortAccounts();
                     saveAccounts();
+                    scheduleUiFlush(); // v97fb: pinta el orden final (el flush
+                    // coalescente pudo dispararse antes del sort)
                     m_refreshAllStatus = m_refreshIsAutomatic
                         ? QStringLiteral("Auto-refresh: %1 farm account(s) refreshed").arg(total)
                         : QStringLiteral("All %1 accounts refreshed").arg(total);

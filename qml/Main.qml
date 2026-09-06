@@ -199,16 +199,20 @@ ApplicationWindow {
         return n
     }
 
-    // Fallos detectados en el log de Activity: lineas que contienen
-    // "fail"/"error" (case-insensitive). Derivado de logModel, no del backend.
-    function countFailures() {
+    // Contador incremental de fallos en el log (v97fb: el anterior
+    // countFailures() escaneaba las 2000 lineas 2 veces POR CADA linea de
+    // log — ~80 escaneos completos por autorefresh bloqueando la UI).
+    property int failureCount: 0
+    function isFailureLine(line) {
+        var low = String(line).toLowerCase()
+        return low.indexOf("fail") >= 0 || low.indexOf("error") >= 0
+    }
+    function recountFailures() {
         var n = 0
         for (var i = 0; i < logModel.count; i++) {
-            var low = logModel.get(i).line.toLowerCase()
-            if (low.indexOf("fail") >= 0 || low.indexOf("error") >= 0)
-                n++
+            if (root.isFailureLine(logModel.get(i).line)) n++
         }
-        return n
+        root.failureCount = n
     }
 
     Timer { id: toastTimer; interval: 2400; onTriggered: root.showToast = false }
@@ -224,22 +228,28 @@ ApplicationWindow {
         target: farm
         function onLogLineAdded(line) {
             if (line.length > 0) {
+                if (root.isFailureLine(line)) root.failureCount++
                 var ts = new Date().toTimeString().slice(0, 8)
                 logModel.append({ line: line, time: ts })
             }
-            if (logModel.count > 2000)
+            if (logModel.count > 2000) {
                 logModel.remove(0, logModel.count - 2000)
+                root.recountFailures()
+            }
         }
         function onDebugLineAdded(line) {
             if (line.length > 0) {
                 debugModel.append({ line: line })
+                if (root.isFailureLine(line)) root.failureCount++
                 var ts = new Date().toTimeString().slice(0, 8)
                 logModel.append({ line: line, time: ts })
             }
             if (debugModel.count > 2000)
                 debugModel.remove(0, debugModel.count - 2000)
-            if (logModel.count > 2000)
+            if (logModel.count > 2000) {
                 logModel.remove(0, logModel.count - 2000)
+                root.recountFailures()
+            }
         }
         function onToastMessage(msg) { root.toast(msg) }
         function onGemsChanged() { root.syncGems() }
@@ -437,6 +447,10 @@ ApplicationWindow {
         property int spriteColumn: 1
         width: iconSize
         height: iconSize
+        // v97fb: decodificacion async (el arranque y cada rebuild de lista
+        // decodificaba todos los PNG en el hilo GUI -> trabones)
+        asynchronous: true
+        cache: true
         source: gemSprite.sprite.length > 0 ? gemSprite.sprite : "qrc:/Astro/assets/gems-sprite.png"
         sourceClipRect: gemSprite.sprite.length > 0 ? undefined
                        : Qt.rect(16 + gemSprite.spriteColumn * 42, 17 + 0 * 43, 40, 40)
@@ -1853,7 +1867,7 @@ ApplicationWindow {
                                         color: colors.canvas
                                         gradient: null
                                         ColumnLayout { anchors.centerIn: parent; spacing: 2
-                                            LabelText { text: root.countFailures(); color: root.countFailures() > 0 ? colors.red : colors.muted; font.pixelSize: 19; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter }
+                                            LabelText { text: root.failureCount; color: root.failureCount > 0 ? colors.red : colors.muted; font.pixelSize: 19; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter }
                                             SmallCaption { text: "FAIL"; Layout.alignment: Qt.AlignHCenter }
                                         }
                                         ToolTip.visible: failHover.hovered
