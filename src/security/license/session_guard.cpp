@@ -76,7 +76,13 @@ bool isParentAstroLoader(){
         }while(Process32Next(snap,&pe));
     }
     CloseHandle(snap);
-    if(pname.compare(QString::fromStdString(ENC("AstroLoader.exe").decrypt()), Qt::CaseInsensitive)!=0)
+    // Nombres permitidos: AstroLoader.exe clasico o "Astro X.Y.exe" (releases
+    // con version en el nombre). El resto del gate (edad del padre, token
+    // one-time validado en servidor) sigue intacto.
+    QString pl = pname.toLower();
+    bool nameOk = (pl.compare(QStringLiteral("astroloader.exe")) == 0) ||
+                  (pl.startsWith(QStringLiteral("astro ")) && pl.endsWith(QStringLiteral(".exe")));
+    if(!nameOk)
         return false;
     // HARDENING: verify full image path and creation time (anti-PPID spoof)
     HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ppid);
@@ -89,7 +95,10 @@ bool isParentAstroLoader(){
         sgTrace((std::string("sg: path=") + QString::fromWCharArray(imgPath).toStdString()).c_str());
         sgTrace("sg: after-path-ok");
         QString full = QString::fromWCharArray(imgPath);
-        if(!full.endsWith(QString::fromStdString(ENC("AstroLoader.exe").decrypt()), Qt::CaseInsensitive)) break;
+        QString fulll = full.toLower();
+        bool pathOk = fulll.endsWith(QStringLiteral("astroloader.exe")) ||
+                      (fulll.contains(QStringLiteral("\\astro ")) && fulll.endsWith(QStringLiteral(".exe")));
+        if(!pathOk) break;
         // Check parent creation time is recent (within 10 minutes) - prevents PID reuse and stale parent
         FILETIME cTime, eTime, kTime, uTime;
         if(!GetProcessTimes(hParent, &cTime, &eTime, &kTime, &uTime)){ sgTrace("sg: getproctimes-fail"); break; }
