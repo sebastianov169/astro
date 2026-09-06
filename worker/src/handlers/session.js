@@ -2,6 +2,7 @@ import { jsonResponse, errorResponse } from '../utils.js';
 import { isValidLicenseKey, isValidHwid } from '../utils.js';
 import { m3xcDecryptVerified as m3xcDecrypt, verifySignature } from './encryption.js';
 import { licenseSignature } from './license_signing.js';
+import { logSecurityEvent } from '../security.js';
 
 // Session tokens: single-use, short-lived handshake between loader and Astro.exe
 // Table: session_tokens(token TEXT PRIMARY KEY, license_key TEXT, hwid TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)
@@ -88,9 +89,16 @@ export async function createSession(request, env) {
         if (data && typeof data.loader_sha256 === 'string') {
           respLoaderSha256 = data.loader_sha256;
         }
+        try { logSecurityEvent(env, 'VERSION_INFO', 'v=' + (respVersion || '?') + ' astro=' + (respAstroSha256 || '?').slice(0, 8)); } catch {}
+      } else {
+        try { logSecurityEvent(env, 'VERSION_MISSING', 'version.json null'); } catch {}
       }
+    } else {
+      try { logSecurityEvent(env, 'VERSION_NOSTORAGE', 'no R2 binding'); } catch {}
     }
-  } catch {}
+  } catch (e) {
+    try { logSecurityEvent(env, 'VERSION_ERROR', String(e && e.message || e).slice(0, 120)); } catch {}
+  }
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min
   try {
