@@ -13,6 +13,7 @@ add_executable(AstroLoader WIN32
     src/anti_sandbox.cpp
     src/crypto_m3xc.cpp
     src/secure_http.cpp
+    src/version_check.cpp
     src/worker_crypto.cpp
     src/hw_collect.cpp
 )

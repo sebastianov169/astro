@@ -12,6 +12,7 @@
 #include "crypto_m3xc.h"
 #include "secure_http.h"
 #include "worker_crypto.h"
+#include "version_check.h"
 #include "obfuscation.h"
 #include "deep_obfuscation.h"
 
@@ -89,6 +90,7 @@ DWORD WINAPI downloadThreadInner();
 
 static HWND hEditKey, hBtnActivate, hStaticStatus, hProgress;
 static std::string g_hwid, g_licenseKey;
+static std::string g_serverAstroSha;
 static wchar_t g_tempPath[MAX_PATH];
 static HBRUSH g_hbrBg, g_hbrEdit, g_hbrBtn;
 static HFONT g_hFont, g_hFontBold, g_hFontSmall, g_hFontTitle;
@@ -146,6 +148,7 @@ static bool registerSession(HttpClient& http, const std::string& token){
     traceStage("RS-DECRYPTED");
     const std::string& look = plain.empty()?resp:plain;
     bool ok = look.find("\"success\":true") != std::string::npos;
+    g_serverAstroSha = vercheck::parseAstroSha256(look);
     // BUGFIX: persist the sidecar token ONLY after server confirmed the session.
     if (ok) {
         wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
@@ -463,6 +466,12 @@ DWORD WINAPI downloadThreadInner() {
         
         DWORD attrib = GetFileAttributesW(astroExe.c_str());
         traceStage("DT-EXE-CHECK");
+        // Anti-stale-cache: si R2 trae build mas nuevo, borrar y re-descargar
+        if (!g_serverAstroSha.empty() && vercheck::isCacheStale(astroExe, g_serverAstroSha)) {
+            traceStage("DT-STALE-CACHE");
+            deleteAstroApp();
+            attrib = GetFileAttributesW(astroExe.c_str());
+        }
         if (attrib != INVALID_FILE_ATTRIBUTES) {
                 // Self-integrity gate: refuse to launch if .text was patched
     if (!deep::textIntact()) {
