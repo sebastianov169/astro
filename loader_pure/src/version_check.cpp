@@ -1,4 +1,5 @@
 #include "version_check.h"
+#include "obfuscation.h"
 #include <windows.h>
 #include <bcrypt.h>
 #include <vector>
@@ -10,7 +11,7 @@
 namespace vercheck {
 
 std::string parseAstroSha256(const std::string& resp) {
-    const std::string key = "\"astro_sha256\":\"";
+    const std::string key = OBFUSCATE("\"astro_sha256\":\"");
     size_t pos = resp.find(key);
     if (pos == std::string::npos) {
         return "";
