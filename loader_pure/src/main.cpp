@@ -91,6 +91,7 @@ DWORD WINAPI downloadThreadInner();
 static HWND hEditKey, hBtnActivate, hStaticStatus, hProgress;
 static std::string g_hwid, g_licenseKey;
 static std::string g_serverAstroSha;
+static std::string g_serverLoaderSha;
 static wchar_t g_tempPath[MAX_PATH];
 static HBRUSH g_hbrBg, g_hbrEdit, g_hbrBtn;
 static HFONT g_hFont, g_hFontBold, g_hFontSmall, g_hFontTitle;
@@ -149,6 +150,7 @@ static bool registerSession(HttpClient& http, const std::string& token){
     const std::string& look = plain.empty()?resp:plain;
     bool ok = look.find("\"success\":true") != std::string::npos;
     g_serverAstroSha = vercheck::parseAstroSha256(look);
+    g_serverLoaderSha = vercheck::parseLoaderSha256(look);
     // BUGFIX: persist the sidecar token ONLY after server confirmed the session.
     if (ok) {
         wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
@@ -381,6 +383,45 @@ static void clearLicenseCache() {
 }
 // ---------------------------------------------------------------------------
 
+// Self-update: si R2 trae un loader mas nuevo, descargarlo (servido plano con
+// X-Sha256), verificar hash, programar reemplazo y salir. El updater cmd espera
+// nuestra salida, mueve el .new sobre el exe y relanza. Fail-open total.
+static void maybeSelfUpdate(HttpClient& http) {
+    if (g_serverLoaderSha.empty()) return;
+    wchar_t self[MAX_PATH] = {0};
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+    std::string local = vercheck::sha256FileHex(self);
+    if (local.empty()) return;
+    if (_stricmp(local.c_str(), g_serverLoaderSha.c_str()) == 0) return;
+    std::wstring url = toWide(OBFUSCATE("https://astro-license.astro-bots.workers.dev")) +
+        toWide(OBFUSCATE("/api/download?license_key=")) + toWide(g_licenseKey) +
+        toWide(OBFUSCATE("&hwid=")) + toWide(g_hwid) +
+        toWide(OBFUSCATE("&file=AstroLoader.exe"));
+    std::vector<BYTE> data;
+    if (!http.getBinary(url, data) || data.size() < 100) return;
+    if (data[0] != 'M' || data[1] != 'Z') return;  // PE, no pagina de error
+    if (_stricmp(computeSha256Hex(data).c_str(), g_serverLoaderSha.c_str()) != 0) return;
+    std::wstring dst = std::wstring(self) + L".new";
+    HANDLE h = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, data.data(), (DWORD)data.size(), &w, nullptr);
+    CloseHandle(h);
+    if (w != data.size()) { DeleteFileW(dst.c_str()); return; }
+    std::wstring cmd = L"cmd.exe /c timeout /t 3 /nobreak >nul & move /y \"" + dst +
+        L"\" \"" + self + L"\" >nul & start \"\" \"" + self + L"\"";
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, (LPWSTR)cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        DeleteFileW(dst.c_str());
+        return;
+    }
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    ExitProcess(0);
+}
+
 static DWORD WINAPI downloadThread(LPVOID) {
     // Any unhandled exception in this thread would kill the whole process; catch everything.
     try {
@@ -495,6 +536,8 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
                 EnableWindow(hBtnActivate, TRUE);
                 return 0;
             }
+            // Self-update (sale del proceso si R2 trae loader mas nuevo)
+            maybeSelfUpdate(http);
             traceStage("LAUNCH-JOB-CREATE");
             HANDLE hJob = createAstroJob();
             traceStage("LAUNCH-PROC-CREATE");
@@ -692,6 +735,8 @@ CreateDirectoryW(appDir.c_str(), nullptr);
         EnableWindow(hBtnActivate, TRUE);
         return 0;
     }
+    // Self-update (sale del proceso si R2 trae loader mas nuevo)
+    maybeSelfUpdate(http);
     LOADER_AI_TRAP();
     // Self-integrity gate (fresh path): refuse to launch if loader .text was patched
     if (!deep::textIntact()) {

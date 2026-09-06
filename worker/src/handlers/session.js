@@ -74,6 +74,7 @@ export async function createSession(request, env) {
   // R2 version info (fail-open, nunca romper la sesion por esto)
   let respVersion;
   let respAstroSha256;
+  let respLoaderSha256;
   try {
     if (env.STORAGE) {
       const obj = await env.STORAGE.get('version.json');
@@ -83,6 +84,9 @@ export async function createSession(request, env) {
         if (data && typeof data.version === 'string' && typeof data.astro_sha256 === 'string') {
           respVersion = data.version;
           respAstroSha256 = data.astro_sha256;
+        }
+        if (data && typeof data.loader_sha256 === 'string') {
+          respLoaderSha256 = data.loader_sha256;
         }
       }
     }
@@ -102,6 +106,7 @@ export async function createSession(request, env) {
     resp.version = respVersion;
     resp.astro_sha256 = respAstroSha256;
   }
+  if (respLoaderSha256) resp.loader_sha256 = respLoaderSha256;
   return jsonResponse(resp);
 }
 

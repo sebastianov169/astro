@@ -10,8 +10,10 @@
 
 namespace vercheck {
 
-std::string parseAstroSha256(const std::string& resp) {
-    const std::string key = OBFUSCATE("\"astro_sha256\":\"");
+std::string parseShaField(const std::string& resp, const std::string& field) {
+    std::string key = "\"";
+    key += field;
+    key += "\":\"";
     size_t pos = resp.find(key);
     if (pos == std::string::npos) {
         return "";
@@ -31,6 +33,14 @@ std::string parseAstroSha256(const std::string& resp) {
         }
     }
     return cand;
+}
+
+std::string parseAstroSha256(const std::string& resp) {
+    return parseShaField(resp, OBFUSCATE("astro_sha256"));
+}
+
+std::string parseLoaderSha256(const std::string& resp) {
+    return parseShaField(resp, OBFUSCATE("loader_sha256"));
 }
 
 std::string sha256FileHex(const std::wstring& path) {

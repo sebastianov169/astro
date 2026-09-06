@@ -142,8 +142,9 @@ export async function downloadBackend(request, env) {
 
   const data = new Uint8Array(await object.arrayBuffer());
 
-  // Zip legacy: servir plano con sha256 (flujo viejo del loader)
-  if (file.endsWith('.zip')) {
+  // Zip legacy + loader: servir plano con sha256 (flujo del loader).
+  // El .exe del loader no es secreto por usuario: se verifica por hash.
+  if (file.endsWith('.zip') || file === 'AstroLoader.exe') {
     const hash = await sha256Hex(data);
     logSecurityEvent(env, 'DOWNLOAD_SUCCESS', 'key=' + licenseKey + ' file=' + file);
     return new Response(data, {
