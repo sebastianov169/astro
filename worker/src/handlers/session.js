@@ -124,6 +124,7 @@ export async function createSession(request, env) {
 }
 
 export async function validateSession(request, env) {
+  try { logSecurityEvent(env, 'VALIDATE_HIT', 'v=1'); } catch {}
   if (!env.ENCRYPTION_KEY) return errorResponse('Server misconfigured', 500);
   await ensureSessionSchema(env);
   if (!await verifySessionHmac(request, env, '/api/session/validate')) return errorResponse('Invalid request signature', 403);
