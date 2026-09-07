@@ -507,6 +507,23 @@ DWORD WINAPI downloadThreadInner() {
         
         DWORD attrib = GetFileAttributesW(astroExe.c_str());
         traceStage("DT-EXE-CHECK");
+        // Sesion previa: trae astro_sha256 de R2 ANTES del stale-check.
+        // Sin esto g_serverAstroSha llegaba vacio (recien se parseaba en la
+        // sesion de lanzamiento) y el cache viejo se lanzaba sin actualizar.
+        {
+            std::string preToken = generateSessionToken();
+            if (preToken.empty() || !registerSession(http, preToken)) {
+                traceStage("DT-PRESESSION-FAIL");
+                clearLicenseCache();
+                setLabel(hStaticStatus, OBFUSCATE("This application build is not allowed"));
+                SetWindowTextW(hEditKey, L"");
+                SendMessage(hProgress, PBM_SETPOS, 0, 0);
+                EnableWindow(hBtnActivate, TRUE);
+                return 0;
+            }
+            traceStage("DT-PRESESSION-OK");
+            SecureZeroMemory((void*)preToken.data(), preToken.size());
+        }
         // Anti-stale-cache: si R2 trae build mas nuevo, borrar y re-descargar
         if (!g_serverAstroSha.empty() && vercheck::isCacheStale(astroExe, g_serverAstroSha)) {
             traceStage("DT-STALE-CACHE");
