@@ -678,6 +678,12 @@ setLabel(hStaticStatus, OBFUSCATE("Connecting..."));
     setLabel(hStaticStatus, OBFUSCATE("Extracting..."));
     
     //     // Delete old app directory completely (proper recursion - no findData reuse)
+    // Preserve license.key across re-downloads: back it up before wiping and
+    // restore it after extraction (antes se borraba y el usuario tenia que
+    // re-escribir la key en cada actualizacion).
+    std::wstring licBackup = std::wstring(g_tempPath) + toWide(OBFUSCATE("license.key.bak"));
+    DeleteFileW(licBackup.c_str());
+    MoveFileW(licenseCachePath().c_str(), licBackup.c_str());
     deleteDirectoryRecursive(appDir);
 
 CreateDirectoryW(appDir.c_str(), nullptr);
@@ -743,6 +749,11 @@ CreateDirectoryW(appDir.c_str(), nullptr);
 
     // Delete ZIP after successful extraction
     DeleteFileW(zipPath.c_str());
+    // Restore license.key tras la re-descarga (ver backup arriba)
+    {
+        std::wstring licBackup2 = std::wstring(g_tempPath) + toWide(OBFUSCATE("license.key.bak"));
+        MoveFileW(licBackup2.c_str(), licenseCachePath().c_str());
+    }
     
     SendMessage(hProgress, PBM_SETPOS, 80, 0);
     setLabel(hStaticStatus, OBFUSCATE("Launching Astro..."));
