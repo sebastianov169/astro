@@ -26,7 +26,7 @@ ApplicationWindow {
     property string toastText: ""
     property string currentTheme: savedTheme || "midnight"
     property var accountStartTimes: ({})
-    // Auto-follow del log de Activity: true = el log se mantiene pegado al
+    // Auto-follow del log interno: true = se mantiene pegado al fondo
     // final al llegar lineas nuevas. Se apaga cuando el usuario hace scroll
     // hacia arriba (leer historial) y se re-activa al volver al fondo. Con 9
     // farms escribiendo a la vez, forzar contentY en CADA linea (2000+ lineas)
@@ -773,8 +773,7 @@ ApplicationWindow {
                     Repeater {
                         model: [
                             { icon: "\u25c8", label: "Dashboard" },
-                            { icon: "\u25a4", label: "Accounts" },
-                            { icon: "\u2263", label: "Activity" }
+                            { icon: "\u25a4", label: "Accounts" }
                         ]
                         delegate: Rectangle {
                             id: navItem
@@ -873,8 +872,8 @@ ApplicationWindow {
                         anchors.rightMargin: 26
                         spacing: 18
                         ColumnLayout { spacing: 4; Layout.preferredWidth: 430
-                            LabelText { text: page === 0 ? "Night Dashboard" : page === 1 ? "Accounts" : "Activity"; font.pixelSize: 22; font.weight: Font.Black; font.letterSpacing: 0.5; elide: Text.ElideRight }
-                            LabelText { text: page === 0 ? "After-dark gem farm operations" : page === 1 ? "Gem inventory and farm loadout" : "Persistent chronological event history"; color: colors.muted; font.pixelSize: 11; elide: Text.ElideRight }
+                            LabelText { text: page === 0 ? "Night Dashboard" : "Accounts"; font.pixelSize: 22; font.weight: Font.Black; font.letterSpacing: 0.5; elide: Text.ElideRight }
+                            LabelText { text: page === 0 ? "After-dark gem farm operations" : "Gem inventory and farm loadout"; color: colors.muted; font.pixelSize: 11; elide: Text.ElideRight }
                         }
                         Item { Layout.fillWidth: true }
                         RowLayout { spacing: 10
@@ -1747,148 +1746,6 @@ ApplicationWindow {
                         }
                     }
 
-                    // ================= Activity =================
-                    RowLayout {
-                        opacity: pages.pageOpacity
-                        transform: Translate { x: pages.pageShift }
-                        Layout.margins: 26
-                        Layout.topMargin: 18
-                        Layout.bottomMargin: 26
-                        spacing: 14
-
-                        // --- panel izquierdo: log (ListView virtualizado) ---
-                        Panel { Layout.fillWidth: true; Layout.fillHeight: true
-                            clip: true
-                            ColumnLayout { anchors.fill: parent; anchors.margins: 14; spacing: 10
-                                RowLayout { Layout.fillWidth: true
-                                    SectionAccent { }
-                                    LabelText { text: "Event timeline"; font.pixelSize: 20; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                                    StatusPill { value: logModel.count + " LINES"; accent: colors.amber }
-                                    GhostButton { text: "Copy All"; Layout.preferredWidth: 80; Layout.preferredHeight: 28
-                                        onClicked: {
-                                            var lines = []
-                                            for (var i = 0; i < logModel.count; i++) {
-                                                var e = logModel.get(i)
-                                                lines.push(e.time + "  " + e.line)
-                                            }
-                                            farm.copyToClipboard(lines.join("\n"))
-                                        }
-                                    }
-                                    GhostButton { text: "Clear"; Layout.preferredWidth: 56; Layout.preferredHeight: 28
-                                        onClicked: logModel.clear() }
-                                }
-                                Rectangle {
-                                    Layout.fillWidth: true; Layout.fillHeight: true
-                                    color: colors.canvas; radius: 6; border.color: colors.borderSoft
-                                    clip: true
-                                    ListView {
-                                        id: logView
-                                        anchors.fill: parent
-                                        anchors.margins: 4
-                                        model: logModel
-                                        clip: true
-                                        spacing: 1
-                                        // Solo virtualiza lo visible — no renderiza 2000+ items
-                                        cacheBuffer: 200
-                                        ScrollBar.vertical: ThemedScrollBar { }
-                                        delegate: Rectangle {
-                                            width: logView.width
-                                            height: logText.implicitHeight + 6
-                                            color: "transparent"
-                                            Text {
-                                                id: logText
-                                                anchors.left: parent.left; anchors.right: parent.right
-                                                anchors.verticalCenter: parent.verticalCenter
-                                                leftPadding: 8; rightPadding: 8
-                                                text: model.time + "  " + model.line
-                                                // severidad: ERROR/fail en rojo, Spawn skip en amber, debug en faint
-                                                color: {
-                                                    var l = model.line
-                                                    if (l.indexOf("ERROR") >= 0 || l.toLowerCase().indexOf("fail") >= 0)
-                                                        return colors.red
-                                                    if (l.toLowerCase().indexOf("spawn skip") >= 0)
-                                                        return colors.amber
-                                                    if (l.indexOf("[DBG]") >= 0)
-                                                        return colors.faint
-                                                    return colors.text
-                                                }
-                                                font.family: "Cascadia Mono, Consolas, Courier New, monospace"
-                                                font.pixelSize: 12
-                                                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                                            }
-                                        }
-                                        // Auto-follow: desplaza al fondo cuando hay lineas nuevas
-                                        // (solo si el usuario ya estaba en el fondo)
-                                        Connections {
-                                            target: logModel
-                                            function onCountChanged() {
-                                                if (root.stickToBottom) {
-                                                    Qt.callLater(function() {
-                                                        logView.positionViewAtEnd()
-                                                    })
-                                                }
-                                            }
-                                        }
-                                        // Detecta scroll del usuario: apaga auto-follow al subir
-                                        onContentYChanged: {
-                                            var maxY = contentHeight - height
-                                            root.stickToBottom = (maxY <= 0 || contentY >= maxY - 4)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // --- panel derecho: run health ---
-                        Panel { Layout.preferredWidth: 235; Layout.fillHeight: true
-                            clip: true
-                            ColumnLayout { anchors.fill: parent; anchors.margins: 14; spacing: 10
-                                RowLayout { Layout.fillWidth: true
-                                    SectionAccent { }
-                                    LabelText { text: "Run health"; font.pixelSize: 18; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                                    StatusPill { value: farm.activeSessions.length + " ACTIVE"; accent: farm.activeSessions.length > 0 ? colors.mint : colors.faint }
-                                }
-                                RowLayout { Layout.fillWidth: true; spacing: 6
-                                    Panel { Layout.fillWidth: true; Layout.preferredHeight: 56; color: colors.canvas; gradient: null
-                                        ColumnLayout { anchors.centerIn: parent; spacing: 2
-                                            LabelText { text: farm.activeSessions.length; color: colors.mint; font.pixelSize: 19; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter }
-                                            SmallCaption { text: "LIVE"; Layout.alignment: Qt.AlignHCenter }
-                                        }
-                                    }
-                                    Panel { Layout.fillWidth: true; Layout.preferredHeight: 56; color: colors.canvas; gradient: null
-                                        ColumnLayout { anchors.centerIn: parent; spacing: 2
-                                            LabelText { text: root.waitingAccounts(); color: colors.amber; font.pixelSize: 19; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter }
-                                            SmallCaption { text: "WAIT"; Layout.alignment: Qt.AlignHCenter }
-                                        }
-                                    }
-                                    Panel {
-                                        Layout.fillWidth: true
-                                        Layout.preferredHeight: 56
-                                        color: colors.canvas
-                                        gradient: null
-                                        ColumnLayout { anchors.centerIn: parent; spacing: 2
-                                            LabelText { text: root.failureCount; color: root.failureCount > 0 ? colors.red : colors.muted; font.pixelSize: 19; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter }
-                                            SmallCaption { text: "FAIL"; Layout.alignment: Qt.AlignHCenter }
-                                        }
-                                        ToolTip.visible: failHover.hovered
-                                        ToolTip.text: "Fallos de la corrida (lineas de log con ERROR/fail)"
-                                        ToolTip.delay: 400
-                                        HoverHandler { id: failHover }
-                                    }
-                                }
-                                Panel { Layout.fillWidth: true; Layout.preferredHeight: 48; color: colors.surface2
-                                    RowLayout { anchors.fill: parent; anchors.margins: 9
-                                        ColumnLayout { Layout.fillWidth: true; spacing: 2
-                                            LabelText { text: farm.farmRunning ? farm.accountText : "Core paused"; font.pixelSize: 11; font.weight: Font.DemiBold }
-                                            SmallCaption { text: farm.serverText }
-                                        }
-                                        StatusPill { value: farm.farmRunning ? "Live" : "Idle"; accent: farm.farmRunning ? colors.mint : colors.faint }
-                                    }
-                                }
-                                Item { Layout.fillHeight: true }
-                            }
-                        }
-                    }
                 }
             }
         }
