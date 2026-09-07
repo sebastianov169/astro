@@ -560,6 +560,8 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
                     DuplicateHandle(GetCurrentProcess(), piL.hProcess,
                         GetCurrentProcess(), &hProcDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
                     WaitForSingleObject(hProcDup, INFINITE);
+                    { DWORD ec = 0; GetExitCodeProcess(hProcDup, &ec);
+                      char b[64]; snprintf(b, 64, "ASTRO-EXIT=%lu", (unsigned long)ec); traceStage(b); }
                     CloseHandle(hProcDup);
                     deleteAstroApp();
                     DeleteFileW((std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"))).c_str());
@@ -787,6 +789,8 @@ CreateDirectoryW(appDir.c_str(), nullptr);
     
     // Wait for Astro to close, then auto-delete everything
     WaitForSingleObject(hProc, INFINITE);
+    { DWORD ec2 = 0; GetExitCodeProcess(hProc, &ec2);
+      char b2[64]; snprintf(b2, 64, "ASTRO-EXIT=%lu", (unsigned long)ec2); traceStage(b2); }
     CloseHandle(hProc);
     deleteAstroApp();
     DeleteFileW((std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"))).c_str());
