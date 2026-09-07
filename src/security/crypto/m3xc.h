@@ -74,6 +74,7 @@ inline std::vector<uint8_t> m3xc_deriveKs(const std::vector<uint8_t>& kb, size_t
 inline QString lm_m3xcEncrypt(const QString& plain, const QString& key) {
     using namespace detail_m3xc;
     QByteArray kb = key.toUtf8();
+    if (kb.isEmpty()) return {};
     QByteArray pb = plain.toUtf8();
     int ptLen = pb.size();
     int pad = ptLen == 0 ? 8 : (8 - ptLen % 8);
@@ -113,6 +114,7 @@ inline QString lm_m3xcDecrypt(const QString& b64, const QString& key) {
     int tot = raw.size();
     if (tot % 8 != 0) return {};
     QByteArray kb = key.toUtf8();
+    if (kb.isEmpty()) return {};
     std::vector<uint8_t> buf(static_cast<size_t>(tot));
     memcpy(buf.data(), raw.constData(), size_t(tot));
     std::vector<uint8_t> kbv;

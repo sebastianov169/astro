@@ -40,27 +40,18 @@ inline bool aesGcmDecrypt(
         (PUCHAR)key, keyLen, 0);
     if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
 
-    // Prepare BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
-    struct AuthInfo {
-        ULONG cbSize;
-        ULONG dwInfoVersion;
-        const UCHAR* pbNonce;
-        ULONG cbNonce;
-        const UCHAR* pbTag;
-        UCHAR* pbTag2; // unused for decrypt but same field
-        ULONG cbTag;
-        const UCHAR* pbAuthData;
-        ULONG cbAuthData;
-        const UCHAR* pbMacContext;
-        ULONG cbMacContext;
-        ULONG cbAAD;
-        ULONGLONG qbDataCopy;
-    } authInfo = {};
+    // Prepare BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO (struct REAL de bcrypt.h;
+    // nunca casero: el layout manual anterior permutaba los campos y el
+    // descifrado siempre fallaba -> ENCRYPTION_KEY vacia -> crash en m3xc).
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    memset(&authInfo, 0, sizeof(authInfo));
     authInfo.cbSize = sizeof(authInfo);
-    authInfo.dwInfoVersion = 1;
-    authInfo.pbNonce = nonce;
+    authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+    authInfo.pbNonce = (PUCHAR)nonce;
     authInfo.cbNonce = nonceLen;
-    authInfo.pbTag = tag;
+    authInfo.pbAuthData = nullptr;
+    authInfo.cbAuthData = 0;
+    authInfo.pbTag = (PUCHAR)tag;
     authInfo.cbTag = tagLen;
 
     // Decrypt
