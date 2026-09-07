@@ -234,6 +234,45 @@ static void VehWriteHex64(HANDLE h, unsigned long long v, DWORD digits)
     DWORD w = 0;
     WriteFile(h, buf, digits, &w, nullptr);
 }
+static HANDLE g_vehLog = INVALID_HANDLE_VALUE;
+// Pre-log en contexto normal (startup): abre el log y vuelca modulos+bases.
+// El handler solo hace WriteFile + CaptureStackBackTrace (lock-free): si el
+// crash ocurre con el loader lock tomado (LoadLibrary de plugins Qt),
+// EnumProcessModules/CreateFile dentro del VEH se cuelgan y no queda log.
+static void VehPrelogModules()
+{
+    char path[MAX_PATH] = {};
+    DWORD dirLen = GetTempPathA(MAX_PATH, path);
+    if (dirLen == 0 || dirLen >= (DWORD)(MAX_PATH - 32)) return;
+    const char* fname = "astro_veh_stack.log";
+    DWORD pos = dirLen;
+    for (DWORD k = 0; fname[k] != '\0' && pos + 1 < (DWORD)MAX_PATH; ++k, ++pos) path[pos] = fname[k];
+    path[pos] = '\0';
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    g_vehLog = h;
+    VehWriteStr(h, "[VEH-STARTUP] mods:
+\n");
+    HMODULE mods[256] = {};
+    DWORD needed = 0;
+    if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
+        DWORD count = needed / (DWORD)sizeof(HMODULE);
+        if (count > 256) count = 256;
+        for (DWORD m = 0; m < count; ++m) {
+            char modName[MAX_PATH] = {};
+            DWORD nlen = GetModuleFileNameA(mods[m], modName, MAX_PATH);
+            if (nlen == 0) continue;
+            if (nlen >= (DWORD)MAX_PATH) nlen = MAX_PATH - 1;
+            modName[nlen] = '\0';
+            VehWriteStr(h, "mod base=0x");
+            VehWriteHex64(h, (unsigned long long)(uintptr_t)mods[m], 16);
+            VehWriteStr(h, " ");
+            VehWriteStr(h, modName);
+            VehWriteStr(h, "
+\n");
+        }
+    }
+}
 static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) {
@@ -242,18 +281,7 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
     if (ep->ExceptionRecord->ExceptionCode != 0xC0000409u) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    char path[MAX_PATH] = {};
-    DWORD dirLen = GetTempPathA(MAX_PATH, path);
-    if (dirLen == 0 || dirLen >= (DWORD)(MAX_PATH - 32)) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const char* fname = "astro_veh_stack.log";
-    DWORD pos = dirLen;
-    for (DWORD k = 0; fname[k] != '\0' && pos + 1 < (DWORD)MAX_PATH; ++k, ++pos) {
-        path[pos] = fname[k];
-    }
-    path[pos] = '\0';
-    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE h = g_vehLog;
     if (h == INVALID_HANDLE_VALUE) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -261,31 +289,8 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
     VehWriteHex64(h, (unsigned long long)ep->ExceptionRecord->ExceptionCode, 8);
     VehWriteStr(h, " addr=0x");
     VehWriteHex64(h, (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress, 16);
-    VehWriteStr(h, "\r\n");
-    HMODULE mods[256] = {};
-    DWORD needed = 0;
-    if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
-        DWORD count = needed / (DWORD)sizeof(HMODULE);
-        if (count > 256) {
-            count = 256;
-        }
-        for (DWORD m = 0; m < count; ++m) {
-            char modName[MAX_PATH] = {};
-            DWORD nlen = GetModuleFileNameA(mods[m], modName, MAX_PATH);
-            if (nlen == 0) {
-                continue;
-            }
-            if (nlen >= (DWORD)MAX_PATH) {
-                nlen = MAX_PATH - 1;
-            }
-            modName[nlen] = '\0';
-            VehWriteStr(h, "mod base=0x");
-            VehWriteHex64(h, (unsigned long long)(uintptr_t)mods[m], 16);
-            VehWriteStr(h, " ");
-            VehWriteStr(h, modName);
-            VehWriteStr(h, "\r\n");
-        }
-    }
+    VehWriteStr(h, "
+\n");
     PVOID frames[48] = {};
     ULONG backHash = 0;
     USHORT captured = CaptureStackBackTrace(0, 48, frames, &backHash);
@@ -297,9 +302,9 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
     for (USHORT f = 0; f < captured; ++f) {
         VehWriteStr(h, "  0x");
         VehWriteHex64(h, (unsigned long long)(uintptr_t)frames[f], 16);
-        VehWriteStr(h, "\r\n");
+        VehWriteStr(h, "
+\n");
     }
-    CloseHandle(h);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI VehAvLogger(PEXCEPTION_POINTERS ep)
@@ -648,6 +653,7 @@ int intArg(const QStringList &args, const QString &flag, int minV, int maxV, int
 int main(int argc, char *argv[])
 {
 #ifdef Q_OS_WIN
+    VehPrelogModules();
     AddVectoredExceptionHandler(1UL, AstroVehHandler);
 #endif
     // =====================================================================
