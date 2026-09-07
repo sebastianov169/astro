@@ -15,6 +15,9 @@
 // DEBUG TRACE (temporary)
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <string>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -115,7 +118,7 @@ static bool appendCrashLine(const char *line)
     return true;
 }
 
-static LONG CALLBACK sehHandler(PEXCEPTION_POINTERS ep)
+static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) {
         TerminateProcess(GetCurrentProcess(), 1);
@@ -131,6 +134,7 @@ static LONG CALLBACK sehHandler(PEXCEPTION_POINTERS ep)
     if (ep->ContextRecord) {
         char regs[640] = {0};
         const CONTEXT *c = ep->ContextRecord;
+#if defined(_M_X64) || defined(__x86_64__)
         _snprintf_s(regs, _TRUNCATE,
                     " rip=%llX rsp=%llX rbp=%llX rax=%llX rbx=%llX rcx=%llX rdx=%llX"
                     " rsi=%llX rdi=%llX r8=%llX r9=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX",
@@ -143,6 +147,15 @@ static LONG CALLBACK sehHandler(PEXCEPTION_POINTERS ep)
                     (unsigned long long)c->R11, (unsigned long long)c->R12,
                     (unsigned long long)c->R13, (unsigned long long)c->R14,
                     (unsigned long long)c->R15);
+#else
+        _snprintf_s(regs, _TRUNCATE,
+                    " eip=%lX esp=%lX ebp=%lX eax=%lX ebx=%lX ecx=%lX edx=%lX esi=%lX edi=%lX",
+                    (unsigned long)c->Eip, (unsigned long)c->Esp,
+                    (unsigned long)c->Ebp, (unsigned long)c->Eax,
+                    (unsigned long)c->Ebx, (unsigned long)c->Ecx,
+                    (unsigned long)c->Edx, (unsigned long)c->Esi,
+                    (unsigned long)c->Edi);
+#endif
         strncat_s(line, sizeof(line), regs, _TRUNCATE);
     }
     if (ep->ExceptionRecord->NumberParameters > 0) {
@@ -218,7 +231,7 @@ static void VehWriteHex64(HANDLE h, unsigned long long v, DWORD digits)
     DWORD w = 0;
     WriteFile(h, buf, digits, &w, nullptr);
 }
-static LONG CALLBACK AstroVehHandler(PEXCEPTION_POINTERS ep)
+static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -271,7 +284,7 @@ static LONG CALLBACK AstroVehHandler(PEXCEPTION_POINTERS ep)
         }
     }
     PVOID frames[48] = {};
-    ULONG backHash = 0;
+    DWORD backHash = 0;
     WORD captured = CaptureStackBackTrace(0, 48, frames, &backHash);
     VehWriteStr(h, "stack frames=0x");
     VehWriteHex64(h, (unsigned long long)captured, 4);
@@ -286,7 +299,7 @@ static LONG CALLBACK AstroVehHandler(PEXCEPTION_POINTERS ep)
     CloseHandle(h);
     return EXCEPTION_CONTINUE_SEARCH;
 }
-static LONG CALLBACK VehAvLogger(PEXCEPTION_POINTERS ep)
+static LONG WINAPI VehAvLogger(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) {
         return EXCEPTION_CONTINUE_SEARCH;
