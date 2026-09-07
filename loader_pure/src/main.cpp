@@ -286,6 +286,11 @@ static void deleteAstroAppRecursive(const std::wstring& dir, bool isRoot) {
         // PRESERVE the DPAPI license cache - it must survive app cleanup
         if (isRoot && _wcsicmp(fd.cFileName, toWide(OBFUSCATE("license.key")).c_str()) == 0)
             continue;
+        // PRESERVE crash/diagnostic logs for post-mortem (E2E + soporte)
+        if (isRoot && (_wcsicmp(fd.cFileName, L"astro_crash.txt") == 0 ||
+                       _wcsicmp(fd.cFileName, L"astro_crash_secure.log") == 0 ||
+                       _wcsicmp(fd.cFileName, L"astro_secured_trace.log") == 0))
+            continue;
         std::wstring full = dir + toWide(OBFUSCATE("\\")) + fd.cFileName;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             deleteAstroAppRecursive(full, false);
