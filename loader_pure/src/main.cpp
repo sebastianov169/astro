@@ -276,42 +276,35 @@ static void drawRoundRect(HDC hdc, RECT* rc, int radius, HBRUSH br) {
     DeleteObject(rgn);
 }
 
+static void deleteAstroAppRecursive(const std::wstring& dir, bool isRoot) {
+    WIN32_FIND_DATAW fd;
+    std::wstring searchPath = dir + toWide(OBFUSCATE("\\*"));
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        // PRESERVE the DPAPI license cache - it must survive app cleanup
+        if (isRoot && _wcsicmp(fd.cFileName, toWide(OBFUSCATE("license.key")).c_str()) == 0)
+            continue;
+        std::wstring full = dir + toWide(OBFUSCATE("\\")) + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            deleteAstroAppRecursive(full, false);
+            RemoveDirectoryW(full.c_str());
+        } else {
+            DWORD attr = GetFileAttributesW(full.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY))
+                SetFileAttributesW(full.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+            DeleteFileW(full.c_str());
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
 static void deleteAstroApp() {
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
     std::wstring appDir = std::wstring(tempPath) + toWide(OBFUSCATE("astro_app"));
-    
-    // Delete all files in directory
-    WIN32_FIND_DATAW findData;
-    std::wstring searchPath = appDir + toWide(OBFUSCATE("\\*"));
-    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(findData.cFileName, toWide(OBFUSCATE(".")).c_str()) != 0 && wcscmp(findData.cFileName, toWide(OBFUSCATE("..")).c_str()) != 0) {
-                // PRESERVE the DPAPI license cache - it must survive app cleanup
-                if (_wcsicmp(findData.cFileName, toWide(OBFUSCATE("license.key")).c_str()) == 0)
-                    continue;
-                std::wstring filePath = appDir + toWide(OBFUSCATE("\\")) + findData.cFileName;
-                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    // Recurse into subdirectories
-                    std::wstring subSearch = filePath + toWide(OBFUSCATE("\\*"));
-                    HANDLE hSubFind = FindFirstFileW(subSearch.c_str(), &findData);
-                    if (hSubFind != INVALID_HANDLE_VALUE) {
-                        do {
-                            if (wcscmp(findData.cFileName, toWide(OBFUSCATE(".")).c_str()) != 0 && wcscmp(findData.cFileName, toWide(OBFUSCATE("..")).c_str()) != 0) {
-                                DeleteFileW((filePath + toWide(OBFUSCATE("\\")) + findData.cFileName).c_str());
-                            }
-                        } while (FindNextFileW(hSubFind, &findData));
-                        FindClose(hSubFind);
-                    }
-                    RemoveDirectoryW(filePath.c_str());
-                } else {
-                    DeleteFileW(filePath.c_str());
-                }
-            }
-        } while (FindNextFileW(hFind, &findData));
-        FindClose(hFind);
-    }
+    deleteAstroAppRecursive(appDir, true);
     RemoveDirectoryW(appDir.c_str());
 }
 
