@@ -242,6 +242,13 @@ if(WIN32)
     endif()
 
     # ---- Hikari LLVM: ofuscacion por-archivo (solo codigo propio; moc/Qt sin tocar) ----
+    # ROOT-CAUSE FIX (fail-fast 0xC0000409 ~5s tras lanzar, intermitente):
+    # cff+bcf+split reescriben el flujo con saltos indirectos que rompen
+    # CFG (/guard:cf) y el unwind de excepciones. En los TUs de la ruta de
+    # arranque (main -> tpm -> license -> session -> winhttp -> backend) eso
+    # moria 2 de cada 3 arranques. Esos TUs llevan SOLO sub (sustitucion de
+    # instrucciones: no crea ramas, CFG/EH-safe). FULL se conserva en los
+    # TUs que corren despues (farm probado 10+ min estable con FULL).
     if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         set(HIKARI_FLAGS "-mllvm;-enable-cffobf;-mllvm;-enable-bcfobf;-mllvm;-enable-subobf;-mllvm;-enable-splitobf")
         foreach(_src
@@ -249,41 +256,53 @@ if(WIN32)
             src/login.cpp
             src/security/logging/hardware_info.cpp
             src/security/logging/secure_logger.cpp
-            src/security/license/license_manager.cpp
-            src/security/license/tpm_reader.cpp
-            src/security/winhttp_client.cpp
             src/security/protection/anti_debug.cpp
             src/security/protection/anti_vm.cpp
             src/security/protection/anti_sandbox.cpp
-            src/security/protection/anti_frida.cpp
             src/security/protection/anti_patch.cpp
             src/security/protection/anti_iat.cpp
             src/security/protection/anti_dump.cpp
             src/security/protection/anti_dll.cpp
             src/security/protection/anti_analysis.cpp
+            src/security/loader/encrypted_channel.cpp)
+            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
+                set_source_files_properties("${_src}" PROPERTIES COMPILE_OPTIONS "${HIKARI_FLAGS}")
+            endif()
+        endforeach()
+        # Ruta de arranque + validacion de sesion: SOLO subobf (CFG/EH-safe).
+        # Incluye anti_frida (corre en startup) y secure_loader/autokill
+        # (descarga del manifest ~+5s, justo en la ventana del crash).
+        set(HIKARI_SUBONLY "-mllvm;-enable-subobf")
+        foreach(_startup
+            src/security/license/license_manager.cpp
+            src/security/license/tpm_reader.cpp
+            src/security/winhttp_client.cpp
+            src/security/protection/anti_frida.cpp
             src/security/loader/secure_loader.cpp
             src/security/loader/autokill.cpp
-            src/security/loader/encrypted_channel.cpp
-            src/security/license/session_guard.cpp
             src/security/crypto/string_encrypt.cpp
             src/security/crypto/ed25519/sha512.cpp
             src/security/crypto/ed25519/verify.cpp
             src/security/crypto/ed25519/fe.cpp
             src/security/crypto/ed25519/ge.cpp
             src/security/crypto/ed25519/sc.cpp
-            src/security/crypto/ed25519/add_scalar.cpp)
-            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
-                set_source_files_properties("${_src}" PROPERTIES COMPILE_OPTIONS "${HIKARI_FLAGS}")
+            src/security/crypto/ed25519/add_scalar.cpp
+            src/security/license/session_guard.cpp)
+            if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_startup}")
+                set_source_files_properties("${_startup}" PROPERTIES COMPILE_OPTIONS "${HIKARI_SUBONLY}")
             endif()
         endforeach()
-        # TU grandes (farm_controller/main_secured/tcp_farm): clang15-Hikari los
+        # TU grandes (farm_controller/tcp_farm): clang15-Hikari los
         # tumba con pases full (ICE). Precedente tcp_farm: solo cff, resto intacto.
+        # main_secured va a SUBONLY: corre todo el arranque y mezcla try/catch
+        # + SEH/VEH con cff (dispatcher indirecto) = fail-fast intermitente.
         set(HIKARI_TCP "-mllvm;-enable-cffobf")
-        foreach(_big src/tcp_farm.cpp src/farm_controller.cpp src/main_secured.cpp)
+        foreach(_big src/tcp_farm.cpp src/farm_controller.cpp)
             if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_big}")
                 set_source_files_properties(${_big} PROPERTIES COMPILE_OPTIONS "${HIKARI_TCP}")
             endif()
         endforeach()
+        set_source_files_properties(src/main_secured.cpp PROPERTIES COMPILE_OPTIONS "${HIKARI_SUBONLY}")
         set(HIKARI_LIGHT "-mllvm;-enable-cffobf;-mllvm;-enable-subobf")
         foreach(_src2 src/crypto.cpp)
             if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src2}")
