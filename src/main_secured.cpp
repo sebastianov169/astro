@@ -147,7 +147,7 @@ static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
                     (unsigned long long)c->R11, (unsigned long long)c->R12,
                     (unsigned long long)c->R13, (unsigned long long)c->R14,
                     (unsigned long long)c->R15);
-#else
+#elif defined(_M_IX86) || defined(__i386__)
         _snprintf_s(regs, _TRUNCATE,
                     " eip=%lX esp=%lX ebp=%lX eax=%lX ebx=%lX ecx=%lX edx=%lX esi=%lX edi=%lX",
                     (unsigned long)c->Eip, (unsigned long)c->Esp,
@@ -155,6 +155,8 @@ static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
                     (unsigned long)c->Ebx, (unsigned long)c->Ecx,
                     (unsigned long)c->Edx, (unsigned long)c->Esi,
                     (unsigned long)c->Edi);
+#else
+        regs[0] = '\0';
 #endif
         strncat_s(line, sizeof(line), regs, _TRUNCATE);
     }
@@ -176,11 +178,12 @@ static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &mod)) {
         char modName[MAX_PATH] = {0};
-        GetModuleFileNameA(mod, modName, MAX_PATH);
-        strncat_s(line, sizeof(line), " module=", _TRUNCATE);
-        strncat_s(line, sizeof(line), modName, _TRUNCATE);
+        if (GetModuleFileNameA(mod, modName, MAX_PATH) != 0) {
+            strncat_s(line, sizeof(line), " module=", _TRUNCATE);
+            strncat_s(line, sizeof(line), modName, _TRUNCATE);
+        }
     }
-    appendCrashLine(line);
+    (void)appendCrashLine(line);
     TerminateProcess(GetCurrentProcess(), 1);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -239,8 +242,8 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
     if (ep->ExceptionRecord->ExceptionCode != 0xC0000409u) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    char path[MAX_PATH];
-    DWORD dirLen = GetTempPathA(MAX_PATH - 32, path);
+    char path[MAX_PATH] = {};
+    DWORD dirLen = GetTempPathA(MAX_PATH, path);
     if (dirLen == 0 || dirLen >= (DWORD)(MAX_PATH - 32)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -259,15 +262,15 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
     VehWriteStr(h, " addr=0x");
     VehWriteHex64(h, (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress, 16);
     VehWriteStr(h, "\r\n");
-    HMODULE mods[256];
+    HMODULE mods[256] = {};
     DWORD needed = 0;
     if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
-        DWORD count = needed / sizeof(HMODULE);
+        DWORD count = needed / (DWORD)sizeof(HMODULE);
         if (count > 256) {
             count = 256;
         }
         for (DWORD m = 0; m < count; ++m) {
-            char modName[MAX_PATH];
+            char modName[MAX_PATH] = {};
             DWORD nlen = GetModuleFileNameA(mods[m], modName, MAX_PATH);
             if (nlen == 0) {
                 continue;
@@ -284,14 +287,14 @@ static LONG WINAPI AstroVehHandler(PEXCEPTION_POINTERS ep)
         }
     }
     PVOID frames[48] = {};
-    DWORD backHash = 0;
-    WORD captured = CaptureStackBackTrace(0, 48, frames, &backHash);
+    ULONG backHash = 0;
+    USHORT captured = CaptureStackBackTrace(0, 48, frames, &backHash);
     VehWriteStr(h, "stack frames=0x");
     VehWriteHex64(h, (unsigned long long)captured, 4);
     VehWriteStr(h, " hash=0x");
     VehWriteHex64(h, (unsigned long long)backHash, 8);
     VehWriteStr(h, "\r\n");
-    for (WORD f = 0; f < captured; ++f) {
+    for (USHORT f = 0; f < captured; ++f) {
         VehWriteStr(h, "  0x");
         VehWriteHex64(h, (unsigned long long)(uintptr_t)frames[f], 16);
         VehWriteStr(h, "\r\n");
@@ -307,13 +310,32 @@ static LONG WINAPI VehAvLogger(PEXCEPTION_POINTERS ep)
     if (ep->ExceptionRecord->ExceptionCode != 0xC0000005u) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    char line[256];
+    char line[256] = {};
     int n = _snprintf_s(line, _TRUNCATE,
         "[VEH] AV thread=%lu addr=0x%llX",
-        GetCurrentThreadId(),
+        (unsigned long)GetCurrentThreadId(),
         (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
-    if (n > 0) appendCrashLine(line);
+    if (n > 0) (void)appendCrashLine(line);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+static DWORD WINAPI AstroAntiDbgThread(LPVOID)
+{
+    // Gate: el primer scan espera hasta que el QML termino de cargar.
+    // LoadLibrary de plugins QML toma el loader lock; Toolhelp32Snapshot en
+    // paralelo puede deadlockear/spinear durante engine.load().
+    while (!g_qmlReady.load()) Sleep(250);
+    while (true) {
+        if (astroScanDebugger() > 0) {
+            TerminateProcess(GetCurrentProcess(), 0xDEAD05);
+            return 0xDEAD05;
+        }
+        // El scan completo (~39 checks) consume ~3s de CPU y toma el loader
+        // lock (NtQuerySystemInformation de modulos). Un scan frecuente en
+        // paralelo con las LoadLibrary on-demand de QtQuick deadlockea el
+        // main thread. 60s = ventana de colision ~5% y deteccion efectiva.
+        Sleep(60000);
+    }
+    return 0;
 }
 #endif
 
@@ -626,7 +648,7 @@ int intArg(const QStringList &args, const QString &flag, int minV, int maxV, int
 int main(int argc, char *argv[])
 {
 #ifdef Q_OS_WIN
-    AddVectoredExceptionHandler(1, AstroVehHandler);
+    AddVectoredExceptionHandler(1UL, AstroVehHandler);
 #endif
     // =====================================================================
     // PHASE -1: Self-integrity check (before ANYTHING else)
@@ -674,8 +696,8 @@ int main(int argc, char *argv[])
     {
         // VECTORED EH: registrar TODA excepcion first-chance de cualquier hilo para
         // diagnosticar el AV ~12s que no pasa por el filtro unhandled.
-        // Nota: se usa funcion CALLBACK (__stdcall), el lambda __cdecl no convierte a PVECTORED_EXCEPTION_HANDLER.
-        AddVectoredExceptionHandler(0, VehAvLogger);
+        // Nota: se usa funcion WINAPI (__stdcall), el lambda __cdecl no convierte a PVECTORED_EXCEPTION_HANDLER.
+        AddVectoredExceptionHandler(0UL, VehAvLogger);
     }
     {
         // WINHTTP DIAGNOSTIC: does a plain POST work before ANY security init?
@@ -705,24 +727,7 @@ int main(int argc, char *argv[])
     // AntiDBG single-run checks en hilo dedicado (NotRequiem, MIT, parchado).
     // El guard completo usa instrumentation callbacks incompatibles con Win11 24H2+;
     // usamos isProgramBeingDebugged() periodico (checks syscall, sin hooks).
-    CreateThread(nullptr, 0, [](LPVOID)->DWORD {
-        // Gate: el primer scan espera hasta que el QML termino de cargar.
-        // LoadLibrary de plugins QML toma el loader lock; Toolhelp32Snapshot en
-        // paralelo puede deadlockear/spinear durante engine.load().
-        while (!g_qmlReady.load()) Sleep(250);
-        while (true) {
-            if (astroScanDebugger() > 0) {   // wrapper parcheado: sin FP de NTSTATUS
-                TerminateProcess(GetCurrentProcess(), 0xDEAD05);
-                return 0xDEAD05;
-            }
-            // El scan completo (~39 checks) consume ~3s de CPU y toma el loader
-            // lock (NtQuerySystemInformation de modulos). Un scan frecuente en
-            // paralelo con las LoadLibrary on-demand de QtQuick deadlockea el
-            // main thread. 60s = ventana de colision ~5% y deteccion efectiva.
-            Sleep(60000);
-        }
-        return 0;
-    }, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, AstroAntiDbgThread, nullptr, 0, nullptr);
     dbgTrace("antidbg-syscall-started");
 
     // =====================================================================
@@ -761,18 +766,22 @@ int main(int argc, char *argv[])
     }
 #endif
     dbgTrace("parent-check-begin");
-    if (!allowStandalone) {
+    bool parentOk = true;
 #ifndef NDEBUG
-        // DEBUG-ONLY test hook: skip loader-parent check when ASTRO_TEST=1.
-        // Compiled only in debug builds; in Release this block disappears and
-        // the parent check below is unconditional.
-        const bool testMode = qEnvironmentVariableIsSet("ASTRO_TEST");
-        if (testMode) {
-            dbgTrace("parent-check-SKIPPED(test)");
-        } else if (!astro::license::isParentAstroLoader()) {
+    // DEBUG-ONLY test hook: skip loader-parent check when ASTRO_TEST=1.
+    // Compiled only in debug builds; in Release this block desaparece y
+    // el parent check de abajo es incondicional.
+    if (qEnvironmentVariableIsSet("ASTRO_TEST")) {
+        dbgTrace("parent-check-SKIPPED(test)");
+        parentOk = true;
+    } else {
+        parentOk = astro::license::isParentAstroLoader();
+    }
 #else
-        if (!astro::license::isParentAstroLoader()) {
+    parentOk = astro::license::isParentAstroLoader();
 #endif
+    if (!allowStandalone) {
+        if (!parentOk) {
             dbgTrace("parent-check-FAILED");
             SecureLog::instance().write("LIC", "Blocked: parent is not AstroLoader");
 #ifdef Q_OS_WIN
