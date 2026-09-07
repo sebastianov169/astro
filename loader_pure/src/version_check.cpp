@@ -43,6 +43,10 @@ std::string parseLoaderSha256(const std::string& resp) {
     return parseShaField(resp, OBFUSCATE("loader_sha256"));
 }
 
+std::string parsePackageSha256(const std::string& resp) {
+    return parseShaField(resp, OBFUSCATE("package_sha256"));
+}
+
 std::string sha256FileHex(const std::wstring& path) {
     HANDLE hFile = CreateFileW(path.c_str(),
                                GENERIC_READ,
@@ -134,6 +138,40 @@ std::string sha256FileHex(const std::wstring& path) {
         result.push_back(hexChars[hash[i] & 0xF]);
     }
 
+    return result;
+}
+
+std::string sha256BytesHex(const std::vector<uint8_t>& data) {
+    if (data.empty()) return "";
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    std::string result;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
+        return "";
+    }
+    DWORD cbHashObject = 0, cbData = 0, cbHash = 0;
+    if (!BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbHashObject, sizeof(DWORD), &cbData, 0)) ||
+        !BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&cbHash, sizeof(DWORD), &cbData, 0))) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return "";
+    }
+    std::vector<BYTE> hashObject(cbHashObject);
+    std::vector<BYTE> hash(cbHash);
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(hAlg, &hHash, hashObject.data(), cbHashObject, NULL, 0, 0))) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return "";
+    }
+    bool ok = BCRYPT_SUCCESS(BCryptHashData(hHash, (PUCHAR)data.data(), (ULONG)data.size(), 0)) &&
+              BCRYPT_SUCCESS(BCryptFinishHash(hHash, hash.data(), cbHash, 0));
+    if (hHash != NULL) BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!ok) return "";
+    static const char* hexChars = "0123456789abcdef";
+    result.reserve(cbHash * 2);
+    for (DWORD i = 0; i < cbHash; ++i) {
+        result.push_back(hexChars[(hash[i] >> 4) & 0xF]);
+        result.push_back(hexChars[hash[i] & 0xF]);
+    }
     return result;
 }
 

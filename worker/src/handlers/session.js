@@ -76,6 +76,7 @@ export async function createSession(request, env) {
   let respVersion;
   let respAstroSha256;
   let respLoaderSha256;
+  let respPackageSha256;
   try {
     if (env.STORAGE) {
       const obj = await env.STORAGE.get('version.json');
@@ -88,6 +89,9 @@ export async function createSession(request, env) {
         }
         if (data && typeof data.loader_sha256 === 'string') {
           respLoaderSha256 = data.loader_sha256;
+        }
+        if (data && typeof data.package_sha256 === 'string') {
+          respPackageSha256 = data.package_sha256;
         }
         try { logSecurityEvent(env, 'VERSION_INFO', 'v=' + (respVersion || '?') + ' astro=' + (respAstroSha256 || '?').slice(0, 8)); } catch {}
       } else {
@@ -115,6 +119,7 @@ export async function createSession(request, env) {
     resp.astro_sha256 = respAstroSha256;
   }
   if (respLoaderSha256) resp.loader_sha256 = respLoaderSha256;
+  if (respPackageSha256) resp.package_sha256 = respPackageSha256;
   return jsonResponse(resp);
 }
 

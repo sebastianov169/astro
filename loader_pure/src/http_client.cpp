@@ -182,8 +182,9 @@ bool HttpClient::getBinary(const std::wstring& url, std::vector<BYTE>& outBytes)
     
     WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    // Timeouts: nunca colgar mas de 10s por fase (proxy/hooks pueden bloquear)
-    WinHttpSetTimeouts(req, 10000, 10000, 10000, 10000);
+    // Descargas grandes (41MB): 60s por fase. Los 10s mataban el download con
+    // red variable -> zip truncado -> extraccion parcial -> Astro moria al arrancar.
+    WinHttpSetTimeouts(req, 60000, 60000, 60000, 60000);
     WinHttpReceiveResponse(req, nullptr);
     
     DWORD statusCode = 0, statusSize = sizeof(statusCode);

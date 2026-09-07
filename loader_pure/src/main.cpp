@@ -92,6 +92,7 @@ static HWND hEditKey, hBtnActivate, hStaticStatus, hProgress;
 static std::string g_hwid, g_licenseKey;
 static std::string g_serverAstroSha;
 static std::string g_serverLoaderSha;
+static std::string g_serverPackageSha;
 static wchar_t g_tempPath[MAX_PATH];
 static HBRUSH g_hbrBg, g_hbrEdit, g_hbrBtn;
 static HFONT g_hFont, g_hFontBold, g_hFontSmall, g_hFontTitle;
@@ -151,6 +152,7 @@ static bool registerSession(HttpClient& http, const std::string& token){
     bool ok = look.find("\"success\":true") != std::string::npos;
     g_serverAstroSha = vercheck::parseAstroSha256(look);
     g_serverLoaderSha = vercheck::parseLoaderSha256(look);
+    g_serverPackageSha = vercheck::parsePackageSha256(look);
     // BUGFIX: persist the sidecar token ONLY after server confirmed the session.
     if (ok) {
         wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
@@ -627,7 +629,22 @@ setLabel(hStaticStatus, OBFUSCATE("Connecting..."));
     
     std::vector<BYTE> zipData;
     traceStage("DT-DL-START");
-    bool dlOk = http.getBinary(dlUrl, zipData);
+    bool dlOk = false;
+    for (int attempt = 0; attempt < 3 && !dlOk; ++attempt) {
+        if (attempt > 0) { Sleep(2000); traceStage("DT-DL-RETRY"); }
+        zipData.clear();
+        dlOk = http.getBinary(dlUrl, zipData);
+        if (dlOk && zipData.size() >= 100 && !g_serverPackageSha.empty()) {
+            std::string got = vercheck::sha256BytesHex(
+                *reinterpret_cast<const std::vector<uint8_t>*>(&zipData));
+            if (got.empty() || _stricmp(got.c_str(), g_serverPackageSha.c_str()) != 0) {
+                traceStage("DT-DL-HASH-MISMATCH");
+                dlOk = false;
+                continue;
+            }
+            traceStage("DT-DL-HASH-OK");
+        }
+    }
     { char b[96]; snprintf(b, 96, "DT-DL-END ok=%d bytes=%zu status=%d", (int)dlOk, zipData.size(), http.lastStatus()); traceStage(b); }
     if (!dlOk || zipData.size() < 100) {
         setLabel(hStaticStatus, OBFUSCATE("This application build is not allowed"));
@@ -706,6 +723,22 @@ CreateDirectoryW(appDir.c_str(), nullptr);
             EnableWindow(hBtnActivate, TRUE);
             return 0;
         }
+    }
+
+    // Post-extraccion: verificar hash del Astro.exe contra el servidor.
+    // Si no coincide (extraccion corrupta), borrar y fallar sin lanzar roto.
+    if (!g_serverAstroSha.empty()) {
+        std::string exHash = vercheck::sha256FileHex(astroCheck);
+        if (exHash.empty() || _stricmp(exHash.c_str(), g_serverAstroSha.c_str()) != 0) {
+            traceStage("DT-EXTRACT-HASH-MISMATCH");
+            deleteAstroApp();
+            DeleteFileW(zipPath.c_str());
+            setLabel(hStaticStatus, OBFUSCATE("Download corrupted - please retry"));
+            SendMessage(hProgress, PBM_SETPOS, 0, 0);
+            EnableWindow(hBtnActivate, TRUE);
+            return 0;
+        }
+        traceStage("DT-EXTRACT-HASH-OK");
     }
 
     // Delete ZIP after successful extraction
