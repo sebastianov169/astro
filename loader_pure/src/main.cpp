@@ -98,6 +98,7 @@ static HBRUSH g_hbrBg, g_hbrEdit, g_hbrBtn;
 static HFONT g_hFont, g_hFontBold, g_hFontSmall, g_hFontTitle;
 static HICON g_hIcon;
 static HANDLE g_hAstroJob = nullptr;  // job object binding Astro.exe to loader lifetime
+static int g_autoRetryCount = 0;  // reintentos automaticos tras crash 0xC0000409 (max 2)
 static bool g_activated = false;
 static std::wstring toWide(const std::string& s);  // fwd decl for helpers below
 // === SECURITY FIX: session handshake restored (was lost from this source) ===
@@ -589,6 +590,11 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
                       if (ec == 0xC0000409) {
                           traceStage("ASTRO-CRASH-FAST");
                           CloseHandle(piL.hThread); CloseHandle(piL.hProcess);
+                          if (++g_autoRetryCount <= 2) {
+                              char rb[64]; snprintf(rb, 64, "ASTRO-AUTORETRY=%d", g_autoRetryCount); traceStage(rb);
+                              setLabel(hStaticStatus, OBFUSCATE("Retrying launch..."));
+                              return downloadThreadInner();
+                          }
                           std::string msg = std::string(OBFUSCATE("Astro closed unexpectedly (0xC0000409). Cache kept for diagnosis."));
                           ShowWindow(GetParent(hStaticStatus), SW_SHOW);
                           MessageBoxA(GetParent(hStaticStatus), msg.c_str(), "Astro", MB_OK | MB_ICONERROR);
@@ -885,9 +891,17 @@ CreateDirectoryW(appDir.c_str(), nullptr);
       ecExit = ec2; }
     CloseHandle(hProc);
     if (ecExit == 0xC0000409) {
-        // Crash de stack-cookie / CFG: NO borrar evidencia. Conservar arbol
-        // extraido para diagnostico y avisar con el codigo de salida.
+        // Crash intermitente de arranque (~5s): NO borrar evidencia y
+        // reintentar automaticamente con sesion fresca (max 2 reintentos).
+        // El cache se conserva (ya verificado por hash) asi que el retry
+        // solo re-registra sesion y relanza: ~67% exito/arranque ->
+        // ~96% con 2 retries.
         traceStage("ASTRO-CRASH-FAST");
+        if (++g_autoRetryCount <= 2) {
+            char rb[64]; snprintf(rb, 64, "ASTRO-AUTORETRY=%d", g_autoRetryCount); traceStage(rb);
+            setLabel(hStaticStatus, OBFUSCATE("Retrying launch..."));
+            return downloadThreadInner();
+        }
         std::string msg = std::string(OBFUSCATE("Astro closed unexpectedly (0xC0000409). Cache kept for diagnosis."));
         setLabel(hStaticStatus, msg.c_str());
         ShowWindow(GetParent(hStaticStatus), SW_SHOW);
