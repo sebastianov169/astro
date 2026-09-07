@@ -14,9 +14,11 @@
 
 // DEBUG TRACE (temporary)
 #include <cstdio>
+#include <cstdlib>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <dbghelp.h>
 #pragma warning(disable: 4996)
 #include <atomic>
 static std::atomic<bool> g_qmlReady{false};
@@ -113,14 +115,19 @@ static bool appendCrashLine(const char *line)
     return true;
 }
 
-static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
+static LONG CALLBACK sehHandler(PEXCEPTION_POINTERS ep)
 {
+    if (ep == nullptr || ep->ExceptionRecord == nullptr) {
+        TerminateProcess(GetCurrentProcess(), 1);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
     char line[1024] = {0};
     int n = _snprintf_s(line, _TRUNCATE,
                         "[SEH] exception 0x%08lX at 0x%llX thread=%lu",
                         (unsigned long)ep->ExceptionRecord->ExceptionCode,
                         (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress,
                         (unsigned long)GetCurrentThreadId());
+    (void)n;
     if (ep->ContextRecord) {
         char regs[640] = {0};
         const CONTEXT *c = ep->ContextRecord;
@@ -160,10 +167,8 @@ static LONG WINAPI sehHandler(PEXCEPTION_POINTERS ep)
         strncat_s(line, sizeof(line), " module=", _TRUNCATE);
         strncat_s(line, sizeof(line), modName, _TRUNCATE);
     }
-    TerminateProcess(GetCurrentProcess(), 1);
-#ifdef ASTRO_DEBUG_TRACE
     appendCrashLine(line);
-#endif
+    TerminateProcess(GetCurrentProcess(), 1);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -265,8 +270,8 @@ static LONG CALLBACK AstroVehHandler(PEXCEPTION_POINTERS ep)
             VehWriteStr(h, "\r\n");
         }
     }
-    PVOID frames[48];
-    DWORD backHash = 0;
+    PVOID frames[48] = {};
+    ULONG backHash = 0;
     WORD captured = CaptureStackBackTrace(0, 48, frames, &backHash);
     VehWriteStr(h, "stack frames=0x");
     VehWriteHex64(h, (unsigned long long)captured, 4);
@@ -279,6 +284,22 @@ static LONG CALLBACK AstroVehHandler(PEXCEPTION_POINTERS ep)
         VehWriteStr(h, "\r\n");
     }
     CloseHandle(h);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG CALLBACK VehAvLogger(PEXCEPTION_POINTERS ep)
+{
+    if (ep == nullptr || ep->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (ep->ExceptionRecord->ExceptionCode != 0xC0000005u) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char line[256];
+    int n = _snprintf_s(line, _TRUNCATE,
+        "[VEH] AV thread=%lu addr=0x%llX",
+        GetCurrentThreadId(),
+        (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
+    if (n > 0) appendCrashLine(line);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
@@ -640,18 +661,8 @@ int main(int argc, char *argv[])
     {
         // VECTORED EH: registrar TODA excepcion first-chance de cualquier hilo para
         // diagnosticar el AV ~12s que no pasa por el filtro unhandled.
-        static auto veh = [](PEXCEPTION_POINTERS ep) -> LONG {
-            if (ep->ExceptionRecord->ExceptionCode == 0xC0000005u) {
-                char line[256];
-                int n = _snprintf_s(line, _TRUNCATE,
-                    "[VEH] AV thread=%lu addr=0x%llX",
-                    GetCurrentThreadId(),
-                    (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
-                if (n > 0) appendCrashLine(line);
-            }
-            return EXCEPTION_CONTINUE_SEARCH;
-        };
-        AddVectoredExceptionHandler(0, veh);
+        // Nota: se usa funcion CALLBACK (__stdcall), el lambda __cdecl no convierte a PVECTORED_EXCEPTION_HANDLER.
+        AddVectoredExceptionHandler(0, VehAvLogger);
     }
     {
         // WINHTTP DIAGNOSTIC: does a plain POST work before ANY security init?

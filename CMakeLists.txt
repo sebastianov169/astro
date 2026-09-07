@@ -223,6 +223,7 @@ target_link_libraries(Astro PRIVATE
     ncrypt
     ntdll
     psapi
+    dbghelp
     ws2_32
     iphlpapi
     ole32
