@@ -607,6 +607,7 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
 setLabel(hStaticStatus, OBFUSCATE("Connecting..."));
     SendMessage(hProgress, PBM_SETPOS, 20, 0);
     JUNK_LOOP(2);
+    traceStage("DT-ACT-OK-DOWNLOADING");
     
     // Download ZIP from R2
     std::wstring dlUrl = toWide(OBFUSCATE("https://astro-license.astro-bots.workers.dev")) + 
@@ -618,7 +619,10 @@ setLabel(hStaticStatus, OBFUSCATE("Connecting..."));
     std::wstring zipPath = std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"));
     
     std::vector<BYTE> zipData;
-    if (!http.getBinary(dlUrl, zipData) || zipData.size() < 100) {
+    traceStage("DT-DL-START");
+    bool dlOk = http.getBinary(dlUrl, zipData);
+    { char b[96]; snprintf(b, 96, "DT-DL-END ok=%d bytes=%zu status=%d", (int)dlOk, zipData.size(), http.lastStatus()); traceStage(b); }
+    if (!dlOk || zipData.size() < 100) {
         setLabel(hStaticStatus, OBFUSCATE("This application build is not allowed"));
         SendMessage(hProgress, PBM_SETPOS, 0, 0);
         EnableWindow(hBtnActivate, TRUE);
