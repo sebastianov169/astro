@@ -549,20 +549,20 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
                 traceStage("LAUNCH-JOB-ASSIGNED");
                 ResumeThread(piL.hThread);
                 traceStage("LAUNCH-RESUMED");
-                CloseHandle(piL.hThread); CloseHandle(piL.hProcess);
                 SendMessage(hProgress, PBM_SETPOS, 100, 0);
                 g_activated = true;
                 // Hide auth window - Astro is running
                 ShowWindow(GetParent(hStaticStatus), SW_HIDE);
                 // Wait for Astro to close, then clean up (same as fresh path)
+                // FIX: esperar SOBRE piL.hProcess directamente. El codigo anterior
+                // hacia CloseHandle y luego DuplicateHandle del handle cerrado
+                // (WAIT_FAILED instantaneo + GetExitCode basura) y limpiaba los
+                // archivos con Astro todavia corriendo.
                 {
-                    HANDLE hProcDup;
-                    DuplicateHandle(GetCurrentProcess(), piL.hProcess,
-                        GetCurrentProcess(), &hProcDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
-                    WaitForSingleObject(hProcDup, INFINITE);
-                    { DWORD ec = 0; GetExitCodeProcess(hProcDup, &ec);
+                    WaitForSingleObject(piL.hProcess, INFINITE);
+                    { DWORD ec = 0; GetExitCodeProcess(piL.hProcess, &ec);
                       char b[64]; snprintf(b, 64, "ASTRO-EXIT=%lu", (unsigned long)ec); traceStage(b); }
-                    CloseHandle(hProcDup);
+                    CloseHandle(piL.hThread); CloseHandle(piL.hProcess);
                     deleteAstroApp();
                     DeleteFileW((std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"))).c_str());
                     cleanupOldZips();
