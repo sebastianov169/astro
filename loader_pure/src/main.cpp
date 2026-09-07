@@ -568,7 +568,15 @@ setLabel(hStaticStatus, OBFUSCATE("Creating secure session..."));
                 {
                     WaitForSingleObject(piL.hProcess, INFINITE);
                     { DWORD ec = 0; GetExitCodeProcess(piL.hProcess, &ec);
-                      char b[64]; snprintf(b, 64, "ASTRO-EXIT=%lu", (unsigned long)ec); traceStage(b); }
+                      char b[64]; snprintf(b, 64, "ASTRO-EXIT=%lu", (unsigned long)ec); traceStage(b);
+                      if (ec == 0xC0000409) {
+                          traceStage("ASTRO-CRASH-FAST");
+                          CloseHandle(piL.hThread); CloseHandle(piL.hProcess);
+                          std::string msg = std::string(OBFUSCATE("Astro closed unexpectedly (0xC0000409). Cache kept for diagnosis."));
+                          ShowWindow(GetParent(hStaticStatus), SW_SHOW);
+                          MessageBoxA(GetParent(hStaticStatus), msg.c_str(), "Astro", MB_OK | MB_ICONERROR);
+                          ExitProcess((UINT)ec);
+                      } }
                     CloseHandle(piL.hThread); CloseHandle(piL.hProcess);
                     deleteAstroApp();
                     DeleteFileW((std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"))).c_str());
@@ -617,6 +625,22 @@ setLabel(hStaticStatus, OBFUSCATE("Connecting..."));
     SendMessage(hProgress, PBM_SETPOS, 20, 0);
     JUNK_LOOP(2);
     traceStage("DT-ACT-OK-DOWNLOADING");
+    // Sesion previa a la descarga: trae version/astro_sha256/package_sha256
+    // de R2 para verificar integridad del ZIP y del extraido. Sin esto los
+    // hashes llegaban tarde (recien en la sesion de lanzamiento) y jamas se
+    // verificaba nada. Fail-closed aqui: sin sesion no hay descarga.
+    {
+        std::string preToken = generateSessionToken();
+        if (preToken.empty() || !registerSession(http, preToken)) {
+            traceStage("DT-PRESESSION-FAIL");
+            setLabel(hStaticStatus, OBFUSCATE("This application build is not allowed"));
+            SendMessage(hProgress, PBM_SETPOS, 0, 0);
+            EnableWindow(hBtnActivate, TRUE);
+            return 0;
+        }
+        traceStage("DT-PRESESSION-OK");
+        SecureZeroMemory((void*)preToken.data(), preToken.size());
+    }
     
     // Download ZIP from R2
     std::wstring dlUrl = toWide(OBFUSCATE("https://astro-license.astro-bots.workers.dev")) + 
@@ -838,9 +862,21 @@ CreateDirectoryW(appDir.c_str(), nullptr);
     
     // Wait for Astro to close, then auto-delete everything
     WaitForSingleObject(hProc, INFINITE);
+    DWORD ecExit = 0;
     { DWORD ec2 = 0; GetExitCodeProcess(hProc, &ec2);
-      char b2[64]; snprintf(b2, 64, "ASTRO-EXIT=%lu", (unsigned long)ec2); traceStage(b2); }
+      char b2[64]; snprintf(b2, 64, "ASTRO-EXIT=%lu", (unsigned long)ec2); traceStage(b2);
+      ecExit = ec2; }
     CloseHandle(hProc);
+    if (ecExit == 0xC0000409) {
+        // Crash de stack-cookie / CFG: NO borrar evidencia. Conservar arbol
+        // extraido para diagnostico y avisar con el codigo de salida.
+        traceStage("ASTRO-CRASH-FAST");
+        std::string msg = std::string(OBFUSCATE("Astro closed unexpectedly (0xC0000409). Cache kept for diagnosis."));
+        setLabel(hStaticStatus, msg.c_str());
+        ShowWindow(GetParent(hStaticStatus), SW_SHOW);
+        MessageBoxA(GetParent(hStaticStatus), msg.c_str(), "Astro", MB_OK | MB_ICONERROR);
+        ExitProcess((UINT)ecExit);
+    }
     deleteAstroApp();
     DeleteFileW((std::wstring(g_tempPath) + toWide(OBFUSCATE("astro_package.zip"))).c_str());
     // Close auth window
