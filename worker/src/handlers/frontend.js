@@ -257,7 +257,7 @@ function showLogin(){document.getElementById('dashView').classList.add('hidden')
 
 
 
-async async function login(){
+async function login(){
 
   const key=document.getElementById('keyInput').value.trim();
 
@@ -295,7 +295,7 @@ function genKey(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const buf=new Uint3
 
 
 
-async async function loadData(){
+async function loadData(){
 
   try{
 
@@ -555,7 +555,7 @@ let _pollTimer=null;
 
 let _alertsVisible=false;
 
-async async function toggleAlerts(){
+async function toggleAlerts(){
 
   _alertsVisible=!_alertsVisible;
 
