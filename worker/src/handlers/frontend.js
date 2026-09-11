@@ -247,11 +247,18 @@ let TIERS={0:'Trial',1:'Basic',2:'Premium'};
 
 
 
-async function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function el(id){return document.getElementById(id);}
+function esc(s){var d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
+function authHeaders(){return {'X-Session-Token':TOKEN};}
+function authJsonHeaders(){return {'Content-Type':'application/json','X-Session-Token':TOKEN};}
+function parseHw(s){var hw={};try{hw=JSON.parse(s||'{}');}catch(e){hw={};}return hw;}
+function renderPending(pending){var list=el('pendingList');if(!list){return;}while(list.firstChild){list.removeChild(list.firstChild);}pending.forEach(function(l){var key=l.license_key;var card=document.createElement('div');card.setAttribute('style','border:1px solid #333;padding:12px;border-radius:8px;margin-bottom:8px;background:#111827');var head=document.createElement('div');head.setAttribute('style','color:#f0c040;font-family:monospace;font-size:12px;display:flex;justify-content:space-between;align-items:center');var ks=document.createElement('span');ks.textContent=key;var cp=document.createElement('button');cp.className='btn-ghost';cp.setAttribute('style','padding:2px 8px;font-size:11px');cp.textContent='Copy';cp.addEventListener('click',function(){navigator.clipboard.writeText(key);});head.appendChild(ks);head.appendChild(cp);card.appendChild(head);var hw=parseHw(l.hardware_info);var hwDiv=document.createElement('div');hwDiv.setAttribute('style','color:#999;font-size:11px;margin:6px 0');hwDiv.textContent='PC: '+(hw.hostname||hw.host||l.client_ip||'?')+' | IP: '+(l.client_ip||'?')+' | HWID: '+String(l.hwid_hash||'').slice(0,16);card.appendChild(hwDiv);var acts=document.createElement('div');acts.setAttribute('style','display:flex;gap:8px;margin-top:8px');var bA=document.createElement('button');bA.className='btn-green';bA.setAttribute('style','padding:6px 12px');bA.textContent='Activar - ligar a PC';bA.addEventListener('click',function(){approve(key);});var bR=document.createElement('button');bR.className='btn-red';bR.setAttribute('style','padding:6px 12px');bR.textContent='Reject';bR.addEventListener('click',function(){reject(key);});acts.appendChild(bA);acts.appendChild(bR);card.appendChild(acts);list.appendChild(card);});}
+function renderTable(all){var tbody=el('licTable');if(!tbody){return;}while(tbody.firstChild){tbody.removeChild(tbody.firstChild);}if(!all.length){var tr=document.createElement('tr');var td=document.createElement('td');td.colSpan=6;td.setAttribute('style','text-align:center;color:#666');td.textContent='No licenses';tr.appendChild(td);tbody.appendChild(tr);return;}all.forEach(function(l){var key=l.license_key;var st=l.is_revoked?'revoked':(l.status||'active');var tr2=document.createElement('tr');var tdK=document.createElement('td');tdK.className='mono';tdK.setAttribute('style','color:#f0c040');tdK.textContent=key;var tdH=document.createElement('td');tdH.className='mono';tdH.setAttribute('style','color:#666');tdH.textContent=l.hwid_hash?String(l.hwid_hash).slice(0,12)+'...':'not bound';var tdT=document.createElement('td');var bT=document.createElement('span');bT.className='badge badge-'+st;bT.textContent=TIERS[l.tier||0];tdT.appendChild(bT);var tdS=document.createElement('td');var bS=document.createElement('span');bS.className='badge badge-'+st;bS.textContent=st;tdS.appendChild(bS);var tdE=document.createElement('td');tdE.setAttribute('style','color:#666;font-size:11px');try{tdE.textContent=l.expires_at?new Date(l.expires_at).toLocaleDateString():'-';}catch(e){tdE.textContent='-';}var tdA=document.createElement('td');tdA.setAttribute('style','display:flex;gap:4px;flex-wrap:wrap');if(st==='pending'){var bA=document.createElement('button');bA.className='btn-green';bA.setAttribute('style','padding:4px 8px;font-size:11px');bA.textContent='Activar';bA.addEventListener('click',function(){approve(key);});tdA.appendChild(bA);}if(st==='active'){var bR=document.createElement('button');bR.className='btn-red';bR.setAttribute('style','padding:4px 8px;font-size:11px');bR.textContent='Revoke';bR.addEventListener('click',function(){revoke(key);});tdA.appendChild(bR);}var bD=document.createElement('button');bD.className='btn-ghost';bD.setAttribute('style','padding:4px 8px;font-size:11px');bD.textContent='Remove';bD.addEventListener('click',function(){removeLic(key);});tdA.appendChild(bD);var bK=document.createElement('button');bK.className='btn-dark';bK.setAttribute('style','padding:4px 8px;font-size:11px');bK.textContent='Autokill';bK.addEventListener('click',function(){autokill(key);});tdA.appendChild(bK);tr2.appendChild(tdK);tr2.appendChild(tdH);tr2.appendChild(tdT);tr2.appendChild(tdS);tr2.appendChild(tdE);tr2.appendChild(tdA);tbody.appendChild(tr2);});}
+function renderAlertList(list){var host=el('alertList');if(!host){return;}while(host.firstChild){host.removeChild(host.firstChild);}if(!list.length){var empty=document.createElement('div');empty.setAttribute('style','padding:16px;color:#666');empty.textContent='Sin alertas';host.appendChild(empty);return;}list.forEach(function(a){var row=document.createElement('div');row.setAttribute('style','padding:10px;border-bottom:1px solid #222');var col=a.severity==='high'?'var(--red)':(a.severity==='low'?'var(--dim)':'var(--gold)');var b=document.createElement('b');b.style.color=col;b.textContent=a.alert_type;var sp=document.createElement('span');sp.setAttribute('style','color:#666;font-size:11px;margin-left:6px');sp.textContent=a.created_at||'';var br=document.createElement('br');var mono=document.createElement('span');mono.className='mono';mono.setAttribute('style','font-size:11px;color:#999');mono.textContent=(a.license_key||'-')+' | '+(a.ip_address||'')+' | '+(a.country||'');row.appendChild(b);row.appendChild(sp);row.appendChild(br);row.appendChild(mono);if(a.details){var br2=document.createElement('br');var det=document.createElement('span');det.setAttribute('style','font-size:11px;color:#777');det.textContent=String(a.details).substring(0,160);row.appendChild(br2);row.appendChild(det);}host.appendChild(row);});}
 
-async function toast(m,t='ok'){const c=document.getElementById('toast');const d=document.createElement('div');d.className='toast '+(t==='ok'?'ok':'err');d.textContent=m;c.appendChild(d);setTimeout(()=>d.remove(),3000)}
+function toast(m,t){var tt=t||'ok';var c=document.getElementById('toast');if(!c){return;}var d=document.createElement('div');d.className='toast '+(tt==='ok'?'ok':'err');d.textContent=m;c.appendChild(d);setTimeout(function(){d.remove();},3000);}
 
-async function showDash(){document.getElementById('loginView').classList.add('hidden');document.getElementById('dashView').classList.remove('hidden')}
+function showDash(){document.getElementById('loginView').classList.add('hidden');document.getElementById('dashView').classList.remove('hidden');if(typeof startPolling==='function'){try{startPolling();}catch(e){}}}
 
 function showLogin(){document.getElementById('dashView').classList.add('hidden');document.getElementById('loginView').classList.remove('hidden')}
 
@@ -279,7 +286,7 @@ async function login(){
 
     TOKEN=d.session_token;localStorage.setItem('astro_session',TOKEN);
 
-    window._lastPendingKeys=null;
+    window._lastPendingKeys=null;window._lastAlertIds=null;try{document.getElementById('loginMsg').textContent='';}catch(e){}
 
     showDash();toast('Welcome');loadData();
 
@@ -289,7 +296,7 @@ async function login(){
 
 }
 
-function logout(){TOKEN='';localStorage.removeItem('astro_session');showLogin()}
+function logout(){try{if(typeof stopPolling==='function'){stopPolling();}}catch(e){}TOKEN='';try{localStorage.removeItem('astro_session');}catch(e){}window._lastPendingKeys=null;window._lastAlertIds=null;try{var ab=document.getElementById('alertBox');if(ab){ab.style.display='none';}}catch(e){}showLogin();}
 
 function genKey(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const buf=new Uint32Array(16);crypto.getRandomValues(buf);let k='';for(let i=0;i<16;i++)k+=c[buf[i]%c.length];document.getElementById('newKey').value=k.slice(0,4)+'-'+k.slice(4,8)+'-'+k.slice(8,12)+'-'+k.slice(12,16)+'-000000000000'}
 
@@ -343,7 +350,7 @@ async function loadData(){
 
     const box=document.getElementById('pendingBox');
 
-    async function renderHw(hwStr, clientIp, clientCountry, fallbackHwid){
+    function renderHw(hwStr, clientIp, clientCountry, fallbackHwid){
 
       let hw={}; try{hw=JSON.parse(hwStr||'{}')}catch{}
 
@@ -457,7 +464,7 @@ async function loadData(){
 
     }
 
-    if(pending.length){box.classList.remove('hidden');document.getElementById('pendingCount').textContent='('+pending.length+')';document.getElementById('pendingList').innerHTML=pending.map(l=>'<div style="border:1px solid #333;padding:12px;border-radius:8px;margin-bottom:8px;background:#111827"><div style="color:#f0c040;font-family:monospace;font-size:12px;display:flex;justify-content:space-between;align-items:center">'+esc(l.license_key)+' <button class="btn-ghost" style="padding:2px 8px;font-size:11px" onclick="navigator.clipboard.writeText(\''+esc(l.license_key)+'\')">Copy</button></div>'+renderHw(l.hardware_info, l.client_ip, l.client_country, l.hwid_hash)+'<div style="display:flex;gap:8px;margin-top:8px"><button class="btn-green" style="padding:6px 12px" onclick="approve(\''+esc(l.license_key)+'\')">Activar - ligar a PC</button> <button class="btn-red" style="padding:6px 12px" onclick="reject(\''+esc(l.license_key)+'\')">Reject</button></div></div>').join('')} else box.classList.add('hidden');
+    if(pending.length){box.classList.remove('hidden');document.getElementById('pendingCount').textContent='('+pending.length+')';try{renderPending(pending);}catch(e){}} else box.classList.add('hidden');
 
     const tbody=document.getElementById('licTable');
 
@@ -475,9 +482,9 @@ async function loadData(){
 
       const isPending = st==='pending';
 
-      return '<tr><td class="mono" style="color:#f0c040">'+esc(l.license_key)+'</td><td class="mono" style="color:#666">'+hwidShort+'</td><td><span class="badge badge-'+st+'">'+TIERS[l.tier||0]+'</span></td><td><span class="badge badge-'+st+'">'+st+'</span></td><td style="color:#666;font-size:11px">'+(l.expires_at?new Date(l.expires_at).toLocaleDateString():'-')+'</td><td style="display:flex;gap:4px;flex-wrap:wrap">'+(isPending?'<button class="btn-green" style="padding:4px 8px;font-size:11px" onclick="approve(\''+esc(l.license_key)+'\')">Activar</button>':'')+(isActive?'<button class="btn-red" style="padding:4px 8px;font-size:11px" onclick="revoke(\''+esc(l.license_key)+'\')">Revoke</button> ':'')+'<button class="btn-ghost" style="padding:4px 8px;font-size:11px" onclick="removeLic(\''+esc(l.license_key)+'\')">Remove</button><button class="btn-dark" style="padding:4px 8px;font-size:11px" onclick="autokill(\''+esc(l.license_key)+'\')">Autokill</button></td></tr>';
+      return '';
 
-    }).join('');
+    }).join('');try{renderTable(all);}catch(e){}
 
   // Security alerts poll (clone detection etc.)
 
@@ -575,9 +582,9 @@ async function toggleAlerts(){
 
     const col=a.severity==='high'?'var(--red)':(a.severity==='low'?'var(--dim)':'var(--gold)');
 
-    return '<div style="padding:10px;border-bottom:1px solid #222"><b style="color:'+col+'">'+esc(a.alert_type)+'</b> <span style="color:#666;font-size:11px">'+(a.created_at||'')+'</span><br><span class="mono" style="font-size:11px;color:#999">'+esc((a.license_key||'-')+' | '+a.ip_address+' | '+(a.country||''))+'</span>'+(a.details?'<br><span style="font-size:11px;color:#777">'+esc(a.details.substring(0,160))+'</span>':'')+'</div>';
+    return '';
 
-  }).join(''):'<div style="padding:16px;color:#666">Sin alertas</div>';
+  }).join(''):'<div style="padding:16px;color:#666">Sin alertas</div>';try{renderAlertList(list);}catch(e){}
 
   fetch(API+'/api/alerts/seen',{method:'POST',headers:{'Content-Type':'application/json','X-Session-Token':TOKEN},body:'{}'}).catch(()=>{});
 
@@ -589,13 +596,13 @@ function startPolling(){ if(_pollTimer) clearInterval(_pollTimer); _pollTimer=se
 
 function stopPolling(){ if(_pollTimer){ clearInterval(_pollTimer); _pollTimer=null; } }
 
-const _origShowDash = showDash;
+// _origShowDash removed - showDash ya hace polling
 
-showDash = function(){ _origShowDash(); startPolling(); };
+// showDash wrapper removed
 
-const _origLogout = logout;
+// _origLogout removed - logout ya limpia todo
 
-logout = function(){ stopPolling(); window._lastPendingKeys=null; _origLogout(); };
+// logout wrapper removed
 
 if(TOKEN){
 
