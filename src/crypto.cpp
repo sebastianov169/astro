@@ -744,9 +744,52 @@ Bytes tpmSignPkcs1Sha256(const QByteArray &msg)
     return sig;
 }
 
-QString buildMidPem(const QString &pem)
+// v97fe (server 2026-09: "qw.sol bound to the PC that created them"): la
+// identidad del equipo es la clave TPM "MitosDeviceKeyV2" (la misma con la que
+// firma el cliente del juego). Exporta su clave publica (blob BCrypt) para
+// construir el mid real del equipo.
+bool tpmExportRsaPublic(Bytes *eOut, Bytes *nOut, int *bitsOut)
 {
-    RsaKey priv = parseRsaPrivateDer(decodePem(pem));
+    NCRYPT_PROV_HANDLE prov = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    if (NCryptOpenStorageProvider(&prov, L"Microsoft Platform Crypto Provider", 0) != 0)
+        return false;
+    auto cleanup = [&]() {
+        if (key) NCryptFreeObject(key);
+        if (prov) NCryptFreeObject(prov);
+    };
+    if (NCryptOpenKey(prov, &key, L"MitosDeviceKeyV2", 0, 0) != 0) {
+        cleanup();
+        return false;
+    }
+    DWORD cb = 0;
+    if (NCryptExportKey(key, 0, BCRYPT_RSAPUBLIC_BLOB, nullptr, nullptr, 0, &cb, 0) != 0 || cb < 24) {
+        cleanup();
+        return false;
+    }
+    std::vector<unsigned char> blob(static_cast<size_t>(cb));
+    if (NCryptExportKey(key, 0, BCRYPT_RSAPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0) != 0) {
+        cleanup();
+        return false;
+    }
+    cleanup();
+    auto rd32 = [&](size_t off) -> u32 {
+        return u32(blob[off]) | (u32(blob[off + 1]) << 8) | (u32(blob[off + 2]) << 16)
+               | (u32(blob[off + 3]) << 24);
+    };
+    if (rd32(0) != 0x31415352u) // "RSA1"
+        return false;
+    const u32 bits = rd32(4), cbExp = rd32(8), cbMod = rd32(12);
+    if (24ull + cbExp + cbMod > size_t(cb))
+        return false;
+    eOut->assign(blob.begin() + 24, blob.begin() + 24 + cbExp);
+    nOut->assign(blob.begin() + 24 + cbExp, blob.begin() + 24 + cbExp + cbMod);
+    *bitsOut = int(bits);
+    return true;
+}
+
+static QString midFromRsaPublic(int bits, const Bytes &e, const Bytes &n)
+{
     Bytes rsa1;
     auto appendU32 = [&](u32 v) {
         rsa1.push_back(std::uint8_t(v & 0xFF));
@@ -755,13 +798,13 @@ QString buildMidPem(const QString &pem)
         rsa1.push_back(std::uint8_t((v >> 24) & 0xFF));
     };
     rsa1.push_back('R'); rsa1.push_back('S'); rsa1.push_back('A'); rsa1.push_back('1');
-    appendU32(u32(priv.bits));
-    appendU32(u32(priv.e.size()));
-    appendU32(u32(priv.n.size()));
+    appendU32(u32(bits));
+    appendU32(u32(e.size()));
+    appendU32(u32(n.size()));
     appendU32(0);
     appendU32(0);
-    rsa1.insert(rsa1.end(), priv.e.begin(), priv.e.end());
-    rsa1.insert(rsa1.end(), priv.n.begin(), priv.n.end());
+    rsa1.insert(rsa1.end(), e.begin(), e.end());
+    rsa1.insert(rsa1.end(), n.begin(), n.end());
     Bytes frame;
     frame.push_back('M'); frame.push_back('I'); frame.push_back('D'); frame.push_back('2');
     frame.push_back(1);
@@ -775,6 +818,21 @@ QString buildMidPem(const QString &pem)
     QByteArray sha = QCryptographicHash::hash(shaInput, QCryptographicHash::Sha256);
     frame.insert(frame.end(), sha.begin(), sha.end());
     return "M2." + urlB64EncodeNoPad(frame);
+}
+
+QString buildMidTpm()
+{
+    Bytes e, n;
+    int bits = 0;
+    if (!tpmExportRsaPublic(&e, &n, &bits))
+        return QString();
+    return midFromRsaPublic(bits, e, n);
+}
+
+QString buildMidPem(const QString &pem)
+{
+    RsaKey priv = parseRsaPrivateDer(decodePem(pem));
+    return midFromRsaPublic(priv.bits, priv.e, priv.n);
 }
 
 // ================================================================

@@ -84,7 +84,8 @@ ApplicationWindow {
                 id: g.id, name: g.name, label: g.name + "  ·  Nv " + g.level,
                 color: g.color, level: g.level, sprite: g.sprite,
                 exp: g.exp, cexp: g.cexp, durability: g.durability,
-                maxDurability: g.maxDurability
+                maxDurability: g.maxDurability,
+                stats: g.attrsText !== undefined ? g.attrsText.join("  ·  ") : ""
             })
         }
     }
@@ -1681,7 +1682,7 @@ ApplicationWindow {
                                 RowLayout { Layout.fillWidth: true; Layout.preferredHeight: 28; Layout.leftMargin: 10; Layout.rightMargin: 10; SmallCaption { text: "GEM"; Layout.preferredWidth: 160 } SmallCaption { text: "LEVEL"; Layout.preferredWidth: 54 } SmallCaption { text: "XP PROGRESS"; Layout.fillWidth: true } SmallCaption { text: "XP CEXP / EXP"; Layout.preferredWidth: 140 } SmallCaption { text: "ACTION"; Layout.preferredWidth: 124 } }
                                 Repeater { model: gemsQmlModel; delegate: Rectangle {
                                     Layout.fillWidth: true
-                                    Layout.preferredHeight: 58
+                                    Layout.preferredHeight: 74
                                     radius: 4
                                     gradient: Gradient {
                                         GradientStop { position: 0.0; color: index === farm.selectedGemIndex ? Qt.rgba(colors.pri1.r, colors.pri1.g, colors.pri1.b, 0.15) : (index % 2 ? colors.surface2 : Qt.lighter(colors.surface, 1.1)) }
@@ -1698,7 +1699,7 @@ ApplicationWindow {
                                     }
                                     HoverHandler { id: invHover }
                                     RowLayout { anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10; spacing: 10
-                                        RowLayout { Layout.preferredWidth: 160; spacing: 8; GemSprite { sprite: model.sprite; iconSize: 34 } ColumnLayout { spacing: 2; LabelText { text: model.name; font.pixelSize: 11; font.weight: Font.DemiBold } } }
+                                        RowLayout { Layout.preferredWidth: 160; spacing: 8; GemSprite { sprite: model.sprite; iconSize: 34 } ColumnLayout { spacing: 2; LabelText { text: model.name; font.pixelSize: 11; font.weight: Font.DemiBold } SmallCaption { visible: model.stats !== undefined && model.stats.length > 0; text: model.stats; font.pixelSize: 9 } } }
                                         LabelText { text: model.level; Layout.preferredWidth: 54; font.pixelSize: 11; font.weight: Font.DemiBold }
                                         ColumnLayout { Layout.fillWidth: true; spacing: 4; ProgressBar { Layout.fillWidth: true; value: root.gemProgress(model.cexp, model.exp); barColor: colors.amber } SmallCaption { text: Math.round(root.gemProgress(model.cexp, model.exp) * 100) + " pct" } }
                                         LabelText { text: model.cexp + " / " + model.exp; Layout.preferredWidth: 140; font.pixelSize: 10; color: colors.muted }
@@ -2010,6 +2011,7 @@ ApplicationWindow {
             ColumnLayout { anchors.fill: parent; anchors.margins: 18; spacing: 12
                 RowLayout { Layout.fillWidth: true
                     LabelText { text: "Gem farming priority"; font.pixelSize: 18; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                    GhostButton { text: "APPLY TO ALL"; Layout.preferredWidth: 110; Layout.preferredHeight: 26; onClicked: { farm.applyGemPriorityToAll(); root.toast("Prioridad + AUTO BUY aplicados a TODAS las cuentas") } }
                     StatusPill { value: "ORDER"; accent: colors.amber }
                 }
                 LabelText { text: "Click a gem to select it, then click another to swap. Top = farmed first."; color: colors.muted; font.pixelSize: 10 }
@@ -2203,7 +2205,7 @@ ApplicationWindow {
                     Layout.fillHeight: true
                     clip: true
                     cellWidth: Math.max(200, (shopPanel.width - 60) / Math.max(2, Math.floor((shopPanel.width - 60) / 210)))
-                    cellHeight: 240
+                    cellHeight: 258
                     model: farm.shopGems
                     ScrollBar.vertical: ThemedScrollBar { }
                     delegate: Rectangle {
@@ -2231,6 +2233,15 @@ ApplicationWindow {
                                     LabelText { anchors.centerIn: parent; text: "Lv" + modelData.level; font.pixelSize: 10; color: colors.blue; font.weight: Font.Bold } }
                                 Rectangle { radius: 6; width: 60; height: 18; color: Qt.rgba(colors.mint.r, colors.mint.g, colors.mint.b, 0.15)
                                     LabelText { anchors.centerIn: parent; text: modelData.exp + "xp"; font.pixelSize: 10; color: colors.mint } }
+                            }
+                            // v97fc (app personal): stats de la gema (attrs del
+                            // server). Si no hay attrs, no ocupa espacio.
+                            LabelText {
+                                visible: modelData.attrsText !== undefined && modelData.attrsText.length > 0
+                                text: modelData.attrsText !== undefined ? modelData.attrsText.join("  ·  ") : ""
+                                font.pixelSize: 9; color: colors.muted
+                                Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
                             }
                             Item { Layout.fillHeight: true }
                             RowLayout { Layout.alignment: Qt.AlignHCenter; spacing: 4

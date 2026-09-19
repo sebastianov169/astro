@@ -51,6 +51,8 @@ struct SpawnPrep {
     int tpmGroup = -1;     // TEORIA 2026-08-10: 3 TPMs compartidos (4+4+2) en vez
                            // de 10 unicos — el server podria limitar dispositivos
                            // (mids) por IP, no cuentas. -1 = PEM unica del device.
+    bool attestTpm = false; // v97ff: el EH del pre-spawn gano con el TPM del
+                            // equipo -> el proof TCP (op10035) va con TPM.
     bool boughtByPriority = false; // 2026-08-10: la gema se COMPRO del shop por
                            // prioridad (inventario vacio) — badge PRIORIDAD en
                            // la tarjeta del dashboard.
@@ -356,9 +358,11 @@ QString gemSpritePath(const QString &name, int itemLevel)
 
 // Caché de TODAS las gemas de una cuenta para accounts.json:
 // [{id, name, level, exp, cexp}, ...] — se muestra al instante al hacer click
+// v97fc: forward decl (definida abajo, usada por gemsCacheFrom)
+static QStringList gemAttrsText(const QVariantList &attrs);
+
 QVariantList gemsCacheFrom(const QVector<GemInfo> &gems)
-{
-    QVariantList out;
+{    QVariantList out;
     for (const auto &g : gems) {
         QVariantMap m;
         m.insert(QStringLiteral("id"), int(g.id));
@@ -367,6 +371,8 @@ QVariantList gemsCacheFrom(const QVector<GemInfo> &gems)
         m.insert(QStringLiteral("exp"), qlonglong(g.exp));
         m.insert(QStringLiteral("cexp"), qlonglong(g.cexp));
         m.insert(QStringLiteral("sprite"), gemSpritePath(g.name, g.itemLevel));
+        m.insert(QStringLiteral("attrs"), g.attrs);
+        m.insert(QStringLiteral("attrsText"), gemAttrsText(g.attrs));
         out.append(m);
     }
     return out;
@@ -375,6 +381,39 @@ QVariantList gemsCacheFrom(const QVector<GemInfo> &gems)
 // Catalogo del shop (StoreItem) serializado para guardar en la cuenta
 // (fetchAllGems lo precarga al iniciar Astro: la gems shop abre al instante
 // sin re-login - pedido 2026-08-09).
+// v97fc (app personal): texto legible de stats para el shop ("+33 Split
+// Distance +20 Speed"). El server manda attrs PLANO [nombre, valor, ...],
+// no pares [[n,v]] — el parseo viejo de pares producia basura ("s+p").
+static QStringList gemAttrsText(const QVariantList &attrs)
+{
+    auto prettyName = [](const QString &raw) {
+        QStringList words = QString(raw).replace(QLatin1Char('_'), QLatin1Char(' ')).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        for (QString &w : words) {
+            if (!w.isEmpty())
+                w[0] = w[0].toUpper();
+        }
+        return words.join(QLatin1Char(' '));
+    };
+    QStringList out;
+    // forma real del server: plano [nombre, valor, nombre, valor, ...]
+    if (!attrs.isEmpty() && attrs.first().type() != QVariant::List) {
+        for (int i = 0; i + 1 < attrs.size(); i += 2) {
+            const QString nm = attrs.at(i).toString();
+            if (!nm.isEmpty())
+                out.append(QStringLiteral("+%1 %2").arg(attrs.at(i + 1).toString(), prettyName(nm)));
+        }
+        if (!out.isEmpty())
+            return out;
+    }
+    // fallback: pares [[nombre, valor], ...]
+    for (const auto &av : attrs) {
+        const QVariantList pair = av.toList();
+        if (pair.size() >= 2 && !pair.at(0).toString().isEmpty())
+            out.append(QStringLiteral("+%1 %2").arg(pair.at(1).toString(), prettyName(pair.at(0).toString())));
+    }
+    return out;
+}
+
 QVariantList storeItemsCacheFrom(const QVector<StoreItem> &items)
 {
     QVariantList out;
@@ -393,13 +432,7 @@ QVariantList storeItemsCacheFrom(const QVector<StoreItem> &items)
         m.insert(QStringLiteral("purchasable"), s.purchasable);
         m.insert(QStringLiteral("category"), s.category);
         m.insert(QStringLiteral("attrs"), s.attrs);
-        QStringList attrsText;
-        for (const auto &av : s.attrs) {
-            const QVariantList pair = av.toList();
-            if (pair.size() >= 2)
-                attrsText.append(pair[0].toString() + " +" + pair[1].toString());
-        }
-        m.insert(QStringLiteral("attrsText"), attrsText);
+        m.insert(QStringLiteral("attrsText"), gemAttrsText(s.attrs));
         out.append(m);
     }
     return out;
@@ -973,6 +1006,9 @@ QVector<int> FarmController::gemPriorityForDevice(const QString &deviceId) const
     // antigua que aun no estuviera en el mapa persistido.
     if (priority.isEmpty() && deviceId == resolveDeviceId())
         priority = m_gemPriority;
+    // v97fg: prioridad GLOBAL como fallback (cuentas nuevas sin lista propia).
+    if (priority.isEmpty())
+        priority = m_gemPriorityGlobal;
     for (int color = 0; color < 20; ++color) {
         if (!priority.contains(color))
             priority.append(color);
@@ -1116,6 +1152,8 @@ QVariantMap FarmController::gemMap(const GemInfo &g) const
     m.insert(QStringLiteral("price"), g.price);
     // sprite de la gema: helper libre gemSpritePath (misma logica que gemsCacheFrom)
     m.insert(QStringLiteral("sprite"), gemSpritePath(g.name, g.itemLevel));
+    // v97fc (app personal): stats en el gem inventory (mismo formato que el shop)
+    m.insert(QStringLiteral("attrsText"), gemAttrsText(g.attrs));
     return m;
 }
 
@@ -1254,7 +1292,19 @@ void FarmController::appendDebug(const QString &line)
 
 void FarmController::writeLogFile(const QString &line)
 {
-    QFile f(QCoreApplication::applicationDirPath() + "/astro_farm.log");
+    // v97fc: rotacion (el log crecia sin limite: 910MB en disco). Cada 100
+    // lineas se chequea el tamaño; pasado 20MB se rota a .old (max ~40MB).
+    // El open/write/close por linea + disco casi lleno = tirones en juegos.
+    static QAtomicInt s_logLines = 0;
+    const QString path = QCoreApplication::applicationDirPath() + QStringLiteral("/astro_farm.log");
+    if ((s_logLines.fetchAndAddOrdered(1) % 100) == 0) {
+        QFile probe(path);
+        if (probe.size() > 20LL * 1024 * 1024) {
+            QFile::remove(path + QStringLiteral(".old"));
+            QFile::rename(path, path + QStringLiteral(".old"));
+        }
+    }
+    QFile f(path);
     if (!f.open(QIODevice::Append | QIODevice::Text))
         return;
     f.write("[" + QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")).toUtf8() + "] ");
@@ -1575,6 +1625,11 @@ void FarmController::fetchShop(const QString &device)
                 cm.insert(QStringLiteral("sprite"),
                           sp.left(dash + 1) + QStringLiteral("%1.png").arg(band, 2, 10, QLatin1Char('0')));
             }
+            // v97fc (app personal): stats en el shop. Caches viejos en disco
+            // pueden no traer attrsText: reconstruirlo desde attrs si existe.
+            if (!cm.contains(QStringLiteral("attrsText")) && cm.contains(QStringLiteral("attrs"))) {
+                cm.insert(QStringLiteral("attrsText"), gemAttrsText(cm.value(QStringLiteral("attrs")).toList()));
+            }
             normalized.append(cm);
         }
         m_shopGems = normalized;
@@ -1636,14 +1691,7 @@ void FarmController::fetchShop(const QString &device)
                     m.insert(QStringLiteral("owned"), s.owned);
                     m.insert(QStringLiteral("purchasable"), s.purchasable);
                     m.insert(QStringLiteral("attrs"), s.attrs);
-                    // attrsText: QStringList legible para QML ("speed +4", ...)
-                    QStringList attrsText;
-                    for (const auto &av : s.attrs) {
-                        const QVariantList pair = av.toList();
-                        if (pair.size() >= 2)
-                            attrsText.append(pair[0].toString() + " +" + pair[1].toString());
-                    }
-                    m.insert(QStringLiteral("attrsText"), attrsText);
+                    m.insert(QStringLiteral("attrsText"), gemAttrsText(s.attrs));
                     m_shopGems.append(m);
                 }
                 m_shopCoins = o.coins;
@@ -1756,13 +1804,7 @@ void FarmController::buyShopGem(int gemId)
                     m.insert(QStringLiteral("owned"), s.owned);
                     m.insert(QStringLiteral("purchasable"), s.purchasable);
                     m.insert(QStringLiteral("attrs"), s.attrs);
-                    QStringList attrsText;
-                    for (const auto &av : s.attrs) {
-                        const QVariantList pair = av.toList();
-                        if (pair.size() >= 2)
-                            attrsText.append(pair[0].toString() + " +" + pair[1].toString());
-                    }
-                    m.insert(QStringLiteral("attrsText"), attrsText);
+                    m.insert(QStringLiteral("attrsText"), gemAttrsText(s.attrs));
                     m_shopGems.append(m);
                 }
                 m_shopCoins = o.coins;
@@ -1906,13 +1948,7 @@ void FarmController::buyShopGemX2(int gemId)
                     m.insert(QStringLiteral("owned"), s.owned);
                     m.insert(QStringLiteral("purchasable"), s.purchasable);
                     m.insert(QStringLiteral("attrs"), s.attrs);
-                    QStringList attrsText;
-                    for (const auto &av : s.attrs) {
-                        const QVariantList pair = av.toList();
-                        if (pair.size() >= 2)
-                            attrsText.append(pair[0].toString() + " +" + pair[1].toString());
-                    }
-                    m.insert(QStringLiteral("attrsText"), attrsText);
+                    m.insert(QStringLiteral("attrsText"), gemAttrsText(s.attrs));
                     m_shopGems.append(m);
                 }
                 m_shopCoins = o.coins;
@@ -2037,13 +2073,7 @@ void FarmController::repairGem(int gemId)
                     m.insert(QStringLiteral("owned"), s.owned);
                     m.insert(QStringLiteral("purchasable"), s.purchasable);
                     m.insert(QStringLiteral("attrs"), s.attrs);
-                    QStringList attrsText;
-                    for (const auto &av : s.attrs) {
-                        const QVariantList pair = av.toList();
-                        if (pair.size() >= 2)
-                            attrsText.append(pair[0].toString() + " +" + pair[1].toString());
-                    }
-                    m.insert(QStringLiteral("attrsText"), attrsText);
+                    m.insert(QStringLiteral("attrsText"), gemAttrsText(s.attrs));
                     m_shopGems.append(m);
                 }
                 m_shopCoins = o.coins;
@@ -2118,8 +2148,17 @@ void FarmController::loadGemPriority()
         m_gemPriorityByDevice.insert(it.key(), list);
     }
     m_gemPriority.clear();
+    const QStringList savedGlobal = s.value(QStringLiteral("gemPriorityGlobal")).toStringList();
+    m_gemPriorityGlobal.clear();
+    for (const auto &sv : savedGlobal) {
+        const int idx = sv.toInt();
+        if (idx >= 0 && idx < 20)
+            m_gemPriorityGlobal.append(idx);
+    }
     if (m_gemPriorityByDevice.contains(dev))
         m_gemPriority = m_gemPriorityByDevice.value(dev);
+    else if (!m_gemPriorityGlobal.isEmpty())
+        m_gemPriority = m_gemPriorityGlobal; // v97fg: fallback global
     // rellenar las que faltan al final en orden natural
     for (int i = 0; i < 20; ++i)
         if (!m_gemPriority.contains(i))
@@ -2150,6 +2189,65 @@ void FarmController::saveGemPriority()
     // v97e1: sync inmediato (el cierre abrupto perdia la config).
     s.sync();
     emit gemPriorityChanged();
+}
+
+// v97fg (pedido del usuario): copiar la prioridad actual a TODAS las cuentas
+// de una sola vez. Ademas la guarda como GLOBAL: las cuentas nuevas (o sin
+// lista propia) heredan ese orden automaticamente.
+void FarmController::applyGemPriorityToAll()
+{
+    QVector<int> order = m_gemPriority;
+    if (order.isEmpty())
+        order = gemPriorityForDevice(resolveDeviceId());
+    m_gemPriorityGlobal = order;
+    QSet<QString> devices;
+    for (const auto &v : m_accounts) {
+        const QString d = v.toMap().value(QStringLiteral("device")).toString();
+        if (!d.isEmpty())
+            devices.insert(d);
+    }
+    for (const QString &d : m_gemPriorityByDevice.keys()) {
+        if (!d.isEmpty())
+            devices.insert(d);
+    }
+    devices.insert(resolveDeviceId());
+    devices.remove(QString());
+    for (const QString &d : devices)
+        m_gemPriorityByDevice.insert(d, order);
+    QVariantMap all;
+    for (auto it = m_gemPriorityByDevice.constBegin(); it != m_gemPriorityByDevice.constEnd(); ++it) {
+        QVariantList list;
+        for (int idx : it.value())
+            list.append(idx);
+        all.insert(it.key(), list);
+    }
+    QStringList globalRaw;
+    for (int idx : m_gemPriorityGlobal)
+        globalRaw.append(QString::number(idx));
+    // v97fg: el toggle AUTO BUY por gema tambien se copia a TODAS las cuentas
+    // (el usuario configura orden + autobuy juntos en el priority).
+    const QSet<int> abSet = m_gemAutobuy.value(resolveDeviceId());
+    for (const QString &d : devices) {
+        if (abSet.isEmpty())
+            m_gemAutobuy.remove(d);
+        else
+            m_gemAutobuy.insert(d, abSet);
+    }
+    QVariantMap abAll;
+    for (auto it = m_gemAutobuy.constBegin(); it != m_gemAutobuy.constEnd(); ++it) {
+        QVariantList list;
+        for (int idx : it.value())
+            list.append(idx);
+        abAll.insert(it.key(), list);
+    }
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    s.setValue(QStringLiteral("gemPriorityAll"), all);
+    s.setValue(QStringLiteral("gemPriorityGlobal"), globalRaw);
+    s.setValue(QStringLiteral("gemAutobuyAll"), abAll);
+    s.sync();
+    appendLog(QStringLiteral("Gem priority + autobuy: aplicados a TODAS las cuentas (%1)").arg(devices.size()));
+    emit gemPriorityChanged();
+    emit gemAutobuyChanged();
 }
 
 // 2026-08-10: auto-buy de la tienda por color. El boton "Auto buy" de la
@@ -2645,8 +2743,9 @@ void FarmController::spawn()
                                 const QString sSk = p.sk;
                                 const QString sMg = p.magic;
                                 const int grp = p.tpmGroup; // TEORIA 3 TPMs: grupo del prep
+                            const bool aTpm = p.attestTpm; // v97ff: clave del EH para el proof TCP
                                 ++spawnIdx;
-                                QTimer::singleShot(delayMs, this, [this, dev, gId, nm, sSk, sMg, grp]() {
+                                QTimer::singleShot(delayMs, this, [this, dev, gId, nm, sSk, sMg, grp, aTpm]() {
                                     // v41 (STOP durante el spawn): si el usuario
                                     // aborto mientras esperaba su turno del stagger,
                                     // NO crear el farm (los workers nuevos se habrian
@@ -2655,7 +2754,7 @@ void FarmController::spawn()
                                         writeLogFile(QStringLiteral("[DBG] spawn cancelado por STOP: %1").arg(nm));
                                         return;
                                     }
-                                    spawnOneFarm(dev, gId, nm, sSk, sMg, grp); // loguea "Spawning ..."
+                                    spawnOneFarm(dev, gId, nm, sSk, sMg, grp, aTpm); // loguea "Spawning ..."
                                 });
                             }
                             // persiste la info fresca en la entrada de la cuenta
@@ -2765,7 +2864,9 @@ void FarmController::spawn()
                 // v97fa: GEM AUTOBUY en RUN — si una gema con autobuy falta en
                 // inventario (limite de XP) y esta en el shop con saldo, se
                 // compra aqui para que el spawn (prioridad, abajo) la use.
-                if (!deviceAutobuy.isEmpty() && !prep.gems.isEmpty()) {
+                // v97fd: sin el gate !prep.gems.isEmpty() (inventory vacio =
+                // todas las gemas al limite): comprar tambien en ese caso.
+                if (!deviceAutobuy.isEmpty()) {
                     // v97fa: login() deja lastCoins en 0 — cargar el balance
                     // con fetchAccountName antes de chequear precios.
                     local.fetchAccountName();
@@ -2828,6 +2929,7 @@ void FarmController::spawn()
                 prep.sk = local.sessionKey();
                 prep.magic = local.magic();
                 prep.ok = true;
+                prep.attestTpm = local.lastEhTpm();
             }
             // debug SIEMPRE persistido (el switch solo controla el panel)
             writeLogFile(QStringLiteral("[DBG] spawnLogin device=%1 ok=%2 gems=%3 current=%4")
@@ -2941,8 +3043,9 @@ void FarmController::spawn()
                             const QString sSk = p.sk;
                             const QString sMg = p.magic;
                             const int grp = p.tpmGroup; // TEORIA 3 TPMs: grupo del prep
+                            const bool aTpm = p.attestTpm; // v97ff: clave del EH para el proof TCP
                             ++spawnIdx;
-                            QTimer::singleShot(delayMs, this, [this, dev, gId, nm, sSk, sMg, grp]() {
+                            QTimer::singleShot(delayMs, this, [this, dev, gId, nm, sSk, sMg, grp, aTpm]() {
                                 spawnOneFarm(dev, gId, nm, sSk, sMg, grp); // loguea "Spawning ..."
                             });
                         }
@@ -3029,7 +3132,7 @@ void FarmController::spawn()
 // doLogin del arranque (9 logins simultaneos = race de Qt 6.10.3).
 void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QString &accountName,
                                    const QString &sessionSk, const QString &sessionMagic,
-                                   int tpmGroup)
+                                   int tpmGroup, bool attestTpm)
 {
     // v97ek: dedup leak 28 farms — si ya hay un farm vivo para este device, no duplicar
     // v97ew: zombie = worker detenido por el refresh (m_stop) o worker ya nulo
@@ -3083,6 +3186,8 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
     worker->setAutoRepair(m_autoRepair);
     worker->setAutoBuyX2(m_autoBuyX2);
     worker->configure(deviceId, pemPath, gemId);
+    // v97ff: el proof TCP usara la misma clave que gano el EH del pre-spawn.
+    worker->setAttestTpm(attestTpm);
     // prioridad de gemas (ids de color) para el cambio automatico de gema rota
     // v97e2: el orden POR CUENTA — la lista del device del worker.
     worker->setGemPriorityList(gemPriorityForDevice(deviceId));
@@ -3790,6 +3895,10 @@ void FarmController::applyAccount(int real)
     const QVariantMap am = m_accounts.at(real).toMap();
     const QString device = am.value(QStringLiteral("device")).toString();
     setDeviceId(device);
+    // v97fg (bug reportado: "otra cuenta tenia otra priority"): recargar la
+    // lista de prioridad de la cuenta activa al cambiar de cuenta (antes solo
+    // se cargaba al arrancar -> el panel quedaba con la lista anterior).
+    loadGemPriority();
     m_accountText = am.value(QStringLiteral("name")).toString();
     if (m_accountText.isEmpty())
         m_accountText = shortDevice(device);
@@ -4119,8 +4228,17 @@ void FarmController::maybeStartRefreshAllLogin()
                     // ANTES del fetchInventory para que el re-equip la vea.
                     const QSet<int> abSet = abOn ? targets.at(k).autobuy : QSet<int>();
                     if (!abSet.isEmpty()) {
-                        const QVector<GemInfo> inv0 = local.fetchInventory(5);
-                    if (!inv0.isEmpty()) {
+                        // v97fd (bug Juansi/Zell): el gate !inv0.isEmpty() dejaba
+                        // sin autobuy a las cuentas con TODAS las gemas al limite
+                        // de XP (inventory vacio): sin gemas -> sin compra -> sin
+                        // farm -> deadlock. Reintento 1x por hiccup y seguir
+                        // aunque siga vacio (ownedColors = {} es la respuesta correcta).
+                        QVector<GemInfo> inv0 = local.fetchInventory(5);
+                        if (inv0.isEmpty()) {
+                            QThread::msleep(1000);
+                            inv0 = local.fetchInventory(5);
+                        }
+                    {
                         // v97fa: las lvl 25 NO cuentan como owned (no farmeables).
                         QSet<int> ownedColors;
                         for (const GemInfo &g : inv0) {

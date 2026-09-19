@@ -197,6 +197,7 @@ public slots:
     Q_INVOKABLE void applyPriorityOrder(const QVariantList &orderedIds);
     Q_INVOKABLE void loadGemPriority();                       // lee QSettings al arrancar
     Q_INVOKABLE void saveGemPriority();                       // persiste en QSettings
+    Q_INVOKABLE void applyGemPriorityToAll();                 // v97fg: prioridad global a TODAS las cuentas
     Q_INVOKABLE QVariantList priorityGems() const;            // todas las gemas unicas de las cuentas, ordenadas por prioridad
     // ---- auto-buy por color de la tienda (2026-08-10) ----
     // La tienda de gemas rota 2x/dia: 19:00 y 01:00 hora Colombia (UTC-5 sin
@@ -254,7 +255,7 @@ private:
     int gemItemId() const;
     void spawnOneFarm(const QString &deviceId, int gemId, const QString &accountName,
                       const QString &sessionSk = QString(), const QString &sessionMagic = QString(),
-                      int tpmGroup = -1);
+                      int tpmGroup = -1, bool attestTpm = false);
     QVariantMap gemMap(const GemInfo &g) const;
     QString colorFor(const QString &name) const;
     // 2026-08-10 (fuente unica de verdad): carga m_gems desde el cache de la
@@ -316,6 +317,7 @@ private:
     // las cuentas): el orden por CUENTA. m_gemPriority es la vista del
     // deviceId activo; el mapa guarda el orden de cada cuenta.
     QHash<QString, QVector<int>> m_gemPriorityByDevice;
+    QVector<int> m_gemPriorityGlobal; // v97fg: prioridad GLOBAL (fallback cuentas nuevas)
     // 2026-08-10: auto-buy de la TIENDA por color (boton "Auto buy" en la
     // seccion de prioridad). QSet de indices 0-19 con compra automatica.
     // La tienda rota 19:00 y 01:00 hora Colombia (UTC-5, sin DST) = 00:00 y

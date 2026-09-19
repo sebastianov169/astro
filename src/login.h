@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QVariant>
 #include <functional>
 
 #include <QNetworkAccessManager>
@@ -21,6 +22,7 @@ struct GemInfo {
     int price = 0;
     int sellPrice = 0;
     int category = 0;
+    QVariantList attrs; // stats del server: plano [nombre, valor, ...]
 };
 
 // Item de la tienda (do:"store"). El id es el id del CATALOGO (el que usa
@@ -69,6 +71,10 @@ public:
     // account/device usa SIEMPRE su propia clave (setAttestPem); si esta vacia,
     // login() falla con error en vez de caer a la clave embebida compartida.
     void setAttestPem(const QString &pem);
+    // v97ff: true si el ultimo login() gano firmando con el TPM del equipo
+    // (fallback cuando la PEM fake recibe reset_did). El proof TCP debe usar
+    // LA MISMA clave que autentico el EH.
+    bool lastEhTpm() const { return m_lastEhTpm; }
 
     // Consulta el inventory de un slot. Devuelve las gemas.
     QVector<GemInfo> fetchInventory(int slot = 5);
@@ -125,6 +131,7 @@ private:
     QString m_deviceId;
     QString m_accountName;
     QString m_attestPem; // PEM fake TPM para el EH (setAttestPem); vacio = login falla
+    bool m_lastEhTpm = false; // v97ff: el ultimo EH gano con la clave TPM
     qlonglong m_lastCoins = 0;
     int m_lastCurrentItem = -1;
     QNetworkAccessManager m_net;
