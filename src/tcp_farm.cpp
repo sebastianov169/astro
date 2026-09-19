@@ -1080,7 +1080,7 @@ Bytes makeEquipmentDataFrame(std::uint32_t seed)
 
 Bytes makeProofFrame(const QString &challenge, const QString &suffix, const QString &deviceId,
                      std::uint32_t seedMt, const QString &attestPem, QString *proofStrOut,
-                     const QString &nonceOverride)
+                     const QString &nonceOverride, bool useTpm)
 {
     // El challenge del op52 es un blob M2XC cifrado; el plaintext (8 chars)
     // es lo que se firma: SHA256(challenge_plaintext | deviceID | "100").
@@ -1091,9 +1091,10 @@ Bytes makeProofFrame(const QString &challenge, const QString &suffix, const QStr
         ? decryptChallenge(challenge, suffix)
         : nonceOverride;
     QByteArray msg = decrypted.toUtf8() + "|" + deviceId.toUtf8() + "|100";
-    // El SECURE_PROOF se firma con la clave de atestacion del device (la fake
-    // PEM generada localmente y registrada en el EH), no con la TPM real.
-    Bytes sig = rsaSignPkcs1Sha256(attestPem, msg);
+    // v97ff: el SECURE_PROOF debe firmarse con LA MISMA clave que autentico
+    // el EH HTTP: si la cuenta esta bindeada al TPM del equipo (la PEM fake
+    // recibio reset_did), el server valida el proof contra esa clave.
+    Bytes sig = useTpm ? tpmSignPkcs1Sha256(msg) : rsaSignPkcs1Sha256(attestPem, msg);
     QString proofStr = urlB64EncodeNoPad(sig);
     if (proofStrOut)
         *proofStrOut = proofStr;
@@ -1335,44 +1336,69 @@ void FarmWorker::doLogin(QString *sk, QString *magic, QString *accountName, QByt
     // EH
     *magic = genMagic(64);
     QString dtf = buildDtf(*sk);
-    QFile pf(m_pemPath);
-    if (!pf.open(QIODevice::ReadOnly)) {
-        *accountName = "no PEM";
+    // v97fe (server 2026-09 "qw.sol bound to the PC"): identidad del equipo =
+    // clave TPM MitosDeviceKeyV2. Intento 1: PEM fake del device; si el server
+    // responde ko/reset_did -> intento 2: firma TPM del equipo.
+    QByteArray chMsg = (dtf + "|" + m_deviceId + "|100").toUtf8();
+    QString pemProof, pemMid;
+    {
+        QFile pf(m_pemPath);
+        if (pf.open(QIODevice::ReadOnly)) {
+            const QString attestPem = QString::fromUtf8(pf.readAll());
+            pf.close();
+            if (!attestPem.isEmpty()) {
+                Bytes pemSig = rsaSignPkcs1Sha256(attestPem, chMsg);
+                pemProof = urlB64EncodeNoPad(pemSig);
+                pemMid = buildMidPem(attestPem);
+            }
+        }
+    }
+    QString tpmProof, tpmMid;
+    try {
+        Bytes tpmSig = tpmSignPkcs1Sha256(chMsg);
+        tpmProof = urlB64EncodeNoPad(tpmSig);
+        tpmMid = buildMidTpm();
+    } catch (const std::exception &) {}
+    if (pemMid.isEmpty() && tpmMid.isEmpty()) {
+        *accountName = "no attest key";
         return;
     }
-    QString attestPem = QString::fromUtf8(pf.readAll());
-    pf.close();
-    QByteArray chMsg = (dtf + "|" + m_deviceId + "|100").toUtf8();
-    Bytes sig = rsaSignPkcs1Sha256(attestPem, chMsg);
-    QString proof = urlB64EncodeNoPad(sig);
-    QString mid = buildMidPem(attestPem);
-    // evidencia TPM: cada cuenta debe presentar un mid DISTINTO (deriva de su
-    // propia PEM fake del device). Si varias cuentas logean el mismo mid, la
-    // atestacion esta compartida y el server limita las conexiones.
-    emit debugLog(QString("TPM http device=%1 mid=%2 key=%3")
-                      .arg(m_deviceId.left(16)).arg(mid.left(12)).arg(QFileInfo(m_pemPath).fileName()));
-    QString ddJson = QString("{\"proof\":\"%1\",\"mid\":\"%2\",\"ver\":\"%3\",\"host\":\"app.mitos.is\"}")
-                         .arg(proof, mid, kVersion);
-    std::uint32_t R10 = std::uint32_t(std::uint64_t(QDateTime::currentMSecsSinceEpoch()) ^ std::uint64_t(QRandomGenerator::global()->generate()));
-    std::uint32_t ddH2 = std::uint32_t(QRandomGenerator::global()->generate());
-    Bytes ddBlob = m2xcEncryptFull(bytesOf(ddJson), bytesOf(*magic), R10, ddH2);
-    QString dd = m2xcFmt(ddBlob);
-    QString ms = rsaEncryptPkcs1Base64(rsaPublicKey, *magic);
-    std::vector<QPair<QString, QString>> ehParams = {
-        {"go", "0"}, {"dd", dd}, {"de", "desktop"}, {"gi", "0"},
-        {"ver", kVersion}, {"it", "1"}, {"do", "eh"}, {"im", "0"},
-        {"di", desktop}, {"dtf", dtf}, {"ms", ms}, {"rndx", rndxTcp()},
+    const QString ms = rsaEncryptPkcs1Base64(rsaPublicKey, *magic);
+    auto sendEh = [&](const QString &proof, const QString &mid) -> QByteArray {
+        const QString ddJson = QString("{\"proof\":\"%1\",\"mid\":\"%2\",\"ver\":\"%3\",\"host\":\"app.mitos.is\"}")
+                                   .arg(proof, mid, kVersion);
+        const std::uint32_t R10 = std::uint32_t(std::uint64_t(QDateTime::currentMSecsSinceEpoch()) ^ std::uint64_t(QRandomGenerator::global()->generate()));
+        const std::uint32_t ddH2 = std::uint32_t(QRandomGenerator::global()->generate());
+        const Bytes ddBlob = m2xcEncryptFull(bytesOf(ddJson), bytesOf(*magic), R10, ddH2);
+        const QString dd = m2xcFmt(ddBlob);
+        std::vector<QPair<QString, QString>> ehParams = {
+            {"go", "0"}, {"dd", dd}, {"de", "desktop"}, {"gi", "0"},
+            {"ver", kVersion}, {"it", "1"}, {"do", "eh"}, {"im", "0"},
+            {"di", desktop}, {"dtf", dtf}, {"ms", ms}, {"rndx", rndxTcp()},
+        };
+        return httpGetTcp(&net, QUrl(kEngine + "?" + makeQueryTcp(ehParams, true)));
     };
-    QByteArray eh = httpGetTcp(&net, QUrl(kEngine + "?" + makeQueryTcp(ehParams, true)));
+    auto ehIsOk = [](const QByteArray &resp) -> bool {
+        const QJsonObject o = parseJsonObj(resp);
+        return o.isEmpty() ? (!resp.isEmpty() && QString::fromUtf8(resp).contains("ok"))
+                           : (o.value("result").toString() == "ok");
+    };
+    QByteArray eh;
+    QString usedKey = QStringLiteral("pem");
+    if (!pemMid.isEmpty())
+        eh = sendEh(pemProof, pemMid);
+    if (!ehIsOk(eh) && !tpmMid.isEmpty()) {
+        eh = sendEh(tpmProof, tpmMid);
+        usedKey = QStringLiteral("tpm");
+    }
+    m_attestTpm = (usedKey == QLatin1String("tpm"));
+    emit debugLog(QString("TPM http device=%1 key=%2")
+                      .arg(m_deviceId.left(16), usedKey));
     // Respuesta del EH: si es JSON valido se exige result=="ok" explicito
     // (contains("ok") aceptaria {"ok":false,...}); si es texto plano (las
     // capturas reales muestran mensajes URL-encoded del server, no JSON) se
     // conserva el check original que funciona contra el server real.
-    QJsonObject ehObj = parseJsonObj(eh);
-    const bool ehOk = ehObj.isEmpty()
-        ? QString::fromUtf8(eh).contains("ok")
-        : (ehObj.value("result").toString() == "ok");
-    if (!ehOk) {
+    if (!ehIsOk(eh)) {
         *accountName = "EH failed";
         return;
     }
@@ -2332,7 +2358,7 @@ bool FarmWorker::spawnSession(QTcpSocket *sock, QNetworkAccessManager *net,
                         pf.close();
                         try {
                             QString proofStr;
-                            Bytes pfrm = tcp::makeProofFrame(v.arr[1].s, state->suffix, m_deviceId, state->seed, pem, &proofStr, nonceRt);
+                            Bytes pfrm = tcp::makeProofFrame(v.arr[1].s, state->suffix, m_deviceId, state->seed, pem, &proofStr, nonceRt, m_attestTpm);
                             emit debugLog(QString("TCP >> PROOF TPM seed=%1 chk=%2 device=%3 proofh=%4")
                                               .arg(state->seed).arg(state->seed % 63).arg(m_deviceId.left(16)).arg(proofStr.left(10)));
                             sendFrame(sock, pfrm);
@@ -4328,7 +4354,7 @@ try {
                             pf.close();
                             try {
                                 QString proofStr;
-                                Bytes pfrm = tcp::makeProofFrame(v.arr[1].s, state.suffix, m_deviceId, state.seed, pem, &proofStr, nonceRt);
+                                Bytes pfrm = tcp::makeProofFrame(v.arr[1].s, state.suffix, m_deviceId, state.seed, pem, &proofStr, nonceRt, m_attestTpm);
                                 emit debugLog(QString("TCP >> PROOF TPM seed=%1 chk=%2 device=%3 proofh=%4")
                                                   .arg(state.seed).arg(state.seed % 63).arg(m_deviceId.left(16)).arg(proofStr.left(10)));
                                 sendFrame(sock.get(), pfrm);

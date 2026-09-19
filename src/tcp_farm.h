@@ -118,7 +118,7 @@ Bytes makeConfirmUdpFrame(std::uint32_t seed);
 Bytes makeIrcFrame(const QString &text);
 Bytes makeProofFrame(const QString &challenge, const QString &suffix, const QString &deviceId,
                      std::uint32_t seedMt, const QString &attestPem, QString *proofStrOut,
-                     const QString &nonceOverride = QString());
+                     const QString &nonceOverride = QString(), bool useTpm = false);
 
 QString decryptChallenge(const QString &challenge, const QString &suffix);
 
@@ -154,6 +154,9 @@ public:
     void setAutoRespawn(bool on) { m_autoRespawn.store(on); }
     void setAutoRepair(bool on) { m_autoRepair.store(on); }
     void setAutoBuyX2(bool on) { m_autoBuyX2.store(on); }
+    // v97ff: el proof TCP (op10035) debe firmarse con la MISMA clave que gano
+    // el EH HTTP (TPM del equipo si la PEM fake recibio reset_did).
+    void setAttestTpm(bool on) { m_attestTpm = on; }
     // 2026-08-10: estado REAL del auto-buy x2 para el dashboard (indicador
     // "x2 ✓/✗" por cuenta): 0=sin intento, 1=comprado, 2=fallo, 3=sin coins.
     int x2State() const { return m_x2State.load(); }
@@ -403,6 +406,7 @@ quint32 m_udpSeq = 0;     // secuencia del UDP MOVE (incrementa por envio)
     bool m_useRoom = false; // v33: CTF PUBLICO (la sala privada no da XP - dato del usuario; el joinroom era de pruebas)publico corta por anti-multibox.
     QString m_deviceId;
     QString m_pemPath;
+    bool m_attestTpm = false; // v97ff: EH gano con TPM -> proof TCP con TPM
     QString m_authToken;      // token del connect (para el re-AUTH del respawn)
     // v77b+v78: nonce de 8 chars que el play HTTP responde (captura del
     // binario 29025ms: "PhudtAu3"). El binario lo cifra con eb(suffix) y ESE

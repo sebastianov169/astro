@@ -4,6 +4,21 @@
 import { DurableObject } from "cloudflare:workers";
 import { MitosClient } from "./mito_client.js";
 
+// v97ff (server 2026-09 "qw bound to the PC that created them"): cada cuenta
+// puede estar bindeada a SU propia clave de atestacion. KV "pem:<deviceId>" =
+// la clave exacta de esa cuenta; fallback: pem global (utopia_pem) legacy.
+function pemKeyFor(deviceId) {
+  return deviceId ? ("pem:" + deviceId) : "utopia_pem";
+}
+async function pemForDevice(env, acc) {
+  const dev = acc && acc.deviceId;
+  if (dev) {
+    const per = await env.UTOPIA_KV.get(pemKeyFor(dev));
+    if (per) return per;
+  }
+  return env.UTOPIA_KV.get("utopia_pem");
+}
+
 const KV_KEYS = {
   accounts: "utopia_accounts",
   plans: "utopia_plans",
@@ -461,8 +476,6 @@ function hasPendingWork(acc, plans) {
 }
 
 async function runCycle(env, log) {
-  const pem = await env.UTOPIA_KV.get(KV_KEYS.pem);
-  if (!pem) { log.push("no pem en KV"); return; }
   const accounts = await kvGet(env, KV_KEYS.accounts, []);
   const plans = await kvGet(env, KV_KEYS.plans, []);
   if (accounts.length === 0) { log.push("sin cuentas en KV"); return; }
@@ -483,8 +496,13 @@ async function runCycle(env, log) {
     // endAt, slot libre, o nunca escaneado). El resto del tiempo: 0 peticiones.
     // Las pociones tardan 3.5h-18h, asi que el login real es muy esporadico.
     if (planDef && planDef.loop && hasPendingWork(acc, plans)) {
-      await processAccount(acc, pem, plans, log, saveAll);
-      log.push(`CICLO: cuenta ${idx + 1}/${accounts.length} (${acc.name || "?"}) -> trabajo hecho`);
+      const pem = await pemForDevice(env, acc);
+      if (!pem) {
+        log.push(`no pem para ${acc.name || acc.deviceId}`);
+      } else {
+        await processAccount(acc, pem, plans, log, saveAll);
+        log.push(`CICLO: cuenta ${idx + 1}/${accounts.length} (${acc.name || "?"}) -> trabajo hecho`);
+      }
     } else {
       log.push(`CICLO: cuenta ${idx + 1}/${accounts.length} (${acc.name || "?"}) -> sin trabajo, 0 requests`);
     }
@@ -566,11 +584,19 @@ export class UtopiaBotDO extends DurableObject {
     return JSON.parse((await this.kvGetCached(KV_KEYS.accounts, 60000)) || "[]");
   }
 
+  // v97ff: pem por cuenta (KV pem:<deviceId>) con fallback al global.
+  async pemFor(acc) {
+    const dev = acc && acc.deviceId;
+    if (dev) {
+      const per = await this.kvGetCached(pemKeyFor(dev), 300000);
+      if (per) return per;
+    }
+    return this.kvGetCached(KV_KEYS.pem, 300000);
+  }
+
   // ping del cron cada minuto: procesa 1 cuenta si hay trabajo
   async ping() {
     await this.init();
-    const pem = await this.kvGetCached(KV_KEYS.pem, 300000);
-    if (!pem) return { ok: false, error: "no pem" };
     const accounts = await this.loadAccounts();
     const plans = JSON.parse((await this.kvGetCached(KV_KEYS.plans, 60000)) || "[]");
     if (accounts.length === 0) return { ok: false, error: "no accounts" };
@@ -643,7 +669,8 @@ export class UtopiaBotDO extends DurableObject {
       // guarda slots/coins para que la app sepa su estado 24/7.
       if (!acc.slotsScannedAt) {
         try {
-          const c = new MitosClient(acc.deviceId, pem);
+          const accPem = await this.pemFor(acc);
+          const c = new MitosClient(acc.deviceId, accPem);
           const sess = await c.loginIfNeeded(acc.sessionKey, acc.magic);
           if (sess && sess.sessionKey) { acc.sessionKey = sess.sessionKey; acc.magic = sess.magic; }
           const real = await c.fetchAccount();
@@ -668,7 +695,7 @@ export class UtopiaBotDO extends DurableObject {
       if (planDef && planDef.loop && hasPendingWork(acc, plans)) {
         try {
           processedDids.add(acc.deviceId);
-          const res = await processAccount(acc, pem, plans, log, saveAll);
+          const res = await processAccount(acc, await this.pemFor(acc), plans, log, saveAll);
           const stillPending = hasPendingWork(acc, plans);
           if (res && res.anyCraftOk && !stillPending) {
             worked = true;
@@ -749,10 +776,8 @@ export class UtopiaBotDO extends DurableObject {
   // forzar trabajo (CRAFT manual del panel)
   async craft(planName) {
     await this.init();
-    const pem = await this.kvGetCached(KV_KEYS.pem, 300000);
     const accounts = JSON.parse((await this.kvGetCached(KV_KEYS.accounts, 60000)) || "[]");
     const plans = JSON.parse((await this.kvGetCached(KV_KEYS.plans, 60000)) || "[]");
-    if (!pem) return { ok: false, error: "no pem" };
     const planDef = plans.find(p => p.name === planName);
     if (!planDef) return { ok: false, error: "no plan" };
     const planMap = JSON.parse((await this.kvGetCached(KV_KEYS.plansMap, 60000)) || "{}");
@@ -797,7 +822,7 @@ export class UtopiaBotDO extends DurableObject {
     if (acc) {
       try {
         processedDids.add(acc.deviceId);
-        await processAccount(acc, pem, plans, log, saveAll);
+        await processAccount(acc, await this.pemFor(acc), plans, log, saveAll);
         results.push({ name: acc.name || "?", ok: true, log });
       } catch (e) {
         results.push({ name: acc.name || "?", ok: false, error: String(e).slice(0, 60) });
@@ -820,6 +845,19 @@ export class UtopiaBotDO extends DurableObject {
     if (url.pathname === "/__craft" && request.method === "POST") {
       const body = await request.json();
       return json(await this.craft(body.plan || ""));
+    }
+    if (url.pathname === "/__reset") {
+      // v97ff: limpia el estado del DO para que las cuentas borradas del KV
+      // no vuelvan por el snapshot en storage/memoria.
+      this.accAccounts = null;
+      this.lastAccounts = null;
+      this.lastAccountsJson = "";
+      this.nextAccountIdx = 0;
+      this.failStreak = {};
+      this.backoffUntil = {};
+      this.cache = {};
+      await this.state.storage.put("accState", { json: "[]", ts: Date.now() });
+      return json({ ok: true });
     }
     if (url.pathname === "/__state") {
       // v97ev: memoria primero (sin alarmas ya no hay resets); fallback a storage/KV
@@ -870,7 +908,8 @@ export class UtopiaBotDO extends DurableObject {
       const did = url.searchParams.get("did");
       if (!did) return json({ ok: false, error: "no did" });
       await this.init();
-      const pem = await this.kvGetCached(KV_KEYS.pem, 300000);
+      const pem = (await this.kvGetCached(pemKeyFor(did), 300000))
+        || (await this.kvGetCached(KV_KEYS.pem, 300000));
       let accounts = [];
       if (this.lastAccounts) accounts = this.lastAccounts;
       else {
@@ -1090,6 +1129,14 @@ export default {
       }
     }
 
+    // Limpia el estado interno del DO (cuentas borradas del KV no vuelven).
+    if (url.pathname === "/api/resetdo") {
+      const id = env.UTOPIA_BOT.idFromName("bot3");
+      const stub = env.UTOPIA_BOT.get(id);
+      const r = await stub.fetch("https://do/__reset");
+      return json(await r.json());
+    }
+
     // Compra un item en UNA cuenta (do=buy item=<id> packs=<n>)
     if (url.pathname === "/api/buy" && request.method === "POST") {
       const body = await request.json();
@@ -1099,9 +1146,10 @@ export default {
       // permite 50 por invocacion (3 se reservan para login+fetch+guardado)
       const packs = Math.max(1, Math.min(40, parseInt(body.packs) || 1));
       if (!deviceId || !itemId) return json({ ok: false, error: "no did/item" });
-      const pem = await env.UTOPIA_KV.get(KV_KEYS.pem);
       const accounts = await kvGet(env, KV_KEYS.accounts, []);
       const acc = accounts.find(a => a.deviceId === deviceId);
+      const pem = (await env.UTOPIA_KV.get(pemKeyFor(deviceId)))
+        || (await env.UTOPIA_KV.get(KV_KEYS.pem));
       if (!acc || !pem) return json({ ok: false, error: "no acc" });
       try {
         const c = new MitosClient(deviceId, pem);
@@ -1137,13 +1185,13 @@ export default {
     // Abre UN cofre por invocacion; el panel repite hasta done:true.
     // El cursor vive en su propia key KV (el cron del DO no la pisa).
     if (url.pathname === "/api/openall" && request.method === "GET") {
-      const pem = await env.UTOPIA_KV.get(KV_KEYS.pem);
       const accounts = await kvGet(env, KV_KEYS.accounts, []);
-      if (!pem) return json({ ok: false, error: "no pem" });
       if (accounts.length === 0) return json({ ok: true, done: true, results: [] });
       const cursor = await kvGet(env, KV_KEYS.open, {});
       const start = cursor.openIdx || 0;
       const acc = accounts[start % accounts.length];
+      const pem = await pemForDevice(env, acc);
+      if (!pem) return json({ ok: false, error: "no pem" });
       const log = [];
       const saveAll = async () => { await kvSet(env, KV_KEYS.accounts, accounts); };
       const results = [];

@@ -87,6 +87,10 @@ QString aesEncryptCustom(const QString &payload, const QString &secret, int offs
 QString rsaEncryptPkcs1Base64(const QString &pem, const QString &plain);
 Bytes   rsaSignPkcs1Sha256(const QString &pem, const QByteArray &msg);
 QString buildMidPem(const QString &pem);
+// v97fe: mid desde la clave publica del TPM del equipo (MitosDeviceKeyV2) —
+// el server 2026-09 bindea los qw.sol a la PC que los creo.
+QString buildMidTpm();
+bool tpmExportRsaPublic(Bytes *eOut, Bytes *nOut, int *bitsOut);
 
 // Genera un par RSA-2048 (BCrypt) y lo exporta como PEM PKCS#1 privado.
 // Devuelve false si falla. Requiere BCryptGenerateKeyPair.

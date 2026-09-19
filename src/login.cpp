@@ -260,54 +260,56 @@ LoginResult LoginManager::login(const QString &deviceId)
         QMutexLocker attestLocker(&g_attestMutex);
         m_magic = genMagic(64);
         QString dtf = buildDtf(m_sessionKey);
-        // proof con la clave PEM de atestacion FAKE del device (setAttestPem).
-        // JAMAS se cae a la clave embebida compartida: el server identifica la
-        // atestacion por mid+proof y una clave compartida entre cuentas hace
-        // que corte la conexion (limite ~4 conexiones simultaneas). Sin clave
-        // propia, el EH falla con error claro en vez de usar la embebida.
+        // v97fe (server 2026-09 "qw.sol bound to the PC that created them"):
+        // la identidad del equipo es la clave TPM MitosDeviceKeyV2 (la misma
+        // con la que firma el cliente del juego). Intento 1: PEM fake del
+        // device (cuentas viejas bindeadas a ella); si el server responde
+        // ko/reset_did, intento 2: firma TPM del equipo.
         const QString attestPem = m_attestPem;
-        if (attestPem.isEmpty()) {
-            result.error = "Attestation key missing (setAttestPem)";
+        QByteArray chMsg = (dtf + "|" + m_deviceId + "|100").toUtf8();
+        QString pemProof, pemMid;
+        if (!attestPem.isEmpty()) {
+            Bytes pemSig = rsaSignPkcs1Sha256(attestPem, chMsg);
+            pemProof = urlB64EncodeNoPad(pemSig);
+            pemMid = buildMidPem(attestPem);
+        }
+        QString tpmProof, tpmMid;
+        try {
+            Bytes tpmSig = tpmSignPkcs1Sha256(chMsg);
+            tpmProof = urlB64EncodeNoPad(tpmSig);
+            tpmMid = buildMidTpm();
+        } catch (const std::exception &) {}
+        if (pemMid.isEmpty() && tpmMid.isEmpty()) {
+            result.error = "Attestation key missing (setAttestPem o MitosDeviceKeyV2)";
             return result;
         }
-        QByteArray chMsg = (dtf + "|" + m_deviceId + "|100").toUtf8();
-        Bytes sig = rsaSignPkcs1Sha256(attestPem, chMsg);
-        QString proof = urlB64EncodeNoPad(sig);
-        QString mid = buildMidPem(attestPem);
-        // evidencia TPM del EH de pre-spawn: cada device debe loguear un mid
-        // DISTINTO (el mismo mid en varias cuentas = atestacion compartida).
-        qWarning("TPM eh device=%.16s mid=%.12s", m_deviceId.left(16).toUtf8().constData(),
-                 mid.left(12).toUtf8().constData());
-        std::printf("[C++] PROOF: %.16s...\n", proof.toUtf8().constData()); fflush(stdout);
-        std::printf("[C++] MID FULL: %.16s...\n", mid.toUtf8().constData()); fflush(stdout);
-
-        QString ddJson = QString("{\"proof\":\"%1\",\"mid\":\"%2\",\"ver\":\"%3\",\"host\":\"app.mitos.is\"}")
-                             .arg(proof, mid, kVersion);
-        u32 R10 = u32(quint64(QDateTime::currentMSecsSinceEpoch()) ^ quint64(QRandomGenerator::global()->generate()));
-        u32 ddH2 = u32(QRandomGenerator::global()->generate());
-        std::printf("[C++] R10: %08x H2: %08x\n", R10, ddH2); fflush(stdout);
-        Bytes ddBlob = m2xcEncryptFull(bytesOf(ddJson),
-                                       bytesOf(m_magic), R10,
-                                       ddH2);
-        QString dd = m2xcFmt(ddBlob);
-        std::printf("[C++] RK: %.16s...\n", rsaPublicKey.left(16).toUtf8().constData()); fflush(stdout);
-        QString ms = rsaEncryptPkcs1Base64(rsaPublicKey, m_magic);
-        std::printf("[C++] MS: %.16s... len=%d\n", ms.toUtf8().constData(), int(ms.size())); fflush(stdout);
-        std::printf("[C++] RK FULL: %.16s...\n", rsaPublicKey.toUtf8().constData()); fflush(stdout);
-        std::printf("[C++] MAGIC: %.16s...\n", m_magic.toUtf8().constData()); fflush(stdout);
-        std::printf("[C++] DTF FULL: %.16s...\n", dtf.toUtf8().constData()); fflush(stdout);
-
-        QVector<QPair<QString, QString>> ehParams = {
-            {"go", "0"}, {"dd", dd}, {"de", "desktop"}, {"gi", "0"},
-            {"ver", kVersion}, {"it", "1"}, {"do", "eh"}, {"im", "0"},
-            {"di", desktop}, {"dtf", dtf}, {"ms", ms}, {"rndx", rndx()},
+        const QString ms = rsaEncryptPkcs1Base64(rsaPublicKey, m_magic);
+        auto sendEh = [&](const QString &proof, const QString &mid) -> QByteArray {
+            const QString ddJson = QString("{\"proof\":\"%1\",\"mid\":\"%2\",\"ver\":\"%3\",\"host\":\"app.mitos.is\"}")
+                                       .arg(proof, mid, kVersion);
+            const u32 R10 = u32(quint64(QDateTime::currentMSecsSinceEpoch()) ^ quint64(QRandomGenerator::global()->generate()));
+            const u32 ddH2 = u32(QRandomGenerator::global()->generate());
+            const Bytes ddBlob = m2xcEncryptFull(bytesOf(ddJson), bytesOf(m_magic), R10, ddH2);
+            const QString dd = m2xcFmt(ddBlob);
+            QVector<QPair<QString, QString>> ehParams = {
+                {"go", "0"}, {"dd", dd}, {"de", "desktop"}, {"gi", "0"},
+                {"ver", kVersion}, {"it", "1"}, {"do", "eh"}, {"im", "0"},
+                {"di", desktop}, {"dtf", dtf}, {"ms", ms}, {"rndx", rndx()},
+            };
+            const QString ehUrl = kEngine + "?" + makeQuery(ehParams, true);
+            // URL del EH truncada: dd/ms/dtf son blobs largos (cifrados/derivados),
+            // no hace falta imprimirlos completos en stdout
+            std::printf("[C++] EH URL: %.160s\n", ehUrl.toUtf8().constData()); fflush(stdout);
+            return httpGet(QUrl(ehUrl), &m_net);
         };
-        QString ehUrl = kEngine + "?" + makeQuery(ehParams, true);
-        // URL del EH truncada: dd/ms/dtf son blobs largos (cifrados/derivados),
-        // no hace falta imprimirlos completos en stdout
-        std::printf("[C++] EH URL: %.160s\n", ehUrl.toUtf8().constData()); fflush(stdout);
+        auto ehIsOk = [](const QByteArray &resp) -> bool {
+            const QJsonObject o = parseJsonObject(resp);
+            return o.isEmpty() ? (!resp.isEmpty() && QString::fromUtf8(resp).contains("ok"))
+                               : (o.value("result").toString() == "ok");
+        };
         QByteArray eh;
         bool ehSkipped = false;
+        QString usedKey = QStringLiteral("pem");
         if (qEnvironmentVariableIsSet("GEMXP_SKIP_EH")) {
             std::printf("[C++] SKIP_EH: no se envia el EH\n"); fflush(stdout);
             eh = QByteArray("{}");
@@ -315,19 +317,24 @@ LoginResult LoginManager::login(const QString &deviceId)
             // (antes eh="{}" y el check contains("ok") fallaba SIEMPRE)
             ehSkipped = true;
         } else {
-            eh = httpGet(QUrl(ehUrl), &m_net);
+            if (!pemMid.isEmpty())
+                eh = sendEh(pemProof, pemMid);
+            if (!ehIsOk(eh) && !tpmMid.isEmpty()) {
+                std::printf("[C++] EH pem ko -> reintento con TPM del equipo\n"); fflush(stdout);
+                eh = sendEh(tpmProof, tpmMid);
+                usedKey = QStringLiteral("tpm");
+            }
         }
+        m_lastEhTpm = (usedKey == QLatin1String("tpm"));
+        qWarning("EH device=%.16s key=%s", m_deviceId.left(16).toUtf8().constData(),
+                 usedKey.toUtf8().constData());
         std::printf("[C++] EH response: %.200s\n", eh.constData()); fflush(stdout);
         if (!ehSkipped) {
             // Respuesta del EH: si es JSON valido se exige result=="ok"
             // explicito (contains("ok") aceptaria {"ok":false,...}); si es
             // texto plano (mensajes URL-encoded del server en las capturas)
             // se conserva el check original que funciona contra el server real.
-            QJsonObject ehObj = parseJsonObject(eh);
-            const bool ehOk = ehObj.isEmpty()
-                ? QString::fromUtf8(eh).contains("ok")
-                : (ehObj.value("result").toString() == "ok");
-            if (!ehOk) {
+            if (!ehIsOk(eh)) {
                 result.error = "EH failed: " + QString::fromUtf8(eh).left(120);
                 return result;
             }
@@ -432,6 +439,21 @@ QVector<GemInfo> LoginManager::fetchInventory(int slot)
         g.price = it.value("price").toInt();
         g.sellPrice = it.value("sell_price").toInt();
         g.category = it.value("category").toInt();
+        // v97fc (app personal): stats del inventario (data.attrs con pares
+        // anidados [[nombre, valor], ...], igual que el shop). Se guardan
+        // como lista de pares para gemAttrsText().
+        const QJsonArray jattrs = it.value("data").toObject().value("attrs").toArray();
+        for (const auto &av : jattrs) {
+            if (av.isArray()) {
+                const QJsonArray pair = av.toArray();
+                if (pair.size() >= 2)
+                    g.attrs.append(QVariantList() << pair.at(0).toString() << pair.at(1).toVariant());
+            } else if (av.isString()) {
+                g.attrs.append(av.toString());
+            } else if (av.isDouble()) {
+                g.attrs.append(av.toVariant());
+            }
+        }
         gems.push_back(g);
     }
     // la gema EQUIPADA de la cuenta (data.current): la que el server reporta

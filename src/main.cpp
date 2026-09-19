@@ -189,6 +189,12 @@ int main(int argc, char *argv[])
     appendCrashLine("[SEH] handler installed");
 #endif
     QGuiApplication app(argc, argv);
+#ifdef Q_OS_WIN
+    // v97fc: prioridad bajo-normal para no robar CPU a juegos (Valorant).
+    // El farm es I/O-bound (~0% CPU en reposo); solo cede ante contienda,
+    // sin impacto medible en el farmeo.
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+#endif
     app.setApplicationName(QStringLiteral("Astro"));
     app.setApplicationVersion(QStringLiteral("1.0"));
     app.setOrganizationName(QStringLiteral("Astro Labs"));
