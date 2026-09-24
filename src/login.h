@@ -61,6 +61,9 @@ public:
     // Bloqueante. deviceId vacio -> lee MitosisOG/qw.sol.
     LoginResult login(const QString &deviceId);
 
+    LoginResult loginWithRetries(const QString &deviceId, int attempts = 3,
+                                 int delayMs = 1200);
+
     // FIX 2026-08-11 (crash del X2 scan con farm activo): reutiliza una
     // sesion ya establecida (sk/magic del worker) SIN hacer KNOCK/LIM/EH -
     // el login completo duplicado desconecta/crashea la sesion del farm.

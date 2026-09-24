@@ -13,6 +13,7 @@ find_package(Qt6 6.4 REQUIRED COMPONENTS Quick QuickControls2 Network)
 
 qt_add_executable(Astro
     src/main.cpp
+    src/compat_mingw.cpp
     src/farm_controller.h
     src/farm_controller.cpp
     src/crypto.h

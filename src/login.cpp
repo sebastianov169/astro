@@ -12,7 +12,9 @@
 #include <QUrlQuery>
 #include <QEventLoop>
 #include <QFile>
+#include <QHash>
 #include <QMutex>
+#include <QSettings>
 #include <QElapsedTimer>
 #include <QThread>
 #include <QCoreApplication>
@@ -40,6 +42,39 @@ const QStringList kDesktopPool = {
 QString randomDesktop() {
     return kDesktopPool.at(
         QRandomGenerator::global()->bounded(kDesktopPool.size()));
+}
+
+QHash<QString, QString> &attestModeCache()
+{
+    static QHash<QString, QString> cache;
+    static bool loaded = false;
+    if (!loaded) {
+        QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+        const QVariantMap m = s.value(QStringLiteral("attestModeAll")).toMap();
+        for (auto it = m.constBegin(); it != m.constEnd(); ++it)
+            cache.insert(it.key(), it.value().toString());
+        loaded = true;
+    }
+    return cache;
+}
+
+QString attestModeFor(const QString &deviceId)
+{
+    return attestModeCache().value(deviceId);
+}
+
+void persistAttestMode(const QString &deviceId, const QString &mode)
+{
+    if (deviceId.isEmpty() || mode.isEmpty())
+        return;
+    QHash<QString, QString> &cache = attestModeCache();
+    if (cache.value(deviceId) == mode)
+        return;
+    cache.insert(deviceId, mode);
+    QSettings s(QStringLiteral("Astro Labs"), QStringLiteral("Astro"));
+    QVariantMap m = s.value(QStringLiteral("attestModeAll")).toMap();
+    m.insert(deviceId, mode);
+    s.setValue(QStringLiteral("attestModeAll"), m);
 }
 
 QString urlEncode(const QString &s, bool plusForSpace)
@@ -75,7 +110,8 @@ QString redactSidUrl(const QString &url)
     return out;
 }
 
-QByteArray httpGet(const QUrl &url, QNetworkAccessManager *mgr)
+QByteArray httpGetEx(const QUrl &url, QNetworkAccessManager *mgr, int timeoutMs,
+                     int *statusOut, int *errOut, int *lenOut, qint64 *msOut)
 {
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::UserAgentHeader, "libcurl-agent/1.0");
@@ -88,15 +124,34 @@ QByteArray httpGet(const QUrl &url, QNetworkAccessManager *mgr)
     QNetworkReply *reply = mgr->get(req);
     QEventLoop loop;
     QTimer timer;
+    QElapsedTimer clock;
     timer.setSingleShot(true);
     QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    timer.start(8000);
+    clock.start();
+    timer.start(timeoutMs);
     loop.exec();
-    QByteArray data = reply->isFinished() ? reply->readAll() : QByteArray();
+    const bool finished = reply->isFinished();
+    if (!finished) {
+        // v97fm: reply colgado (socket keep-alive que el server ya cerro y Qt
+        // no detecto): abortar YA y tirar la conexion cacheada para que el
+        // retry abra una nueva, en vez de agotar el timeout de 8s viejo.
+        reply->abort();
+        mgr->clearConnectionCache();
+    }
+    QByteArray data = finished ? reply->readAll() : QByteArray();
     int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     QNetworkReply::NetworkError err = reply->error();
-    std::printf("[httpGet] %.120s status=%d err=%d len=%d\n", redactSidUrl(url.toString()).toUtf8().constData(), status, int(err), int(data.size()));
+    const qint64 ms = clock.elapsed();
+    std::printf("[httpGet] %.120s status=%d err=%d len=%d ms=%d\n", redactSidUrl(url.toString()).toUtf8().constData(), status, int(err), int(data.size()), int(ms)); fflush(stdout);
+    if (statusOut)
+        *statusOut = status;
+    if (errOut)
+        *errOut = int(err);
+    if (lenOut)
+        *lenOut = int(data.size());
+    if (msOut)
+        *msOut = ms;
     // delete DIRECTO, no deleteLater: el hilo del refreshAll/spawn destruye el
     // QNAM (y muere) justo despues de esta llamada; el DeferredDelete pendiente
     // del deleteLater se procesa al teardown del hilo sobre un reply YA borrado
@@ -105,6 +160,11 @@ QByteArray httpGet(const QUrl &url, QNetworkAccessManager *mgr)
     // Despues del loop.exec el reply esta idle: delete directo es seguro.
     delete reply;
     return data;
+}
+
+QByteArray httpGet(const QUrl &url, QNetworkAccessManager *mgr)
+{
+    return httpGetEx(url, mgr, 8000, nullptr, nullptr, nullptr, nullptr);
 }
 
 QByteArray httpPost(const QUrl &url, const QByteArray &body, QNetworkAccessManager *mgr)
@@ -152,6 +212,48 @@ QString makeQuery(const QVector<QPair<QString, QString>> &pairs, bool plus = tru
 }
 } // namespace
 
+// v97fm: circuit breaker global del KNOCK (declarado en crypto.h). Con 3+
+// cuentas logueando a la vez el server empieza a responder sin token ({} o
+// body vacio) y los reintentos en paralelo lo empeoran. Estado global con
+// mutex propio: ring de 6 timestamps de fallos en los ultimos 10s; con >=3 se
+// arma una pausa de 5-8s que TODOS los knocks respetan antes de reintentar.
+namespace {
+QMutex g_knockGateMutex;
+qint64 g_knockPenaltyUntilMs = 0;
+qint64 g_knockFailStamps[6] = {0, 0, 0, 0, 0, 0};
+int g_knockFailIdx = 0;
+} // namespace
+
+qint64 knockGateDelayMs()
+{
+    QMutexLocker locker(&g_knockGateMutex);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    return g_knockPenaltyUntilMs > now ? g_knockPenaltyUntilMs - now : 0;
+}
+
+void knockGateNoteFailure()
+{
+    QMutexLocker locker(&g_knockGateMutex);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    g_knockFailStamps[g_knockFailIdx % 6] = now;
+    ++g_knockFailIdx;
+    int recent = 0;
+    for (int i = 0; i < 6; ++i)
+        if (g_knockFailStamps[i] > 0 && now - g_knockFailStamps[i] <= 10000)
+            ++recent;
+    if (recent >= 3 && g_knockPenaltyUntilMs <= now)
+        g_knockPenaltyUntilMs = now + 5000 + qint64(QRandomGenerator::global()->bounded(3000));
+}
+
+void knockGateNoteSuccess()
+{
+    QMutexLocker locker(&g_knockGateMutex);
+    g_knockPenaltyUntilMs = 0;
+    for (int i = 0; i < 6; ++i)
+        g_knockFailStamps[i] = 0;
+    g_knockFailIdx = 0;
+}
+
 LoginManager::LoginManager(QObject *parent) : QObject(parent)
 {
     // El QNetworkAccessManager (m_net) se construye AQUI, en el ctor, desde el
@@ -197,14 +299,64 @@ LoginResult LoginManager::login(const QString &deviceId)
         // caen siempre dentro de LIM (entre los warnings TOKEN/SD1/EDID de
         // distintos hilos), incluso con tandas de 3 logins.
         QMutexLocker loginLocker(&g_loginMutex);
-        // ---- KNOCK ----
+        // ---- KNOCK (con reintentos) ----
+        // v97fh: el KNOCK es un GET barato y el server a veces responde sin
+        // token por throttling transitorio (muchos logins seguidos). Antes un
+        // fallo aca dejaba la cuenta ignorada hasta el proximo autorefresh;
+        // ahora se reintenta con backoff dentro del mismo login.
         std::printf("[C++] KNOCK...\n"); fflush(stdout);
         QString chk = md5Hex("_chk91822" + m_deviceId + "l.o.x");
-        QString q = makeQuery({{"do", "knock"}, {"rndx", rndx()}});
-        QJsonObject knock = parseJsonObject(httpGet(QUrl(kEngine + "?" + q), &m_net));
-        QString token = knock.value("data").toObject().value("token").toString();
+        QString token;
+        QString lastKnockBody;
+        // v97fm (robustez del knock): antes el timeout era 8s fijo y cada
+        // reintento esperaba lo suyo -> un knock huerfano tardaba ~9s por
+        // intento y las 3 cuentas reintentando a la vez saturaban al server
+        // (throttle -> respuesta vacia). Ahora: deadline total 12s, timeout 3s
+        // por intento con conexion renovada (httpGetEx aborta + limpia la
+        // cache de conexiones), clasificacion del fallo (throttle 200-sin-token
+        // = backoff exponencial con jitter; timeout/transporte = retry casi
+        // inmediato) y gate global (knockGate*) cuando varios knocks fallan.
+        const qint64 knockDeadline = QDateTime::currentMSecsSinceEpoch() + 12000;
+        for (int attempt = 1; attempt <= 6 && token.isEmpty(); ++attempt) {
+            const qint64 gate = knockGateDelayMs();
+            if (gate > 0) {
+                std::printf("[C++] KNOCK gate global: espero %dms\n", int(gate)); fflush(stdout);
+                QThread::msleep(unsigned(qMin<qint64>(gate, 8000)));
+            }
+            if (QDateTime::currentMSecsSinceEpoch() >= knockDeadline)
+                break;
+            QString q = makeQuery({{"do", "knock"}, {"rndx", rndx()}});
+            int kstatus = 0, kerr = 0, klen = 0;
+            qint64 kms = 0;
+            QJsonObject knock = parseJsonObject(httpGetEx(QUrl(kEngine + "?" + q), &m_net, 3000, &kstatus, &kerr, &klen, &kms));
+            token = knock.value("data").toObject().value("token").toString();
+            if (!token.isEmpty()) {
+                knockGateNoteSuccess();
+                break;
+            }
+            knockGateNoteFailure();
+            lastKnockBody = QString("intento=%1 status=%2 err=%3 len=%4 ms=%5 body=%6")
+                                .arg(attempt).arg(kstatus).arg(kerr).arg(klen).arg(kms)
+                                .arg(QString::fromUtf8(QJsonDocument(knock).toJson()).left(80));
+            if (attempt < 6) {
+                if (kstatus == 200 && klen > 0) {
+                    // 200 sin token = throttling transitorio del server:
+                    // backoff exponencial con jitter (1.5s, 3s, 6s, 8s cap)
+                    const int backoff = int(qMin<qint64>(8000, qint64(1500) << (attempt - 1)));
+                    const int jitter = QRandomGenerator::global()->bounded(backoff / 3 + 1);
+                    std::printf("[C++] KNOCK sin token (throttle), retry %d/6 en %dms\n", attempt, backoff + jitter); fflush(stdout);
+                    QThread::msleep(unsigned(backoff + jitter));
+                } else {
+                    // timeout/transporte (httpGetEx ya renovo la conexion):
+                    // retry casi inmediato, sin castigar al server
+                    const int wait = 250 + QRandomGenerator::global()->bounded(350);
+                    std::printf("[C++] KNOCK sin respuesta (status=%d err=%d ms=%d), retry %d/6 en %dms\n", kstatus, kerr, int(kms), attempt, wait); fflush(stdout);
+                    QThread::msleep(unsigned(wait));
+                }
+            }
+        }
         if (token.isEmpty()) {
-            result.error = "KNOCK failed: " + QString::fromUtf8(QJsonDocument(knock).toJson()).left(120);
+            result.error = "KNOCK failed: " + lastKnockBody;
             return result;
         }
         std::printf("[C++] LIM... token=%.16s...\n", token.toUtf8().constData()); fflush(stdout);
@@ -317,13 +469,27 @@ LoginResult LoginManager::login(const QString &deviceId)
             // (antes eh="{}" y el check contains("ok") fallaba SIEMPRE)
             ehSkipped = true;
         } else {
-            if (!pemMid.isEmpty())
+            const bool tpmFirst =
+                attestModeFor(m_deviceId) == QLatin1String("tpm");
+            auto tryPem = [&]() {
+                if (ehIsOk(eh) || pemMid.isEmpty())
+                    return;
                 eh = sendEh(pemProof, pemMid);
-            if (!ehIsOk(eh) && !tpmMid.isEmpty()) {
-                std::printf("[C++] EH pem ko -> reintento con TPM del equipo\n"); fflush(stdout);
+                if (ehIsOk(eh))
+                    usedKey = QStringLiteral("pem");
+            };
+            auto tryTpm = [&]() {
+                if (ehIsOk(eh) || tpmMid.isEmpty())
+                    return;
+                std::printf("[C++] EH con TPM del equipo\n"); fflush(stdout);
                 eh = sendEh(tpmProof, tpmMid);
-                usedKey = QStringLiteral("tpm");
-            }
+                if (ehIsOk(eh))
+                    usedKey = QStringLiteral("tpm");
+            };
+            if (tpmFirst) { tryTpm(); tryPem(); }
+            else { tryPem(); tryTpm(); }
+            if (ehIsOk(eh))
+                persistAttestMode(m_deviceId, usedKey);
         }
         m_lastEhTpm = (usedKey == QLatin1String("tpm"));
         qWarning("EH device=%.16s key=%s", m_deviceId.left(16).toUtf8().constData(),
@@ -350,6 +516,24 @@ LoginResult LoginManager::login(const QString &deviceId)
         result.error = QString("login error: %1").arg(e.what());
         return result;
     }
+}
+
+LoginResult LoginManager::loginWithRetries(const QString &deviceId, int attempts,
+                                           int delayMs)
+{
+    LoginResult result;
+    for (int intento = 1; intento <= attempts; ++intento) {
+        result = login(deviceId);
+        if (result.ok)
+            return result;
+        std::printf("[C++] login %s intento=%d fallo: %s\n",
+                    deviceId.left(12).toUtf8().constData(), intento,
+                    result.error.toUtf8().constData());
+        fflush(stdout);
+        if (intento < attempts)
+            QThread::msleep(static_cast<unsigned long>(delayMs));
+    }
+    return result;
 }
 
 // Reutiliza una sesion ya establecida (sk/magic del worker del farm) SIN

@@ -118,7 +118,8 @@ QJsonObject parseJsonObj(const QByteArray &data)
     return doc.object();
 }
 
-QByteArray httpGetTcp(QNetworkAccessManager *mgr, const QUrl &url)
+QByteArray httpGetTcp(QNetworkAccessManager *mgr, const QUrl &url, int timeoutMs = 8000,
+                      int *statusOut = nullptr, int *errOut = nullptr, int *lenOut = nullptr, qint64 *msOut = nullptr)
 {
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::UserAgentHeader, "libcurl-agent/1.0");
@@ -128,12 +129,32 @@ QByteArray httpGetTcp(QNetworkAccessManager *mgr, const QUrl &url)
     QNetworkReply *reply = mgr->get(req);
     QEventLoop loop;
     QTimer timer;
+    QElapsedTimer clock;
     timer.setSingleShot(true);
     QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    timer.start(8000);
+    clock.start();
+    timer.start(timeoutMs);
     loop.exec();
-    QByteArray data = reply->isFinished() ? reply->readAll() : QByteArray();
+    const bool finished = reply->isFinished();
+    if (!finished) {
+        // v97fm: reply colgado (keep-alive que el server ya cerro): abortar YA
+        // y limpiar la cache de conexiones para que el retry use una nueva.
+        reply->abort();
+        mgr->clearConnectionCache();
+    }
+    QByteArray data = finished ? reply->readAll() : QByteArray();
+    if (statusOut || errOut || lenOut || msOut) {
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (statusOut)
+            *statusOut = status;
+        if (errOut)
+            *errOut = int(reply->error());
+        if (lenOut)
+            *lenOut = int(data.size());
+        if (msOut)
+            *msOut = clock.elapsed();
+    }
     // delete directo (no deleteLater): el QNAM del hilo del refreshAll/spawn se
     // destruye al salir del lambda; el DeferredDelete pendiente se procesaba al
     // teardown del hilo sobre un reply ya borrado -> UAF -> AV en Qt6Core
@@ -1295,12 +1316,41 @@ void FarmWorker::doLogin(QString *sk, QString *magic, QString *accountName, QByt
     QMutexLocker loginLocker(&g_loginMutex);
     QNetworkAccessManager net;
     Q_UNUSED(sessionCookies);
-    // KNOCK
-    QString q = makeQueryTcp({{"do", "knock"}, {"rndx", rndxTcp()}}, false);
-    QJsonObject knock = parseJsonObj(httpGetTcp(&net, QUrl(kEngine + "?" + q)));
-    QString token = knock.value("data").toObject().value("token").toString();
+    // KNOCK (v97fm: deadline 12s, timeout 3s por intento con conexion renovada,
+    // backoff por clasificacion y gate global; ver login.cpp para el detalle)
+    QString token;
+    QString lastKnockBody;
+    const qint64 knockDeadline = QDateTime::currentMSecsSinceEpoch() + 12000;
+    for (int attempt = 1; attempt <= 6 && token.isEmpty(); ++attempt) {
+        const qint64 gate = knockGateDelayMs();
+        if (gate > 0)
+            QThread::msleep(unsigned(qMin<qint64>(gate, 8000)));
+        if (QDateTime::currentMSecsSinceEpoch() >= knockDeadline)
+            break;
+        QString q = makeQueryTcp({{"do", "knock"}, {"rndx", rndxTcp()}}, false);
+        int kstatus = 0, kerr = 0, klen = 0;
+        qint64 kms = 0;
+        QJsonObject knock = parseJsonObj(httpGetTcp(&net, QUrl(kEngine + "?" + q), 3000, &kstatus, &kerr, &klen, &kms));
+        token = knock.value("data").toObject().value("token").toString();
+        if (!token.isEmpty()) {
+            knockGateNoteSuccess();
+            break;
+        }
+        knockGateNoteFailure();
+        lastKnockBody = QString("intento=%1 status=%2 err=%3 len=%4 ms=%5 body=%6")
+                            .arg(attempt).arg(kstatus).arg(kerr).arg(klen).arg(kms)
+                            .arg(QString::fromUtf8(QJsonDocument(knock).toJson()).left(80));
+        if (attempt < 6) {
+            if (kstatus == 200 && klen > 0) {
+                const int backoff = int(qMin<qint64>(8000, qint64(1500) << (attempt - 1)));
+                QThread::msleep(unsigned(backoff + QRandomGenerator::global()->bounded(backoff / 3 + 1)));
+            } else {
+                QThread::msleep(unsigned(250 + QRandomGenerator::global()->bounded(350)));
+            }
+        }
+    }
     if (token.isEmpty()) {
-        *accountName = "KNOCK failed";
+        *accountName = "KNOCK failed: " + lastKnockBody;
         return;
     }
     // LIM
@@ -3508,7 +3558,22 @@ void FarmWorker::run()
             // v97ar: NUNCA re-loggear — si el loginifneeded da uid=0 con la
             // sesion reutilizada, reintentar con la MISMA sesion (el server
             // puede tardar); el login fresco kickea la cuenta.
-            emitLog("loginifneeded vacio/uid=0: reintentando con la misma sesion (v97ar)");
+            // v97fl (fix inestabilidad): si NO hay actividad de partida
+            // reciente (<12s), la cuenta NO esta en partida -> el login fresco
+            // es SEGURO y necesario; los 15 reintentos + fail dejaban la cuenta
+            // muerta hasta el proximo refresh (perdida de ~10 min de farm).
+            {
+                const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+                const bool inMatch = m_lastMatchActivityMs > 0 && (nowMs - m_lastMatchActivityMs) < 12000;
+                if (!inMatch) {
+                    emitLog("loginifneeded vacio/uid=0 sin partida: login fresco (seguro)");
+                    { QMutexLocker lk(&m_sessionMutex); m_sk.clear(); m_magic.clear(); }
+                    m_lastUid.clear();
+                    consecutiveSessionFailures = 0;
+                    continue;
+                }
+            }
+            emitLog("loginifneeded vacio/uid=0 en partida: reintentando misma sesion (v97ar)");
             consecutiveSessionFailures++;
             if (consecutiveSessionFailures >= 15) {
                 fail("Sesion invalida (15 intentos seguidos): loginifneeded vacio");
@@ -4080,6 +4145,7 @@ try {
     // El server no corta TCP ni envia op33 al terminar la partida; solo deja
     // de mandar XP. Este watchdog detecta la partida muerta y reconecta.
     qint64 lastMatchActivityAt = QDateTime::currentMSecsSinceEpoch();
+    m_lastMatchActivityMs = lastMatchActivityAt;
     emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, true);
     emit stateChanged("Farming CTF... (press Stop to stop)");
     // diagnostico 2026-08-10: el auto-buy no corria — verificar que el flag
@@ -4430,7 +4496,8 @@ try {
                             }
                         }
                     } else if (op == 20) {
-                        lastMatchActivityAt = now; // v34: SPAWNED = partida activa
+                        lastMatchActivityAt = now;
+        m_lastMatchActivityMs = now; // v34: SPAWNED = partida activa
                         m_sameSocketPlayAttempts = 0; // v58
                         if (matchEnded && m_autoRespawn) {
                             // Partida terminada (match_end.log): [33,null] + [20] -> el
@@ -4520,13 +4587,15 @@ try {
                         state.xpTotal += xp;
                         state.xpLast = xp;
                         m_sessionXpTotal = state.xpTotal;
-                        lastMatchActivityAt = now; // v34: partida viva (XP llega)
+                        lastMatchActivityAt = now;
+        m_lastMatchActivityMs = now; // v34: partida viva (XP llega)
                         m_sameSocketPlayAttempts = 0; // v58
                         emit debugLog(QString("XP +%1 (total %2)").arg(xp, 0, 'f', 1).arg(state.xpTotal, 0, 'f', 1));
                         emit xpUpdate(state.xpTotal, state.xpLast, state.deaths, state.spawned);
                     } else if (op == 35 || op == 10) {
                         // v34: op35 = PLAYER_STATUS, op10 = MAP — actividad de partida
                         lastMatchActivityAt = now;
+        m_lastMatchActivityMs = now;
                         // log del contenido: el binario recibe la XP de la gema como
                         // [35, [-1, "Has obtenido +XP"]] + [10, [26, ...]] (match_end.log)
                         QString dataStr;
@@ -4833,6 +4902,7 @@ try {
             emitLog("WATCHDOG: 12s sin actividad - reconectando (v96)");
             m_sameSocketPlayAttempts = 0;
             lastMatchActivityAt = now;
+        m_lastMatchActivityMs = now;
             lastPingAt = 0; // fuerza el bloque de reconexion TCP
             sock->abort();
             continue;

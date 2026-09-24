@@ -129,6 +129,8 @@ QString decryptChallenge(const QString &challenge, const QString &suffix);
 // ================================================================
 class FarmWorker : public QObject
 {
+    qint64 m_lastMatchActivityMs = 0; // v97fl: actividad de partida para decidir login fresco seguro
+
     Q_OBJECT
 public:
     explicit FarmWorker(QObject *parent = nullptr);

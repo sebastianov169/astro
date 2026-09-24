@@ -1351,7 +1351,7 @@ void FarmController::fetchGems()
                 pf.close();
             }
         }
-        LoginResult r = local.login(deviceId);
+        LoginResult r = local.loginWithRetries(deviceId);
         QVector<GemInfo> gems;
         QString realName;
         qlonglong coins = 0;
@@ -1471,7 +1471,7 @@ void FarmController::fetchAllGems()
                 local.setAttestPem(QString::fromUtf8(pf.readAll()));
                 pf.close();
             }
-            LoginResult r = local.login(deviceId);
+            LoginResult r = local.loginWithRetries(deviceId);
             if (!r.ok)
                 continue;
             FetchOut &o = outs[k];
@@ -1656,7 +1656,16 @@ void FarmController::fetchShop(const QString &device)
                 pf.close();
             }
         }
-        const LoginResult r = local.login(device);
+        LoginResult r;
+        for (int intento = 1; intento <= 3; ++intento) {
+            r = local.login(device);
+            if (r.ok)
+                break;
+            writeLogFile(QStringLiteral("[DBG] shopLogin device=%1 intento=%2 fallo: %3")
+                             .arg(device.left(8)).arg(intento).arg(r.error));
+            if (intento < 3)
+                QThread::msleep(1200);
+        }
         struct ShopOut {
             bool ok = false;
             qlonglong coins = 0;
@@ -2393,7 +2402,7 @@ void FarmController::runStoreAutoBuy()
                     pf.close();
                 }
             }
-            const LoginResult r = local.login(device);
+            const LoginResult r = local.loginWithRetries(device);
             struct BuyOut {
                 bool ok = false;
                 QString msg;
@@ -3146,8 +3155,15 @@ void FarmController::spawnOneFarm(const QString &deviceId, int gemId, const QStr
                 appendLog(QStringLiteral("Spawn skip %1: ya existe farm vivo (%2 handles)").arg(accountName).arg(m_farms.size()));
                 return;
             }
-            if (m_farms.at(i).thread)
+            if (m_farms.at(i).thread) {
                 m_farms.at(i).thread->requestInterruption();
+                // v97fk (fix crash "QThread: Destroyed while thread is still
+                // running"): sin quit+wait el QThread parentado quedaba huerfano
+                // y corriendo; el shutdown no lo veia (farms=0) y el dtor lo
+                // destruia vivo -> qFatal 0x40000015.
+                m_farms.at(i).thread->quit();
+                m_farms.at(i).thread->wait(8000);
+            }
             m_farms.removeAt(i);
         }
     }
@@ -4028,7 +4044,7 @@ void FarmController::refreshSelectedFarmAccounts()
                 break;
             }
         }
-        if (alive || !m_gemAutobuyEnabled || m_gemAutobuy.value(dev).isEmpty())
+        if (alive)
             continue;
         devices.append(dev);
     }
@@ -4071,6 +4087,16 @@ void FarmController::refreshAccounts(const QStringList &devices, bool automatic)
         fh.worker->stop();
     }
     // si no habia farms, el respawn no aplica: solo se refresca la data
+    // v97fj: las cuentas SELECCIONADAS del refresh que NO estan corriendo
+    // (murieron/kickeadas) tambien se respawnean: antes quedaban ignoradas
+    // hasta el proximo arranque de la app (bug "se ignora X tras el refresh").
+    for (const QString &dev : m_refreshTargetDevices) {
+        if (respawnDevices.contains(dev))
+            continue;
+        if (!m_farmSelection.contains(dev))
+            continue;
+        respawnDevices.append(dev);
+    }
     m_refreshRespawnDevices = respawnDevices;
 
     appendLog(QStringLiteral("%1: stopping %2 farm(s), then fresh login of %3 account(s)")
@@ -4217,7 +4243,7 @@ void FarmController::maybeStartRefreshAllLogin()
                     local.setAttestPem(QString::fromUtf8(pf.readAll()));
                     pf.close();
                 }
-                const LoginResult r = local.login(deviceId);
+                const LoginResult r = local.loginWithRetries(deviceId);
                 if (r.ok) {
                     out.ok = true;
                     out.name = local.fetchAccountName();

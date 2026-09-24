@@ -293,21 +293,32 @@ int main(int argc, char *argv[])
     }
 
     if (hasArg(args, QStringLiteral("--headless-run"))) {
-        // Hook de prueba en vivo: marca TODAS las cuentas (o SOLO la de
-        // --account NAME) y las spawnea (--headless-run --duration N). El
-        // spawn() arranca cuando la seleccion ya esta persistida (3s) y las
-        // gemas cacheadas (5s).
+        // Hook de prueba en vivo: marca TODAS las cuentas (o SOLO las de
+        // --account NAME[,NAME2,...]) y las spawnea (--headless-run --duration N).
+        // El spawn() arranca cuando la seleccion ya esta persistida (3s) y las
+        // gemas cacheadas (5s). v97fi: --account acepta lista separada por comas
+        // (para probar tandas de N cuentas por el limite de device compartido).
         const QString accountValue = argValue(args, QStringLiteral("--account"));
         QTimer::singleShot(3000, &farm, [&farm, accountValue]() {
+            const QStringList wanted = accountValue.isEmpty()
+                ? QStringList()
+                : accountValue.split(QLatin1Char(','), Qt::SkipEmptyParts);
             const auto accs = farm.accounts();
             for (int i = 0; i < accs.size(); ++i) {
-                bool match = true;
-                if (!accountValue.isEmpty()) {
+                bool match = wanted.isEmpty();
+                if (!match) {
                     const QVariantMap m = accs[i].toMap();
-                    match = m.value(QStringLiteral("name")).toString()
-                                .contains(accountValue, Qt::CaseInsensitive)
-                            || m.value(QStringLiteral("device")).toString()
-                                .contains(accountValue, Qt::CaseInsensitive);
+                    const QString nm = m.value(QStringLiteral("name")).toString();
+                    const QString dv = m.value(QStringLiteral("device")).toString();
+                    for (const QString &w : wanted) {
+                        const QString ws = w.trimmed();
+                        if (!ws.isEmpty()
+                            && (nm.contains(ws, Qt::CaseInsensitive)
+                                || dv.contains(ws, Qt::CaseInsensitive))) {
+                            match = true;
+                            break;
+                        }
+                    }
                 }
                 farm.toggleFarmSelection(i, match);
             }

@@ -34,6 +34,15 @@ extern QMutex g_matchMutex; // 2026-08-10: serializa SOLO la espera del [20]
 // (read-only, sin red) no lo tocan.
 extern QMutex g_refreshFullMutex;
 
+// v97fm: circuit breaker global del KNOCK (implementado en login.cpp). Si >=3
+// knocks fallan en ~10s (throttling del server cuando varias cuentas loguean a
+// la vez), todos los knocks esperan una pausa corta en vez de martillar (la
+// tormenta de reintentos hacia que el server devolviera respuestas vacias).
+// delay>0 = ms que el caller debe esperar antes de intentar el proximo knock.
+qint64 knockGateDelayMs();
+void knockGateNoteFailure();
+void knockGateNoteSuccess();
+
 #include <vector>
 
 using Bytes = std::vector<std::uint8_t>;
